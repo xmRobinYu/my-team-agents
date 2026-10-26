@@ -81,6 +81,13 @@ does not have one.
 
 ## Important Development Notes
 
+- **Rule-file changes need `RULE_CHANGE_REASON`.** It is read from the
+  environment, so an `export`ed value persists across later commits and silently
+  disables the check. Verify with `env -u RULE_CHANGE_REASON` when testing.
+- **Build before typecheck/test.** Packages consume each other via `dist/*.d.ts`;
+  a fresh clone fails `TS2307` unless built first. `just check` encodes the order.
+  Tests resolve workspace packages to `src/` via `vitest.config.ts` aliases, so
+  `pnpm test` alone is self-sufficient — but typecheck still needs the build.
 - **Pi trust**: RPC mode cannot show the interactive trust prompt, so
   `PiAdapter` always passes explicit `--approve`/`--no-approve`. Trust does not
   constrain tool access — isolation comes from the process/container.

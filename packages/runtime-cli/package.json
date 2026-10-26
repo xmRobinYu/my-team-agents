@@ -11,5 +11,11 @@
   },
   "dependencies": {
     "@my-team-agents/runtime-core": "workspace:*"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   }
 }

@@ -44,7 +44,7 @@ check_staged() {
 
   # Rule-file changes must be justified in the commit message or an env var.
   local rule_files
-  rule_files="$(printf '%s\n' "$files" | grep -E '^(AGENTS\.md|CONTEXT\.md|constraints\.yaml|justfile|\.git-hooks/)' || true)"
+  rule_files="$(printf '%s\n' "$files" | grep -E '^(AGENTS\.md|CONTEXT\.md|constraints\.yaml|justfile|vitest\.config\.ts|tsconfig\.base\.json|\.git-hooks/)' || true)"
   if [ -n "$rule_files" ] && [ -z "${RULE_CHANGE_REASON:-}" ]; then
     printf 'check-naming: rule files changed without RULE_CHANGE_REASON:\n%s\n' "$rule_files" >&2
     printf 'set RULE_CHANGE_REASON="<why>" to proceed\n' >&2
