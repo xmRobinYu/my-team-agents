@@ -39,6 +39,7 @@ packages/runtime-core/   RuntimeAdapter contract + canonical event types
 packages/runtime-pi/     Pi RPC adapter (the only full loop)
 packages/runtime-cli/    claude/codex/dsh CLI adapters (minimal v1)
 packages/domain/         entities + handoff guardrails
+packages/orchestrator/   dispatcher loop, structured handoff, stall watchdog
 packages/cost-report/    daily self-assessment from session logs
 scripts/                 guardrail self-test
 .git-hooks/              naming + rule-change guard
@@ -51,11 +52,16 @@ ref/                     READ-ONLY reference checkouts (teamagentx et al.)
 
 ```bash
 just setup            # install
-just check            # typecheck + test + build + verify-cli + test-guardrails
+just check            # build + typecheck + test + verify-cli + test-guardrails
 ```
 
-Single surfaces: `just typecheck`, `just test`, `just build`,
+Single surfaces: `just build`, `just typecheck`, `just test`,
 `just verify-cli`, `just test-guardrails`.
+
+**Order matters: `build` must precede `typecheck` and `test`.** Packages consume
+each other through `dist/*.d.ts`, so type-checking a clean checkout without
+building first fails with `TS2307`. `just check` encodes this order; a bare
+`just typecheck` on a fresh clone will fail and that is expected.
 
 There is no `just lint` — eslint is not installed (readiness gap).
 There is no `just dev` — no server exists in v1.
@@ -107,6 +113,11 @@ does not have one.
 - `packages/runtime-core/src/events.ts` — canonical event names; changing these
   breaks every adapter at once.
 - `packages/runtime-pi/src/adapter.ts` — JSONL framing; partial lines must buffer.
+- `packages/orchestrator/src/dispatcher.ts` — handoffs dispatch only after
+  settle, and only within guardrails. A runtime that throws on `start()` must
+  degrade to `failed`, never propagate.
+- `packages/orchestrator/src/handoff-intent.ts` — handoff intent is declared via
+  the `handoff_to` tool, never scraped from prose.
 - `packages/domain/src/handoff.ts` — guardrails must be deterministic, never
   model-dependent.
 - `packages/cost-report/src/parse.ts` — `since` cursor makes daily runs idempotent.

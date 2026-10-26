@@ -204,6 +204,7 @@ export class PiAdapter implements RuntimeAdapter {
           ...(textOf(record) !== undefined ? { text: textOf(record) } : {}),
           ...(tool ? { toolName: tool } : {}),
           ...(typeof record.toolCallId === "string" ? { toolCallId: record.toolCallId } : {}),
+          ...(record.args !== undefined ? { args: record.args } : {}),
           ...(toUsage(record.usage) ? { usage: toUsage(record.usage) } : {}),
           ...(typeof record.model === "string" ? { model: record.model } : {}),
           ...(typeof record.provider === "string" ? { provider: record.provider } : {}),

@@ -31,4 +31,7 @@ test-guardrails:
     ./scripts/test-guardrails.sh
 
 # Everything CI runs, in order.
-check: typecheck test build verify-cli test-guardrails
+#
+# build MUST precede typecheck: packages consume each other through dist/*.d.ts,
+# so type-checking a clean checkout without building first fails with TS2307.
+check: build typecheck test verify-cli test-guardrails

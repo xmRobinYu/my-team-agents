@@ -79,6 +79,23 @@ resolution, cost attribution).
 but leave extension seams. **R**: user — "第一期的主要目标是仿照teamagentx把基础架子搭建起来" +
 "只是在实现过程中需要预留未来拓展的口子".
 
+### Q14 — Handoff intent must be declared, not parsed
+**A**: agents declare handoffs through a `handoff_to` tool call; prose is never
+scraped for `@mentions`.
+**R**: teamagentx replaced regex/prose mention parsing with `mention_agents`
+structured handoff precisely because prose is unreliable — a model writing
+"@bob look at this" in a sentence is not dispatching.
+
+### Q15 — Dispatch timing
+**A**: handoff dispatch happens only AFTER the run settles, never mid-stream.
+**R**: prevents a still-emitting run from fanning out without bound; bounds are
+enforced in code, independent of model behavior.
+
+### Q16 — Queue persistence
+**A**: v1 queue is in-memory FIFO; a crash loses queued work. **R**: acknowledged
+v1 limit, not an oversight — persistence is the next seam.
+**Gap**: no durability, no retry across process restarts.
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

@@ -56,6 +56,12 @@ export interface CanonicalEvent {
   text?: string;
   toolName?: string;
   toolCallId?: string;
+  /**
+   * Tool arguments as declared by the agent. The structured-handoff path reads
+   * these; without them handoff intent could not be recovered from the stream
+   * and we would be back to parsing prose.
+   */
+  args?: unknown;
   /** Cumulative usage at the time of the event (Pi reports it on message_update/message_end). */
   usage?: Usage;
   model?: string;

@@ -115,6 +115,8 @@ export function normalizeLine(line: string, runId: string): CanonicalEvent | nul
       timestamp: new Date().toISOString(),
       ...(textCandidate !== undefined ? { text: textCandidate } : {}),
       ...(typeof obj.toolName === "string" ? { toolName: obj.toolName } : {}),
+      ...(typeof obj.toolCallId === "string" ? { toolCallId: obj.toolCallId } : {}),
+      ...(obj.args !== undefined ? { args: obj.args } : {}),
       ...(typeof obj.error === "string" ? { isError: true, error: obj.error } : {}),
     };
   } catch {

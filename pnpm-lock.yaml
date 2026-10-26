@@ -22,6 +22,15 @@ importers:
 
   packages/domain: {}
 
+  packages/orchestrator:
+    dependencies:
+      '@my-team-agents/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@my-team-agents/runtime-core':
+        specifier: workspace:*
+        version: link:../runtime-core
+
   packages/runtime-cli:
     dependencies:
       '@my-team-agents/runtime-core':
