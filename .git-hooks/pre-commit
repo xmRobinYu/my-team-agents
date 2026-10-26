@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Pre-commit guard.
+#
+# Two hard rules:
+#   1. No forbidden artifacts (.bak, _v2, scratch, tmp, backup, old).
+#   2. Rule-file changes must carry RULE_CHANGE_REASON.
+#
+# Install: git config core.hooksPath .git-hooks
+
+set -uo pipefail
+exec "$(dirname "${BASH_SOURCE[0]}")/check-naming.sh" --staged

@@ -1,0 +1,60 @@
+# Engagement constraints — L3 (critical) posture, scoped to what this repo
+# actually enforces today. Thresholds mirror the Verification Matrix in AGENTS.md;
+# nothing here names a gate that does not exist.
+
+version: 1
+strictness: L3-critical
+
+scope:
+  mode: greenfield
+  large_refactor: none
+  reference_repos_readonly: true
+
+size_limits:
+  max_file_lines: 800
+  max_complexity: 15
+
+enforcement:
+  # No phantom enforcement: eslint is NOT installed, so no lint surface is declared.
+  typecheck: block
+  tests: block
+  cli_smoke: block
+  guardrail_self_test: block
+  naming_and_backups: block
+  rule_file_changes: block
+
+quality:
+  # Gaps, not fabricated thresholds: coverage tooling is not wired yet.
+  coverage_per_file: null
+  duplicate_limit_percent: 3
+  anti_stub: block
+  anti_drift: block
+
+pr_review:
+  diff_size: block
+  rule_file_change_requires_reason: true
+
+verification_surfaces:
+  - id: typecheck
+    command: just typecheck
+    blocking: true
+  - id: test
+    command: just test
+    blocking: true
+  - id: build
+    command: just build
+    blocking: true
+  - id: verify-cli
+    command: just verify-cli
+    blocking: true
+  - id: test-guardrails
+    command: just test-guardrails
+    blocking: true
+
+deferred_modules:
+  - id: capability-packages
+    reason: deferred by user; v1 scripture is LLM wiki + RAG
+  - id: promotion-grading
+    reason: deferred by user; v1 evaluation is a daily self-assessment skill
+  - id: five-layer-cost-ledger
+    reason: deferred; v1 cost report reads session logs directly
