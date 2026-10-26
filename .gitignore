@@ -1,0 +1,16 @@
+.DS_Store
+node_modules/
+dist/
+build/
+coverage/
+.env
+.env.local
+*.log
+
+# reference repos (independent checkouts, not part of this project)
+ref/
+
+# pi agent sessions / local state (never commit conversations or credentials)
+.pi/
+**/.pi/
+*.jsonl
