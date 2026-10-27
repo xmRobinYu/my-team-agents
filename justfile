@@ -30,8 +30,18 @@ verify-cli: build
 test-guardrails:
     ./scripts/test-guardrails.sh
 
+
+# Offline check of the Feishu sync mapping (no network, no credentials).
+verify-docs:
+    node scripts/sync-feishu-docs.mjs --check
+
+# Mirror repo docs to the Feishu wiki (needs local lark-cli user auth).
+# Sync a subset: just sync-docs docs/architecture.md
+sync-docs *paths:
+    node scripts/sync-feishu-docs.mjs {{paths}}
+
 # Everything CI runs, in order.
 #
 # build MUST precede typecheck: packages consume each other through dist/*.d.ts,
 # so type-checking a clean checkout without building first fails with TS2307.
-check: build typecheck test verify-cli test-guardrails
+check: build typecheck test verify-cli test-guardrails verify-docs

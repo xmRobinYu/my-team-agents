@@ -1,0 +1,43 @@
+{
+  "space_id": "7701231058624187646",
+  "space_name": "my-team-agents",
+  "identity": "user",
+  "documents": [
+    {
+      "source": "docs/wiki-overview.md",
+      "node": "my-team-agents 知识库总览",
+      "node_token": "PiTYw5Yq6i6dbskNa0iczsJ8nIG",
+      "document_id": "DZb6dNUuHouWtVx8G2lcNC5Gnlg"
+    },
+    {
+      "source": "docs/product-plan.md",
+      "node": "my-team-agents 产品规划",
+      "node_token": "CCt2wM1SgiEar8k0ZuMc2cQln4M",
+      "document_id": "CJoHdcsiko7v2BxwHkDcDh1Tnfe"
+    },
+    {
+      "source": "docs/architecture.md",
+      "node": "my-team-agents 架构设计",
+      "node_token": "GVw5wkAyfibD8pkUJaxcuZWCnUe",
+      "document_id": "WxxtdqfdDohIV2xJ0cWc02v2nvb"
+    },
+    {
+      "source": "docs/project-plan.md",
+      "node": "my-team-agents 项目计划",
+      "node_token": "A1ynwarfBiflt9kNGtVcgXZqn9f",
+      "document_id": "UWDedh6fWoGZhWxAnaQc2h5rnlc"
+    },
+    {
+      "source": "AGENTS.md",
+      "node": "AGENTS.md",
+      "node_token": "Etd7wxOSdihnmIkughqcgyuunfb",
+      "document_id": "VH0wdJAbzot4vwxRRUvc66aHnec"
+    },
+    {
+      "source": "CONTEXT.md",
+      "node": "CONTEXT.md",
+      "node_token": "AvMSwRjGKivOJZkCDDccfDYFnAe",
+      "document_id": "AcW2diiGXoiHXJxMxyLc4lAWnHf"
+    }
+  ]
+}

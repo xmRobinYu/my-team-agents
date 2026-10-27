@@ -96,6 +96,17 @@ enforced in code, independent of model behavior.
 v1 limit, not an oversight — persistence is the next seam.
 **Gap**: no durability, no retry across process restarts.
 
+### Q17 — Documentation synchronization
+**A**: repo Markdown is mirrored one-way to the Feishu wiki space
+`my-team-agents` (space_id `7701231058624187646`) via `just sync-docs`; the
+offline mapping check `just verify-docs` is part of `just check`.
+**R**: user — "文档有更新都需要同步一份的飞书上面，可以把这个写入agents.md里面".
+**Why one-way**: two-way editing turns the Feishu copy into a second source of
+truth that silently diverges from the repo. Overwrite + read-back keeps the repo
+authoritative and makes the sync idempotent.
+**Gap**: `just sync-docs` needs local `lark-cli` user credentials, so it cannot
+run in CI; only the offline mapping check is CI-enforceable.
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

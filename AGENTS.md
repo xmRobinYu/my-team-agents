@@ -41,7 +41,8 @@ packages/runtime-cli/    claude/codex/dsh CLI adapters (minimal v1)
 packages/domain/         entities + handoff guardrails
 packages/orchestrator/   dispatcher loop, structured handoff, stall watchdog
 packages/cost-report/    daily self-assessment from session logs
-scripts/                 guardrail self-test
+docs/                    product/architecture/plan docs + Feishu sync manifest
+scripts/                 guardrail self-test + Feishu doc sync
 .git-hooks/              naming + rule-change guard
 ref/                     READ-ONLY reference checkouts (teamagentx et al.)
 ```
@@ -52,11 +53,11 @@ ref/                     READ-ONLY reference checkouts (teamagentx et al.)
 
 ```bash
 just setup            # install
-just check            # build + typecheck + test + verify-cli + test-guardrails
+just check            # build + typecheck + test + verify-cli + guardrails + doc mapping
 ```
 
 Single surfaces: `just build`, `just typecheck`, `just test`,
-`just verify-cli`, `just test-guardrails`.
+`just verify-cli`, `just test-guardrails`, `just verify-docs`.
 
 **Order matters: `build` must precede `typecheck` and `test`.** Packages consume
 each other through `dist/*.d.ts`, so type-checking a clean checkout without
@@ -75,6 +76,7 @@ There is no `just dev` — no server exists in v1.
 | Build | `just build` | yes |
 | CLI smoke | `just verify-cli` | yes |
 | Guardrail self-test | `just test-guardrails` | yes |
+| Doc-sync mapping | `docs/feishu-sync.json` + mapped sources | `just verify-docs` | yes |
 
 Every command above resolves to a real `justfile` target. Do not add a row that
 does not have one.
@@ -99,6 +101,29 @@ does not have one.
   supported as a CLI adapter only.
 - **Unknown events are never dropped**: unmapped upstream names surface as
   `type: "unknown"` with `rawType` preserved.
+
+## Documentation Sync
+
+`AGENTS.md`, `CONTEXT.md` and every file under `docs/` are mirrored one-way to
+the Feishu wiki space `my-team-agents` (space_id `7701231058624187646`):
+
+```bash
+just verify-docs      # offline: mapping + source files (part of just check)
+just sync-docs        # overwrite the Feishu copy of every mapped doc
+just sync-docs docs/architecture.md   # sync one doc
+```
+
+- Mapping lives in `docs/feishu-sync.json` (source -> node_token/document_id).
+  A new doc requires a manifest entry before it can sync; `just verify-docs`
+  fails if a required source is unmapped or a mapped source is missing.
+- **The repo is the single source of truth.** Edit the repo, then sync; do not
+  edit Feishu copies or record decisions only in Feishu comments.
+- `just sync-docs` is intentionally NOT in CI: it needs the local `lark-cli`
+  user credential. The blocking CI surface is the offline mapping check.
+- Any change to a synced document must be accompanied by a `just sync-docs`
+  run in the same task; report the command's exit code honestly.
+- Feishu node titles follow each document's first `# ` heading — `overwrite`
+  sets the docx title. Keep that heading stable if you need a stable label.
 
 ## Conventions
 
@@ -155,6 +180,7 @@ checker; nothing here is advisory only.
 | Rule-file changes carry a reason | `AGENTS.md`, `CONTEXT.md`, `constraints.yaml`, `justfile`, `.git-hooks/check-naming.sh` | `.git-hooks/check-naming.sh` (pre-commit) | block |
 | Full matrix green on push/PR | repo | `.github/workflows/ci.yml` (CI) | gate |
 | Test scope excludes `ref/` | `vitest.config.ts` | `just test` | block |
+| Doc-sync mapping is complete | `docs/feishu-sync.json` + mapped sources | `just verify-docs` | block |
 
 ## Deferred Modules
 
