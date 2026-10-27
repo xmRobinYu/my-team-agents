@@ -77,6 +77,8 @@ There is no `just dev` — no server exists in v1.
 | CLI smoke | `just verify-cli` | yes |
 | Guardrail self-test | `just test-guardrails` | yes |
 | Doc-sync mapping | `docs/feishu-sync.json` + mapped sources | `just verify-docs` | yes |
+| Package resolution | every workspace package | `just verify-packages` | yes |
+| Tests without any build | all packages | `just test-no-build` | yes |
 
 Every command above resolves to a real `justfile` target. Do not add a row that
 does not have one.
@@ -86,10 +88,13 @@ does not have one.
 - **Rule-file changes need `RULE_CHANGE_REASON`.** It is read from the
   environment, so an `export`ed value persists across later commits and silently
   disables the check. Verify with `env -u RULE_CHANGE_REASON` when testing.
-- **Build before typecheck/test.** Packages consume each other via `dist/*.d.ts`;
-  a fresh clone fails `TS2307` unless built first. `just check` encodes the order.
-  Tests resolve workspace packages to `src/` via `vitest.config.ts` aliases, so
-  `pnpm test` alone is self-sufficient — but typecheck still needs the build.
+- **Build before typecheck**, but **not before tests**. Packages consume each
+  other via `dist/*.d.ts`, so a fresh clone fails `TS2307` unless built first.
+  Tests instead resolve workspace packages to `src/` through the aliases in
+  `vitest.config.ts`, so `pnpm test` is self-sufficient. New workspace packages
+  need both an `exports` field and a src alias; `just verify-packages` fails if
+  either is missing, and `just test-no-build` proves tests pass with no dist at
+  all. Never "fix" a test by building first — that hides the dependency.
 - **Pi trust**: RPC mode cannot show the interactive trust prompt, so
   `PiAdapter` always passes explicit `--approve`/`--no-approve`. Trust does not
   constrain tool access — isolation comes from the process/container.

@@ -30,6 +30,18 @@ verify-cli: build
 test-guardrails:
     ./scripts/test-guardrails.sh
 
+# Every workspace package must declare exports and resolve to src in tests.
+verify-packages:
+    node scripts/check-package-exports.mjs
+
+# Prove tests are self-sufficient: no build, no dist, no prior artifacts.
+# `check` runs build first, which can hide a test suite that silently depends
+# on dist/; this target exists to catch exactly that class of regression.
+test-no-build:
+    rm -rf packages/*/dist
+    node scripts/check-package-exports.mjs
+    pnpm test
+
 
 # Offline check of the Feishu sync mapping (no network, no credentials).
 verify-docs:
@@ -44,4 +56,4 @@ sync-docs *paths:
 #
 # build MUST precede typecheck: packages consume each other through dist/*.d.ts,
 # so type-checking a clean checkout without building first fails with TS2307.
-check: build typecheck test verify-cli test-guardrails verify-docs
+check: build typecheck test verify-cli test-guardrails verify-docs verify-packages
