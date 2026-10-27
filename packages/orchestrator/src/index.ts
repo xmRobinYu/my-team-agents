@@ -7,3 +7,14 @@ export {
   type HandoffParseResult,
 } from "./handoff-intent.js";
 export { StallWatchdog, type StallWatchdogOptions } from "./stall-watchdog.js";
+export {
+  ExecutionStore,
+  type AttemptRecord,
+  type CreateTaskInput,
+  type HandoffCommit,
+  type TaskRecord,
+  type TaskResult,
+  type TaskStatus,
+  type UsageRecord,
+} from "./execution-store.js";
+export { createDurableWorker, type DurableWorker, type WorkerOptions } from "./durable-worker.js";

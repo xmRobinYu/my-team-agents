@@ -16,6 +16,7 @@
 | my-team-agents 产品规划 | `docs/product-plan.md` | 定位、数字员工类型、模块规划、V1 范围 |
 | my-team-agents 架构设计 | `docs/architecture.md` | 包结构、运行时契约、协作模型、调度闭环、扩展接口 |
 | my-team-agents 项目计划 | `docs/project-plan.md` | 阶段状态、里程碑、延后清单、风险 |
+| P6/P7 实施分析 | `docs/p6-p7-implementation-plan.md` | 持久队列与服务端 API / assistant-ui 的差距、数据模型、契约、风险与落地顺序 |
 | AGENTS.md | `AGENTS.md` | 目录地图、工作流、验证矩阵、治理约束 |
 | CONTEXT.md | `CONTEXT.md` | append-only 决策日志与参考事实 |
 

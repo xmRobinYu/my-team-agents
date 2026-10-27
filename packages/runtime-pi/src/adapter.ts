@@ -111,7 +111,12 @@ export class PiAdapter implements RuntimeAdapter {
   constructor(private readonly options: PiAdapterOptions) {}
 
   async start(spec: RunSpec): Promise<RunHandle> {
-    const args = ["--mode", "rpc", "--no-session"];
+    const args = ["--mode", "rpc"];
+    if (spec.session?.sessionId) {
+      args.push("--session-dir", spec.session!.sessionDir, "--session-id", spec.session!.sessionId);
+    } else {
+      args.push("--no-session");
+    }
     args.push(this.options.approveProjectResources ? "--approve" : "--no-approve");
     if (spec.model) args.push("--model", spec.model);
     if (spec.thinking) args.push("--thinking", spec.thinking);
@@ -120,11 +125,19 @@ export class PiAdapter implements RuntimeAdapter {
     const spawnFn = this.options.spawn ?? spawn;
     const child = spawnFn("pi", args, { cwd: spec.workspacePath });
 
-    const events = this.streamEvents(child, spec.runId);
-    const settled = this.settle(child, spec.runId, events.done);
+    // A holder is used because the settled promise must be created before the
+    // parser can call it, and the parser is what sees `agent_settled`.
+    const settledHolder: { onSettled?: (record: JsonRecord) => void } = {};
+    const events = this.streamEvents(child, spec.runId, (record) =>
+      settledHolder.onSettled?.(record));
+    const settled = this.settle(child, spec.runId, settledHolder);
 
     // Kick off the run. `prompt` resolving means accepted, NOT completed (docs/rpc.md).
-    this.send(child, { id: `${spec.runId}:prompt`, type: "prompt", message: spec.prompt });
+    this.send(child, { id: `${spec.runId}:prompt`, type: "prompt", message: spec.prompt,
+      ...(spec.images && spec.images.length > 0
+        ? { images: spec.images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType })) }
+        : {}),
+    });
 
     return {
       runId: spec.runId,
@@ -144,6 +157,7 @@ export class PiAdapter implements RuntimeAdapter {
   private streamEvents(
     child: ChildProcessWithoutNullStreams,
     runId: string,
+    onSettled?: (record: JsonRecord) => void,
   ): { iterable: AsyncIterable<CanonicalEvent>; done: Promise<void> } {
     let buffer = "";
     let push: (e: CanonicalEvent) => void = () => {};
@@ -194,6 +208,8 @@ export class PiAdapter implements RuntimeAdapter {
           continue; // Non-protocol noise on stdout is not fatal; RPC frames are JSON.
         }
         const rawType = typeof record.type === "string" ? record.type : "";
+        if (rawType === "agent_settled") onSettled?.(record);
+        if (rawType === "agent_settled") onSettled?.(record);
         const { type, rawType: unknownRaw } = canonicalType(rawType);
         const tool = typeof record.toolName === "string" ? record.toolName : undefined;
         push({
@@ -244,12 +260,29 @@ export class PiAdapter implements RuntimeAdapter {
     return { iterable, done };
   }
 
-  private async settle(
+  private settle(
     child: ChildProcessWithoutNullStreams,
     runId: string,
-    done: Promise<void>,
+    holder: { onSettled?: (record: JsonRecord) => void },
   ): Promise<RunResult> {
-    await done;
-    return { runId, status: "completed" };
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result: RunResult) => {
+        if (settled) return;
+        settled = true;
+        if (child.exitCode === null && !child.killed) child.kill();
+        resolve(result);
+      };
+      // `agent_settled` is the only completion signal: `agent_end` closes one
+      // low-level run while Pi may still retry, compact, or process queued work.
+      holder.onSettled = (record: JsonRecord) => {
+        finish({ runId, status: record.aborted === true ? "aborted" : "completed" });
+      };
+      child.on("error", (error) => finish({ runId, status: "failed", error: error.message }));
+      child.on("exit", (code, signal) => {
+        finish({ runId, status: signal ? "aborted" : "failed",
+          error: `Pi exited before agent_settled (${code ?? signal ?? "unknown"})` });
+      });
+    });
   }
 }

@@ -34,6 +34,17 @@ export interface RuntimeCapabilities {
 
 export type RuntimeKind = "pi" | "claude-cli" | "codex-cli" | "dsh-cli";
 
+export interface RunImage {
+  data: string;
+  mimeType: string;
+}
+
+export interface RunSession {
+  sessionId: string;
+  sessionDir: string;
+  resume: boolean;
+}
+
 export interface RunSpec {
   runId: string;
   /** Attribution keys for cost reporting. */
@@ -46,6 +57,8 @@ export interface RunSpec {
   agentDir?: string;
   model?: string;
   prompt: string;
+  images?: RunImage[];
+  session?: RunSession;
   /** Pi: --thinking. */
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }

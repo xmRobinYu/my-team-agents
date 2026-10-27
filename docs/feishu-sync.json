@@ -38,6 +38,12 @@
       "node": "CONTEXT.md",
       "node_token": "AvMSwRjGKivOJZkCDDccfDYFnAe",
       "document_id": "AcW2diiGXoiHXJxMxyLc4lAWnHf"
+    },
+    {
+      "source": "docs/p6-p7-implementation-plan.md",
+      "node": "P6/P7 实施分析：持久队列与服务端 API / assistant-ui 接入",
+      "node_token": "Ky1jwZfMOiUjaUkvpT0cUPKhnGf",
+      "document_id": "JGs3dnVfuosnVVxiYoscn6j8n1e"
     }
   ]
 }

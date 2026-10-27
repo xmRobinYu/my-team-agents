@@ -10,6 +10,9 @@ coverage/
 # reference repos (independent checkouts, not part of this project)
 ref/
 
+# local development runtime data (durable queue, never commit)
+.mta/
+
 # pi agent sessions / local state (never commit conversations or credentials)
 .pi/
 **/.pi/
