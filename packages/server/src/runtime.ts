@@ -16,7 +16,7 @@ function mockAdapter(): RuntimeAdapter {
     kind: "pi",
     capabilities: {
       streaming: true, steer: false, cancel: true, approval: "none", sandbox: "none",
-      workspacePerRun: true, agentDirPerRun: false, usageAttribution: "message", costCap: false,
+      workspacePerRun: true, agentDirPerRun: false, usageAttribution: "message", costCap: false, sessionResume: false,
     },
     async start(spec) {
       let cancelled = false;

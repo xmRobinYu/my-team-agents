@@ -34,8 +34,16 @@ function canonicalType(raw: string): { type: CanonicalEvent["type"]; rawType?: s
     case "tool_execution_end":
     case "queue_update":
     case "compaction_start":
+    case "compaction_end":
     case "auto_retry_start":
     case "auto_retry_end":
+    case "summarization_retry_scheduled":
+    case "summarization_retry_attempt_start":
+    case "summarization_retry_finished":
+    case "entry_appended":
+    case "session_info_changed":
+    case "thinking_level_changed":
+    case "bash_execution_update":
       return { type: raw };
     case "extension_error":
       return { type: "error" };
@@ -106,17 +114,28 @@ export class PiAdapter implements RuntimeAdapter {
     agentDirPerRun: false,
     usageAttribution: "message",
     costCap: false,
+    sessionResume: true,
   };
 
   constructor(private readonly options: PiAdapterOptions) {}
 
   async start(spec: RunSpec): Promise<RunHandle> {
     const args = ["--mode", "rpc"];
-    if (spec.session?.sessionId) {
-      args.push("--session-dir", spec.session!.sessionDir, "--session-id", spec.session!.sessionId);
-    } else {
+    if (spec.session?.sessionPath) {
+      // Resume the original session WITH history: --session <path> loads it,
+      // --session-id alone only selects a file and starts with empty context.
+      args.push("--session", spec.session.sessionPath);
+    } else if (spec.session?.sessionId) {
+      // Fallback: reconstruct path. Pi names files <timestamp>_<uuid>.jsonl,
+      // so a bare sessionId cannot always be mapped; prefer sessionPath.
+      const sessionPath = `${spec.session.sessionDir}/${spec.session.sessionId}.jsonl`;
+      args.push("--session", sessionPath);
+    } else if (spec.session?.resume === false) {
+      // Explicitly ephemeral: nothing is written, so nothing can be resumed.
       args.push("--no-session");
     }
+    // Default: let Pi persist a new session. Passing --no-session unconditionally
+    // made resume impossible, because the first run never wrote anything.
     args.push(this.options.approveProjectResources ? "--approve" : "--no-approve");
     if (spec.model) args.push("--model", spec.model);
     if (spec.thinking) args.push("--thinking", spec.thinking);
@@ -127,9 +146,19 @@ export class PiAdapter implements RuntimeAdapter {
 
     // A holder is used because the settled promise must be created before the
     // parser can call it, and the parser is what sees `agent_settled`.
-    const settledHolder: { onSettled?: (record: JsonRecord) => void } = {};
+    const settledHolder: {
+      onSettled?: (record: JsonRecord) => void;
+      sessionFile?: string;
+      onSessionFile?: (file: string) => void;
+    } = {};
+    // A resumed run already knows its session file; a fresh run learns it from
+    // `get_state` (docs/rpc-commands.md) once Pi has created the session.
+    if (spec.session?.sessionPath) settledHolder.sessionFile = spec.session.sessionPath;
     const events = this.streamEvents(child, spec.runId, (record) =>
-      settledHolder.onSettled?.(record));
+      settledHolder.onSettled?.(record), (file) => {
+      settledHolder.sessionFile = file;
+      settledHolder.onSessionFile?.(file);
+    });
     const settled = this.settle(child, spec.runId, settledHolder);
 
     // Kick off the run. `prompt` resolving means accepted, NOT completed (docs/rpc.md).
@@ -138,6 +167,8 @@ export class PiAdapter implements RuntimeAdapter {
         ? { images: spec.images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType })) }
         : {}),
     });
+    // Ask where Pi put the session so the durable store can resume it later.
+    this.send(child, { id: `${spec.runId}:state`, type: "get_state" });
 
     return {
       runId: spec.runId,
@@ -158,6 +189,7 @@ export class PiAdapter implements RuntimeAdapter {
     child: ChildProcessWithoutNullStreams,
     runId: string,
     onSettled?: (record: JsonRecord) => void,
+    onSessionFile?: (file: string) => void,
   ): { iterable: AsyncIterable<CanonicalEvent>; done: Promise<void> } {
     let buffer = "";
     let push: (e: CanonicalEvent) => void = () => {};
@@ -208,7 +240,19 @@ export class PiAdapter implements RuntimeAdapter {
           continue; // Non-protocol noise on stdout is not fatal; RPC frames are JSON.
         }
         const rawType = typeof record.type === "string" ? record.type : "";
-        if (rawType === "agent_settled") onSettled?.(record);
+        // `response` is a command reply and `extension_ui_request` an extension
+        // interaction, not session activity (docs/rpc.md). They are not model
+        // events: pushing them as `unknown` pollutes the transcript and would
+        // surface protocol noise to the UI. Session events only.
+        if (rawType === "response") {
+          const data = record.data;
+          if (typeof data === "object" && data !== null) {
+            const file = (data as JsonRecord).sessionFile;
+            if (typeof file === "string" && file.length > 0) onSessionFile?.(file);
+          }
+          continue;
+        }
+        if (rawType === "extension_ui_request") continue;
         if (rawType === "agent_settled") onSettled?.(record);
         const { type, rawType: unknownRaw } = canonicalType(rawType);
         const tool = typeof record.toolName === "string" ? record.toolName : undefined;
@@ -263,15 +307,16 @@ export class PiAdapter implements RuntimeAdapter {
   private settle(
     child: ChildProcessWithoutNullStreams,
     runId: string,
-    holder: { onSettled?: (record: JsonRecord) => void },
+    holder: { onSettled?: (record: JsonRecord) => void; sessionFile?: string },
   ): Promise<RunResult> {
     return new Promise((resolve) => {
       let settled = false;
       const finish = (result: RunResult) => {
         if (settled) return;
         settled = true;
+        const sessionFile = holder.sessionFile;
         if (child.exitCode === null && !child.killed) child.kill();
-        resolve(result);
+        resolve(sessionFile ? { ...result, sessionFile } : result);
       };
       // `agent_settled` is the only completion signal: `agent_end` closes one
       // low-level run while Pi may still retry, compact, or process queued work.

@@ -32,6 +32,8 @@ export interface CreateTaskInput {
   depth?: number;
   idempotencyKey?: string;
   recoverySnapshot?: string;
+  /** Pi session file to resume on the next Attempt (set after a run reports it). */
+  sessionFile?: string;
   availableAt?: number;
 }
 
@@ -137,6 +139,7 @@ export class ExecutionStore {
         fencing_token INTEGER NOT NULL DEFAULT 0,
         idempotency_key TEXT UNIQUE,
         recovery_snapshot TEXT,
+        session_file TEXT,
         status TEXT NOT NULL,
         active_attempt_id TEXT,
         available_at INTEGER NOT NULL,
@@ -237,6 +240,7 @@ export class ExecutionStore {
       fencingToken: num(row.fencing_token),
       idempotencyKey: text(row.idempotency_key) ?? undefined,
       recoverySnapshot: text(row.recovery_snapshot) ?? undefined,
+      sessionFile: text(row.session_file) ?? undefined,
       status: text(row.status) as TaskStatus,
       activeAttemptId: text(row.active_attempt_id),
       availableAt: num(row.available_at),
@@ -515,7 +519,27 @@ export class ExecutionStore {
       lastAssistantMessage: lastText?.text ?? null,
       lastAssistantEventType: lastText?.type ?? null,
       toolOutcomes: tools,
+      sessionFile: task.sessionFile ?? null,
       instruction: "Continue unfinished work. Do not repeat confirmed side effects; unknown side effects require human review.",
+    });
+  }
+
+  /**
+   * Persist the Pi session file reported by a run. Fenced: a superseded Attempt
+   * must not point the next Attempt at its own (dead) session.
+   */
+  recordSession(attemptId: string, fencingToken: number, sessionFile: string): boolean {
+    return this.tx(() => {
+      const attempt = this.one("SELECT task_id FROM attempts WHERE id=? AND fencing_token=?",
+        attemptId, fencingToken);
+      if (!attempt) return false;
+      const taskId = text(attempt.task_id)!;
+      const owned = this.one(
+        "SELECT id FROM tasks WHERE id=? AND active_attempt_id=? AND fencing_token=?",
+        taskId, attemptId, fencingToken);
+      if (!owned) return false;
+      this.run("UPDATE tasks SET session_file=? WHERE id=?", sessionFile, taskId);
+      return true;
     });
   }
 

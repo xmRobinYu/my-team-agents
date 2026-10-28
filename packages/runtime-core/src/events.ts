@@ -5,10 +5,15 @@
  *   agent_start | agent_end | agent_settled | turn_start | turn_end
  *   message_start | message_update | message_end
  *   tool_execution_start | tool_execution_update | tool_execution_end
- *   queue_update | compaction_start | auto_retry_start | auto_retry_end
+ *   queue_update | compaction_start | compaction_end
+ *   auto_retry_start | auto_retry_end | summarization_retry_*
+ *   entry_appended | session_info_changed | thinking_level_changed
+ *   bash_execution_update
  *
  * Non-Pi runtimes (claude/codex/dsh CLI adapters) normalize INTO these names.
  * Unknown upstream event names are reported as `unknown` and never dropped silently.
+ * RPC control frames (`response`, `extension_ui_request`) are protocol records,
+ * not session events, and are filtered by the Pi adapter.
  */
 
 export type CanonicalEventType =
@@ -25,8 +30,16 @@ export type CanonicalEventType =
   | "tool_execution_end"
   | "queue_update"
   | "compaction_start"
+  | "compaction_end"
   | "auto_retry_start"
   | "auto_retry_end"
+  | "summarization_retry_scheduled"
+  | "summarization_retry_attempt_start"
+  | "summarization_retry_finished"
+  | "entry_appended"
+  | "session_info_changed"
+  | "thinking_level_changed"
+  | "bash_execution_update"
   | "error"
   | "unknown";
 

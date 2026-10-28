@@ -30,6 +30,12 @@ export interface RuntimeCapabilities {
   /** Message-level usage is what makes per-member cost attribution possible. */
   usageAttribution: "message" | "session" | "none";
   costCap: boolean;
+  /**
+   * Can resume a previous run's session with its history (Pi: --session <path>).
+   * Q18 requires resuming the original session when the runtime supports it;
+   * when false, recovery falls back to a new Attempt built from the snapshot.
+   */
+  sessionResume: boolean;
 }
 
 export type RuntimeKind = "pi" | "claude-cli" | "codex-cli" | "dsh-cli";
@@ -42,6 +48,9 @@ export interface RunImage {
 export interface RunSession {
   sessionId: string;
   sessionDir: string;
+  /** Full path to the session file (e.g. ~/.pi/agent/sessions/<ws>/<ts>_<id>.jsonl).
+   *  Pi's --session <path> loads history; --session-id alone does not. */
+  sessionPath?: string;
   resume: boolean;
 }
 
@@ -75,6 +84,12 @@ export interface RunResult {
   runId: string;
   status: "completed" | "aborted" | "failed";
   error?: string;
+  /**
+   * Pi session file backing this run. The durable store persists it so a later
+   * Attempt resumes the same session with its history (Q18) instead of only
+   * re-running from the deterministic recovery snapshot.
+   */
+  sessionFile?: string;
 }
 
 export interface RuntimeAdapter {

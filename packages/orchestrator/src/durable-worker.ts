@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import type { CanonicalEvent, RuntimeAdapter } from "@my-team-agents/runtime-core";
 import { DEFAULT_GUARDRAILS, evaluateHandoff } from "@my-team-agents/domain";
 import { ExecutionStore, type AttemptRecord, type TaskRecord, type TaskResult } from "./execution-store.js";
@@ -104,10 +106,23 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
         } catch { return task.prompt; }
       })();
       const prompt = `${originalPrompt}${snapshot}\n\nAt the end, provide a final JSON result with outcome ("success"|"partial"|"failed"), summary, artifacts (each with path), and remainingRisks.`;
+      // Q18: resume the original session when the runtime supports it. Only a
+      // retry resumes; the first Attempt has no session yet. The file must still
+      // exist, otherwise Pi would start from an empty history silently.
+      const resumeSession = attempt.sequence > 1 && adapter.capabilities.sessionResume
+        && task.sessionFile && existsSync(task.sessionFile);
       const handle = await adapter.start({
         runId: attempt.id, tenantId: task.tenantId, projectId: task.projectId,
         memberId: task.memberId, workspacePath: task.workspacePath, prompt,
         ...(task.model ? { model: task.model } : {}),
+        ...(resumeSession
+          ? { session: {
+              sessionId: basename(task.sessionFile!, ".jsonl"),
+              sessionDir: dirname(task.sessionFile!),
+              sessionPath: task.sessionFile!,
+              resume: true,
+            } }
+          : {}),
       });
       const watchdog = setInterval(() => {
         if (now() - lastEventAt >= idleTimeoutMs) {
@@ -133,6 +148,11 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
           onChange();
         }
         const result = await handle.settled;
+        // Persist the session before deciding the outcome: a failed or cancelled
+        // Attempt must still let the next one resume with its history (Q18).
+        if (result.sessionFile) {
+          store.recordSession(attempt.id, attempt.fencingToken, result.sessionFile);
+        }
         if (result.status !== "completed") failure = failure ?? result.error ?? `runtime ${result.status}`;
       } finally {
         clearInterval(watchdog);

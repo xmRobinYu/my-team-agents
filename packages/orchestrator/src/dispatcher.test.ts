@@ -14,6 +14,7 @@ const CAPS: RuntimeCapabilities = {
   agentDirPerRun: false,
   usageAttribution: "message",
   costCap: false,
+  sessionResume: false,
 };
 
 /** Fake adapter: yields the given events then settles with the given status. */

@@ -197,11 +197,15 @@ be silently combined.
 **A**: durable execution landed as SQLite `ExecutionStore` plus a separate API and
 Worker process. **R**: implements Q18–Q23 decisions.
 - Task/Attempt/Event/Usage/Outbox are persisted; fence tokens reject late writes.
-- Resume of the original Pi session is wired at the adapter level but **not
-  proven end-to-end**: the `pi` binary is absent, so recovery falls back to a new
-  Attempt built from the deterministic recovery snapshot (Q20/Q18).
+- Session resume is wired end-to-end: the Pi adapter reports its `sessionFile`
+  (from RPC `get_state`), the store persists it per Task under the Attempt's
+  fencing token, and a retry Attempt resumes it with `--session <path>` when
+  `sessionResume` is advertised and the file still exists.
+- When resume is unavailable (CLI adapters, missing file, first Attempt),
+  recovery falls back to a new Attempt built from the deterministic snapshot.
 - `busy_timeout` is required: separate processes hit SQLITE_BUSY without it.
-**Gap**: no end-to-end Pi smoke; session resume is untested against real Pi.
+**Bound**: resume continues the *conversation*, not tool side effects. A crashed
+run whose file writes are unknown still requires human confirmation (Q18).
 
 ### Q25 — Development-only mock runtime
 **A**: a deterministic mock adapter exists for local verification. **R**: allows
@@ -210,6 +214,25 @@ queue, retry, handoff and UI verification without the `pi` binary.
   agent result.
 - `MTA_RUNTIME=mock` selects it; production mode uses Pi or CLI adapters.
 **Gap**: mock success is not evidence that Pi integration works.
+
+### Q26 — Real Pi smoke findings (2026-10-28)
+**A**: installed `@earendil-works/pi-coding-agent` 1.4.0, configured custom
+provider `airouter` (OpenAI-compatible), ran live end-to-end tests.
+**Findings that changed code**:
+1. **`--no-session` was unconditional**: `PiAdapter.start()` always passed
+   `--no-session` when no `sessionId`, so the first run never persisted a
+   session and resume was impossible. Fixed: default now persists a new session;
+   only `resume: false` is ephemeral.
+2. **`--session-id` does not load history**: it only selects the session file;
+   the model starts with empty context. `--session <path>` loads the full
+   history. Fixed: adapter now prefers `sessionPath` and uses `--session`.
+3. **RPC control frames leaked as `unknown` events**: `response` and
+   `extension_ui_request` are protocol records, not session activity. Fixed:
+   they are filtered before canonicalization.
+**Verified**: `agent_settled` completion semantics, session resume with memory
+(model recalled a token taught in run 1), usage attribution.
+**New gate**: `just pi-smoke` runs live smoke (not in `check` — needs pi +
+network + working model).
 
 ## Reference Notes
 

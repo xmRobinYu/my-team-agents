@@ -42,6 +42,7 @@ const CAPABILITIES: Record<CliKind, RuntimeCapabilities> = {
     agentDirPerRun: false,
     usageAttribution: "none",
     costCap: true, // --max-budget-usd
+    sessionResume: false,
   },
   "codex-cli": {
     streaming: true,
@@ -53,6 +54,7 @@ const CAPABILITIES: Record<CliKind, RuntimeCapabilities> = {
     agentDirPerRun: false,
     usageAttribution: "none",
     costCap: false,
+    sessionResume: false,
   },
   "dsh-cli": {
     streaming: false,
@@ -64,6 +66,7 @@ const CAPABILITIES: Record<CliKind, RuntimeCapabilities> = {
     agentDirPerRun: false,
     usageAttribution: "none",
     costCap: false,
+    sessionResume: false,
   },
 };
 

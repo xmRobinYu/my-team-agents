@@ -65,20 +65,22 @@ building first fails with `TS2307`. `just check` encodes this order; a bare
 `just typecheck` on a fresh clone will fail and that is expected.
 
 There is no `just lint` — eslint is not installed (readiness gap).
-There is no `just dev` — no server exists in v1.
+There is no `just dev` — run the API with `pnpm --filter @my-team-agents/server dev`
+and the UI with `pnpm --filter @my-team-agents/web dev`.
 
 ## Verification Matrix
 
-| Check | Command | Blocking |
-|---|---|---|
-| Typecheck | `just typecheck` | yes |
-| Tests | `just test` | yes |
-| Build | `just build` | yes |
-| CLI smoke | `just verify-cli` | yes |
-| Guardrail self-test | `just test-guardrails` | yes |
+| Check | Scope | Command | Blocking |
+|---|---|---|---|
+| Typecheck | all packages | `just typecheck` | yes |
+| Tests | all packages | `just test` | yes |
+| Build | all packages | `just build` | yes |
+| CLI smoke | cost-report | `just verify-cli` | yes |
+| Guardrail self-test | guardrail scripts | `just test-guardrails` | yes |
 | Doc-sync mapping | `docs/feishu-sync.json` + mapped sources | `just verify-docs` | yes |
 | Package resolution | every workspace package | `just verify-packages` | yes |
 | Tests without any build | all packages | `just test-no-build` | yes |
+| Real Pi end-to-end | runtime-pi + live model | `just pi-smoke` | no (needs pi + network) |
 
 Every command above resolves to a real `justfile` target. Do not add a row that
 does not have one.

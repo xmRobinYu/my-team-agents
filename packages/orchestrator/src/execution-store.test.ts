@@ -11,7 +11,7 @@ const adapter = (run: (attemptId: string) => Promise<CanonicalEvent[]>): Runtime
   kind: "pi",
   capabilities: {
     streaming: true, steer: true, cancel: true, approval: "none", sandbox: "none",
-    workspacePerRun: true, agentDirPerRun: false, usageAttribution: "message", costCap: false,
+    workspacePerRun: true, agentDirPerRun: false, usageAttribution: "message", costCap: false, sessionResume: false,
   },
   async start(spec): Promise<RunHandle> {
     const events = await run(spec.runId);
@@ -27,7 +27,7 @@ const failingAdapter: RuntimeAdapter = {
   kind: "pi",
   capabilities: {
     streaming: true, steer: false, cancel: true, approval: "none", sandbox: "none",
-    workspacePerRun: true, agentDirPerRun: false, usageAttribution: "message", costCap: false,
+    workspacePerRun: true, agentDirPerRun: false, usageAttribution: "message", costCap: false, sessionResume: false,
   },
   async start(spec): Promise<RunHandle> {
     return {

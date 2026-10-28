@@ -75,7 +75,67 @@ describe("PiAdapter lifecycle", () => {
     for await (const _event of handle.events) { break; }
     expect(captured).toContain("rpc");
     expect(captured).toContain("--approve");
-    expect(captured).toContain("--no-session");
+  });
+
+  it("persists a session by default so a later run can resume it", async () => {
+    const capture = async (s: RunSpec): Promise<string[]> => {
+      let args: string[] = [];
+      const { spawn } = fakePi((child) => { void child; });
+      const wrapped = ((_command: string, a: string[]) => {
+        args = a;
+        return spawn(_command, a);
+      }) as unknown as typeof import("node:child_process").spawn;
+      const handle = await new PiAdapter({ approveProjectResources: false, spawn: wrapped }).start(s);
+      for await (const _event of handle.events) { break; }
+      return args;
+    };
+
+    const defaultArgs = await capture({ ...spec });
+    // Default must NOT pass --no-session: that made the first run ephemeral, so
+    // resume could never work. Pi persists a session instead.
+    expect(defaultArgs).not.toContain("--no-session");
+    expect(defaultArgs).not.toContain("--session");
+
+    const ephemeralArgs = await capture({ ...spec, session: { sessionId: "", sessionDir: "", resume: false } });
+    expect(ephemeralArgs).toContain("--no-session");
+
+    // --session-id alone does not load history; --session <path> does.
+    const resumeArgs = await capture({
+      ...spec,
+      session: { sessionId: "s1", sessionDir: "/d", sessionPath: "/d/s1.jsonl", resume: true },
+    });
+    expect(resumeArgs).toContain("--session");
+    expect(resumeArgs).toContain("/d/s1.jsonl");
+    expect(resumeArgs).not.toContain("--session-id");
+  });
+
+  it("drops RPC control frames instead of surfacing them as events", async () => {
+    const child = new EventEmitter() as FakeChild;
+    child.killed = false;
+    child.exitCode = null;
+    child.kill = () => { child.killed = true; };
+    child.stdin = { write: () => {} };
+    const dataListeners: Array<(chunk: string) => void> = [];
+    child.stdout = {
+      setEncoding: () => {},
+      on: (event, listener) => { if (event === "data") dataListeners.push(listener); },
+    };
+    const spawn = ((_command: string, _args: string[]) => child) as unknown as typeof import("node:child_process").spawn;
+    const adapter = new PiAdapter({ approveProjectResources: false, spawn });
+    const handle = await adapter.start(spec);
+    // `response` and `extension_ui_request` are protocol records, not session
+    // activity (docs/rpc.md); only agent_settled may reach consumers.
+    for (const send of dataListeners) {
+      send(`${JSON.stringify({ type: "response", command: "prompt", success: true })}\n`);
+      send(`${JSON.stringify({ type: "extension_ui_request", id: "u1" })}\n`);
+      send(`${JSON.stringify({ type: "agent_settled", aborted: false })}\n`);
+    }
+    // The iterator terminates on stdout "end" / child "exit" (docs/rpc.md
+    // shutdown); the fake must emit one or the for-await loop hangs.
+    child.emit("exit", 0, null);
+    const seen: string[] = [];
+    for await (const event of handle.events) seen.push(event.type);
+    expect(seen).toEqual(["agent_settled"]);
   });
 
   it("reports a failed result when Pi exits before agent_settled", async () => {

@@ -57,3 +57,9 @@ sync-docs *paths:
 # build MUST precede typecheck: packages consume each other through dist/*.d.ts,
 # so type-checking a clean checkout without building first fails with TS2307.
 check: build typecheck test verify-cli test-guardrails verify-docs verify-packages
+
+# Real end-to-end smoke against the installed pi binary (needs a live provider).
+# Not part of `check`: it requires pi installed + network + a working model.
+# Run manually before shipping Pi-integration changes.
+pi-smoke: build
+    ./scripts/pi-smoke.sh
