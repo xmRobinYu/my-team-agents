@@ -30,7 +30,7 @@ deliberately deferred — see `## Deferred Modules`.
 | pnpm | 11.22.0 | `packageManager` field |
 | TypeScript | 5.9.3 | strict, NodeNext |
 | Vitest | 3.2.7 | scoped to `packages/**` |
-| Pi | 1.4.0 docs verified | **global `pi` binary is NOT installed** |
+| Pi | 1.4.0 | `npm i -g --ignore-scripts @earendil-works/pi-coding-agent`; a live provider needs `~/.pi/agent/models.json` |
 
 ## Directory Map
 
@@ -39,10 +39,13 @@ packages/runtime-core/   RuntimeAdapter contract + canonical event types
 packages/runtime-pi/     Pi RPC adapter (the only full loop)
 packages/runtime-cli/    claude/codex/dsh CLI adapters (minimal v1)
 packages/domain/         entities + handoff guardrails
-packages/orchestrator/   dispatcher loop, structured handoff, stall watchdog
+packages/orchestrator/   dispatcher loop, structured handoff, stall watchdog,
+                         durable SQLite execution store + worker
+packages/server/         Fastify API + SSE + standalone worker entrypoints
+packages/web/            assistant-ui workbench (external-store projection)
 packages/cost-report/    daily self-assessment from session logs
 docs/                    product/architecture/plan docs + Feishu sync manifest
-scripts/                 guardrail self-test + Feishu doc sync
+scripts/                 guardrail self-test, doc sync, live pi smoke
 .git-hooks/              naming + rule-change guard
 ref/                     READ-ONLY reference checkouts (teamagentx et al.)
 ```
@@ -59,10 +62,18 @@ just check            # build + typecheck + test + verify-cli + guardrails + doc
 Single surfaces: `just build`, `just typecheck`, `just test`,
 `just verify-cli`, `just test-guardrails`, `just verify-docs`.
 
-**Order matters: `build` must precede `typecheck` and `test`.** Packages consume
-each other through `dist/*.d.ts`, so type-checking a clean checkout without
-building first fails with `TS2307`. `just check` encodes this order; a bare
-`just typecheck` on a fresh clone will fail and that is expected.
+**Order matters for typecheck only: `build` must precede it.** Packages consume
+each other through `dist/*.d.ts`, so a clean checkout fails `TS2307` without a
+build. Tests are different: Vitest aliases workspace packages to `src/`, so
+`just test-no-build` proves they pass with no `dist/` at all.
+
+Live Pi smoke (`just pi-smoke`) is manual and needs all three prerequisites:
+1. `npm i -g --ignore-scripts @earendil-works/pi-coding-agent`
+2. A working provider in `~/.pi/agent/models.json` (keep this file private).
+3. Network access. Override the default with
+   `PI_SMOKE_MODEL=<provider>/<model> just pi-smoke`.
+Without these the smoke exits nonzero; do not weaken its assertions to make it
+pass, and do not add it to CI unless a model endpoint is available there.
 
 There is no `just lint` — eslint is not installed (readiness gap).
 There is no `just dev` — run the API with `pnpm --filter @my-team-agents/server dev`
@@ -107,7 +118,14 @@ does not have one.
 - **dsh is a cordis profile launcher**, not a coding-agent runtime. It is
   supported as a CLI adapter only.
 - **Unknown events are never dropped**: unmapped upstream names surface as
-  `type: "unknown"` with `rawType` preserved.
+  `type: "unknown"` with `rawType` preserved. Exception: RPC control frames
+  (`response`, `extension_ui_request`) are protocol records, not session
+  activity, and are filtered before canonicalization (docs/rpc.md).
+- **Pi session resume**: a session persists by default. `--session-id` alone
+  does NOT load history; `--session <path>` does, so `RunSpec.session.sessionPath`
+  is what resume uses. Resume continues the conversation only — unknown tool
+  side effects still require human confirmation (Q18). `just pi-smoke` proves
+  both completion semantics and resume-with-memory against a live model.
 
 ## Documentation Sync
 
