@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ServerResponse } from "node:http";
 import type { CreateTaskInput, DurableWorker, ExecutionStore } from "@my-team-agents/orchestrator";
+import { registerPiRoutes } from "./pi-routes.js";
 
 export interface AppOptions {
   store: ExecutionStore;
@@ -179,6 +180,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       request.raw.on("close", () => clearInterval(timer));
     },
   );
+
+  registerPiRoutes(app, { store, worker, notify });
 
   if (options.staticRoot && existsSync(options.staticRoot)) {
     await app.register(fastifyStatic, { root: resolve(options.staticRoot), prefix: "/" });

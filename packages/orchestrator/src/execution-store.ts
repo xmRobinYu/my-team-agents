@@ -543,6 +543,28 @@ export class ExecutionStore {
     });
   }
 
+  /**
+   * Activate a placeholder Task on its first real message.
+   *
+   * react-pi creates an empty thread, then sends the first prompt separately.
+   * The placeholder is parked (availableAt far future, prompt is a title). This
+   * flips it to a real queued task with the actual content, exactly once.
+   */
+  activatePlaceholder(taskId: string, prompt: string, now = Date.now()): boolean {
+    return this.tx(() => {
+      const task = this.getTask(taskId);
+      // Only a never-attempted queued placeholder may be activated; anything
+      // with attempts already has real history and must go through retryTask.
+      if (!task || task.status !== "queued" || task.activeAttemptId) return false;
+      const attempted = this.one("SELECT COUNT(*) AS n FROM attempts WHERE task_id=?", taskId);
+      if (num(attempted?.n) > 0) return false;
+      if (!prompt.trim()) return false;
+      this.run("UPDATE tasks SET prompt=?,available_at=?,updated_at=? WHERE id=?",
+        prompt, now, now, taskId);
+      return true;
+    });
+  }
+
   requestCancelChain(chainId: string, now = Date.now()): number {
     return this.tx(() => {
       this.run("UPDATE chains SET cancel_requested=1 WHERE id=?", chainId);

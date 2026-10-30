@@ -16,6 +16,8 @@
   },
   "dependencies": {
     "@assistant-ui/react": "0.15.31",
+    "@assistant-ui/react-pi": "^0.0.32",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
     "assistant-ui": "0.0.126",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"

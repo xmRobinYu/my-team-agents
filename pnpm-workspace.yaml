@@ -1,4 +1,8 @@
 packages:
   - "packages/*"
 allowBuilds:
+  # Transitive deps of @earendil-works/pi-coding-agent (via @assistant-ui/react-pi).
+  # Their postinstall compiles native/JS artifacts the runtime imports.
+  '@google/genai': true
   esbuild: true
+  protobufjs: true

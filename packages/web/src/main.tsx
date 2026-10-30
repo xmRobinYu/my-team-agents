@@ -1,6 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { App } from "./components/App";
+import { App } from "./components/PiApp";
 import "./styles.css";
 
 const container = document.getElementById("root");

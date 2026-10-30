@@ -234,6 +234,30 @@ provider `airouter` (OpenAI-compatible), ran live end-to-end tests.
 **New gate**: `just pi-smoke` runs live smoke (not in `check` — needs pi +
 network + working model).
 
+### Q27 — react-pi integration approach (2026-10-29)
+**A**: full replacement of the hand-written workbench with `usePiRuntime`.
+**R**: user chose full replacement over panel-only or parallel-page options.
+**Architecture**:
+- `PiClient` is transport-agnostic, so the UI talks to OUR server via
+  `createPiHttpClient({ baseUrl: "/api/pi" })` — it never drives Pi directly.
+- We did NOT use `createPiNodeClient`: that supervisor owns the Pi process and
+  would bypass the durable queue/lease/retry/recovery (P6). Instead a projection
+  layer maps Task==Thread and translates persisted CanonicalEvents into the
+  PiClient event contract (`packages/server/src/pi-thread.ts`, `pi-routes.ts`).
+- react-pi creates an EMPTY thread (initialize) then sends the first message.
+  A placeholder Task is parked (availableAt far-future) and activated on the
+  first real prompt via `store.activatePlaceholder`; follow-ups map to durable
+  retry. P6 semantics are preserved.
+- Terminal tasks emit `agent_end`/`agent_settled` in the SSE stream so the UI
+  leaves the running state even when a runtime (mock) never emits them.
+- The detail panel keeps reading `/api/tasks/:id` because attempts, usage,
+  handoffs and chain are P6 evidence the PiClient contract does not model.
+**Removed**: App.tsx, TaskThread, TaskListPanel, NewTaskPanel, ConversationStore,
+chat/mapping(+test), useWorkbenchData — all superseded by usePiRuntime.
+**Verified**: 9 projection/route tests, live reducer accepts translated frames,
+end-to-end via the real react-pi HTTP client (create → send → SSE → idle,
+underlying task `succeeded`).
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:
