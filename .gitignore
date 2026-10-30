@@ -13,6 +13,9 @@ ref/
 # local development runtime data (durable queue, never commit)
 .mta/
 
+# imported team personas (agentDir trees written by POST /api/rooms/import)
+.rooms/
+
 # pi agent sessions / local state (never commit conversations or credentials)
 .pi/
 **/.pi/

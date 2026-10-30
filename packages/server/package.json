@@ -26,5 +26,8 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
+  },
+  "devDependencies": {
+    "fflate": "^0.8.3"
   }
 }

@@ -3,13 +3,18 @@ import fastifyStatic from "@fastify/static";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ServerResponse } from "node:http";
-import type { CreateTaskInput, DurableWorker, ExecutionStore } from "@my-team-agents/orchestrator";
+import { RoomStore, type CreateTaskInput, type DurableWorker, type ExecutionStore } from "@my-team-agents/orchestrator";
 import { registerPiRoutes } from "./pi-routes.js";
+import { registerRoomRoutes } from "./room-routes.js";
 
 export interface AppOptions {
   store: ExecutionStore;
   worker: DurableWorker;
   staticRoot?: string;
+  /** Defaults to a RoomStore over the ExecutionStore handle: rooms and tasks commit under one database. */
+  rooms?: RoomStore;
+  roomsRoot?: string;
+  defaultProjectId?: string;
 }
 
 interface TaskBody {
@@ -30,6 +35,7 @@ const validTask = (body: TaskBody) =>
 export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   const { store, worker } = options;
+  const rooms = options.rooms ?? new RoomStore(store.db);
   const clients = new Set<ServerResponse>();
   const notify = () => {
     for (const client of clients) client.write(`event: tasks\ndata: ${JSON.stringify(store.listTasks())}\n\n`);
@@ -182,6 +188,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   );
 
   registerPiRoutes(app, { store, worker, notify });
+
+  // I2: rooms are additive. Registered after /api/pi so its encapsulated body
+  // parsers cannot change how /api/tasks and /api/pi see request bodies.
+  await registerRoomRoutes(app, {
+    store: rooms,
+    roomsRoot: options.roomsRoot,
+    defaultProjectId: options.defaultProjectId,
+  });
 
   if (options.staticRoot && existsSync(options.staticRoot)) {
     await app.register(fastifyStatic, { root: resolve(options.staticRoot), prefix: "/" });
