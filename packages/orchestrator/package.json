@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@my-team-agents/domain": "workspace:*",
-    "@my-team-agents/runtime-core": "workspace:*"
+    "@my-team-agents/runtime-core": "workspace:*",
+    "fflate": "^0.8.3"
   },
   "exports": {
     ".": {

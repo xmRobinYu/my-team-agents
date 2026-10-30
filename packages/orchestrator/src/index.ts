@@ -18,3 +18,9 @@ export {
   type UsageRecord,
 } from "./execution-store.js";
 export { createDurableWorker, type DurableWorker, type WorkerOptions } from "./durable-worker.js";
+export {
+  RoomStore,
+  type AppendMessageInput,
+  type CreateRoomAgentInput,
+  type CreateRoomInput,
+} from "./room-store.js";
