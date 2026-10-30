@@ -100,11 +100,32 @@ jobs:
           node-version: '22'
       - run: node scripts/sync-feishu-docs.mjs --check
 
+  # Bitable projection mapping: parses the docs and validates the declared schema.
+  # Node-only, no credentials; the network upsert stays manual like `just sync-docs`.
+  bitable-mapping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node scripts/sync-feishu-bitable.mjs --check
+
+  # Sync-layer unit tests (node:test, no pnpm install needed).
+  scripts-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test scripts/*.test.mjs
+
   # Branch protection points at this single job. It is always() guarded so a
   # skipped upstream job cannot be read as a pass.
   ci-ok:
     runs-on: ubuntu-latest
-    needs: [typecheck, test, build, verify-cli, guardrails, docs-mapping, test-no-build]
+    needs: [typecheck, test, build, verify-cli, guardrails, docs-mapping, bitable-mapping, scripts-test, test-no-build]
     if: always()
     steps:
       - name: Aggregate results

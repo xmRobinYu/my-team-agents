@@ -47,19 +47,49 @@ test-no-build:
 verify-docs:
     node scripts/sync-feishu-docs.mjs --check
 
+
+# Offline check of the Bitable mapping: parses docs/project-plan.md + CONTEXT.md
+# and validates docs/feishu-bitable.json. No network, no credentials.
+verify-bitable:
+    node scripts/sync-feishu-bitable.mjs --check
+
+# Unit tests for the sync layer (scripts/*.test.mjs). Vitest is scoped to
+# packages/** by design, so these run through the Node test runner instead.
+test-scripts:
+    node --test scripts/*.test.mjs
+
 # Mirror repo docs to the Feishu wiki (needs local lark-cli user auth).
 # Sync a subset: just sync-docs docs/architecture.md
 sync-docs *paths:
     node scripts/sync-feishu-docs.mjs {{paths}}
 
+# Upsert project progress into the Feishu Bitable (needs lark-cli user auth).
+# Idempotent: rows are matched by 阶段号 / 里程碑号 / 条目主键, never deleted.
+sync-bitable:
+    node scripts/sync-feishu-bitable.mjs
+
+# One command after any doc/plan change: prose mirror first, then the tracker.
+# Paths go to sync-docs only; the Bitable is a full upsert every run because it
+# keys rows itself and costs nothing when the docs are unchanged.
+sync-all *paths:
+    node scripts/sync-feishu-docs.mjs {{paths}}
+    node scripts/sync-feishu-bitable.mjs
+
 # Everything CI runs, in order.
 #
 # build MUST precede typecheck: packages consume each other through dist/*.d.ts,
 # so type-checking a clean checkout without building first fails with TS2307.
-check: build typecheck test verify-cli test-guardrails verify-docs verify-packages
+check: build typecheck test verify-cli test-guardrails verify-docs verify-bitable test-scripts verify-packages
 
 # Real end-to-end smoke against the installed pi binary (needs a live provider).
 # Not part of `check`: it requires pi installed + network + a working model.
 # Run manually before shipping Pi-integration changes.
 pi-smoke: build
     ./scripts/pi-smoke.sh
+
+# P8/I2 acceptance evidence: import the real teamagentx package, print the room,
+# the 5 agents with their agentDirs, the ignored-field report, and prove a broken
+# package leaves nothing behind. Needs the built workspace packages and the local
+# ref/ tree (untracked), so it is not part of `check`.
+verify-import: build
+    node --experimental-strip-types scripts/i2-real-import.mts

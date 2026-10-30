@@ -1,0 +1,152 @@
+{
+  "_about": "Feishu Bitable (多维表格) target + schema for project progress tracking. Config, not documentation: it is a .json under docs/, so `just verify-docs` does not treat it as a managed Markdown doc and no `documents` entry is needed. Kept separate from docs/feishu-sync.json because that file's validator walks `documents` only; mixing a second resource shape into it would make the doc gate depend on Bitable state.",
+  "_discipline": "The repo is the single source of truth. Every field below is derived from docs/project-plan.md + CONTEXT.md by scripts/sync-feishu-bitable.mjs. Do not maintain status by hand in Feishu: manual edits to derived fields are overwritten on the next sync. Manual content is safe in extra columns or extra rows the script does not key on.",
+  "space_id": "7701231058624187646",
+  "identity": "user",
+  "base_title": "my-team-agents 项目进展",
+  "base_token": "PENDING_FIRST_PROVISION",
+  "node_token": "PENDING_FIRST_PROVISION",
+  "_pending_note": "Placeholders, same convention as docs/feishu-sync.json. `PENDING_FIRST_PROVISION` means the wiki node does not exist yet. Run `just sync-bitable` from an interactive terminal that can reach the macOS Keychain: the script creates the Bitable node under the wiki space, writes the real node_token/base_token back into this file, then provisions tables and records. A placeholder never matches a real resource, so a sync can only create or fail loudly — it can never overwrite somebody else's Base.",
+  "primary_field": "主键",
+  "tables": [
+    {
+      "key": "phases",
+      "name": "项目阶段",
+      "primaryKey": "阶段号",
+      "source": "docs/project-plan.md ## 当前状态",
+      "fields": [
+        { "name": "阶段号", "type": "text", "description": "P0…P8（含 P7a/P7b），来自 docs/project-plan.md 阶段表。同步主键，请勿修改。" },
+        { "name": "阶段名称", "type": "text" },
+        { "name": "范围", "type": "text", "description": "阶段覆盖的内容。" },
+        { "name": "状态", "type": "select", "multiple": false, "options": [
+          { "name": "完成", "hue": "Green", "lightness": "Light" },
+          { "name": "进行中", "hue": "Blue", "lightness": "Light" },
+          { "name": "下一步", "hue": "Orange", "lightness": "Light" },
+          { "name": "待启", "hue": "Gray", "lightness": "Lighter" },
+          { "name": "未标注", "hue": "Red", "lightness": "Lighter" }
+        ] },
+        { "name": "状态原文", "type": "text", "description": "文档里的原始状态写法，用于核对映射是否失真。" },
+        { "name": "文档顺序", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "仓库内", "type": "select", "multiple": false, "options": [
+          { "name": "存在", "hue": "Green", "lightness": "Lighter" },
+          { "name": "已移除", "hue": "Gray", "lightness": "Lighter" }
+        ], "description": "文档删除该阶段时脚本只标记「已移除」，不删行，避免丢失表内手工内容。" }
+      ]
+    },
+    {
+      "key": "milestones",
+      "name": "里程碑",
+      "primaryKey": "里程碑号",
+      "source": "docs/project-plan.md ## 里程碑",
+      "fields": [
+        { "name": "里程碑号", "type": "text", "description": "M1…M5（含 M3.5）。同步主键，请勿修改。" },
+        { "name": "标题", "type": "text" },
+        { "name": "目标", "type": "text" },
+        { "name": "状态", "type": "select", "multiple": false, "options": [
+          { "name": "已完成", "hue": "Green", "lightness": "Light" },
+          { "name": "进行中", "hue": "Blue", "lightness": "Light" },
+          { "name": "待办", "hue": "Gray", "lightness": "Lighter" },
+          { "name": "未标注", "hue": "Red", "lightness": "Lighter" }
+        ] },
+        { "name": "条目总数", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "已完成条目", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "完成度", "type": "number", "style": { "type": "progress", "percentage": true, "color": "Blue" } },
+        { "name": "参考", "type": "text", "description": "文档中的 PRD / 决策 / 前置 说明行。" },
+        { "name": "仓库内", "type": "select", "multiple": false, "options": [
+          { "name": "存在", "hue": "Green", "lightness": "Lighter" },
+          { "name": "已移除", "hue": "Gray", "lightness": "Lighter" }
+        ] }
+      ]
+    },
+    {
+      "key": "items",
+      "name": "里程碑条目",
+      "primaryKey": "条目主键",
+      "source": "docs/project-plan.md ## 里程碑（每个 - 条目）",
+      "fields": [
+        { "name": "条目主键", "type": "text", "description": "形如 M3.5#4：里程碑号 + 文档内序号。序号按条目在文档中的顺序生成，请勿手工修改。" },
+        { "name": "里程碑号", "type": "text" },
+        { "name": "条目序号", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "内容", "type": "text" },
+        { "name": "状态", "type": "select", "multiple": false, "options": [
+          { "name": "已完成", "hue": "Green", "lightness": "Light" },
+          { "name": "进行中", "hue": "Blue", "lightness": "Light" },
+          { "name": "待办", "hue": "Gray", "lightness": "Lighter" },
+          { "name": "未标注", "hue": "Red", "lightness": "Lighter" }
+        ] },
+        { "name": "仓库内", "type": "select", "multiple": false, "options": [
+          { "name": "存在", "hue": "Green", "lightness": "Lighter" },
+          { "name": "已移除", "hue": "Gray", "lightness": "Lighter" }
+        ] }
+      ]
+    },
+    {
+      "key": "risks",
+      "name": "风险登记",
+      "primaryKey": "风险",
+      "source": "docs/project-plan.md ## 风险登记",
+      "fields": [
+        { "name": "风险", "type": "text", "description": "风险描述，同时是同步主键；改这一列等于新增一条风险。" },
+        { "name": "影响", "type": "text" },
+        { "name": "应对", "type": "text" },
+        { "name": "文档顺序", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "仓库内", "type": "select", "multiple": false, "options": [
+          { "name": "存在", "hue": "Green", "lightness": "Lighter" },
+          { "name": "已移除", "hue": "Gray", "lightness": "Lighter" }
+        ] }
+      ]
+    },
+    {
+      "key": "deferred",
+      "name": "延后清单",
+      "primaryKey": "项",
+      "source": "docs/project-plan.md ## 延后清单",
+      "fields": [
+        { "name": "项", "type": "text", "description": "明确不做的模块，同步主键。" },
+        { "name": "原因", "type": "text" },
+        { "name": "保留方式", "type": "text" },
+        { "name": "文档顺序", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "仓库内", "type": "select", "multiple": false, "options": [
+          { "name": "存在", "hue": "Green", "lightness": "Lighter" },
+          { "name": "已移除", "hue": "Gray", "lightness": "Lighter" }
+        ] }
+      ]
+    },
+    {
+      "key": "overview",
+      "name": "项目总览",
+      "primaryKey": "总览",
+      "source": "docs/project-plan.md + CONTEXT.md 汇总",
+      "fields": [
+        { "name": "总览", "type": "text", "description": "固定单行「项目」。" },
+        { "name": "阶段完成", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "阶段总数", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "条目完成", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "条目总数", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "里程碑总数", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "风险条数", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "延后条数", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "决策条数", "type": "number", "style": { "type": "plain", "precision": 0 }, "description": "CONTEXT.md 决策日志（append-only）的 Q 条目数。" },
+        { "name": "最新决策", "type": "text" },
+        { "name": "已验证", "type": "text", "description": "docs/project-plan.md 的「已验证：」段落原文。" },
+        { "name": "快照", "type": "text", "description": "内容指纹；与「进展记录」里的快照列对应。" }
+      ]
+    },
+    {
+      "key": "changelog",
+      "name": "进展记录",
+      "primaryKey": "快照",
+      "appendOnly": true,
+      "source": "每次内容变更一行（append-only）",
+      "fields": [
+        { "name": "快照", "type": "text", "description": "内容指纹，作为去重主键：同一指纹只落一行，重复执行不追加。" },
+        { "name": "同步时间", "type": "datetime", "style": { "format": "yyyy/MM/dd HH:mm" } },
+        { "name": "阶段完成", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "条目完成", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "决策条数", "type": "number", "style": { "type": "plain", "precision": 0 } },
+        { "name": "最新决策", "type": "text" },
+        { "name": "摘要", "type": "text", "description": "本次同步的增删改统计。" }
+      ]
+    }
+  ]
+}

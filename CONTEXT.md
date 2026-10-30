@@ -367,6 +367,32 @@ and session dir are ours to set per run. `RunSpec.agentDir` exists
 lands. Verified Pi CLI flags: `--skill`, `--append-system-prompt`,
 `--session-dir`, `--extension`, `--no-context-files`.
 
+### Q36 — Feishu Bitable as a projection of the plan (2026-10-31)
+**A**: project progress is mirrored into a Bitable **under the wiki space**, derived
+from the repo, never hand-maintained. **R**: user wants live progress management
+without leaving Feishu, while keeping the repo as the single source of truth (Q17).
+- Node is created in-space: `lark-cli wiki +node-create --obj-type bitable`, so the
+  tracker sits in the wiki tree rather than as a stray Drive doc.
+- Tables: 项目阶段 / 里程碑 / 里程碑条目 / 风险登记 / 延后清单 / 项目总览 / 进展记录.
+  Schema is committed as `docs/feishu-bitable.json` (JSON, not Markdown, so
+  `just verify-docs` does not claim it).
+- **Upsert by business key, never delete-and-rebuild**: 阶段号 / 里程碑号 /
+  条目主键 (e.g. `M3.5#4`) / 风险 / 项. Rebuilding would drop user-added columns,
+  rows and every `record_id`.
+- Rows that leave the docs are flagged `仓库内=已移除`; a run that would flag ≥3 rows
+  **and** over half a table is refused unless re-run with `--allow-mass-removal`.
+  A renamed doc section must not silently read as "the project cancelled everything".
+- `进展记录` is append-only, keyed by a content hash: unchanged repo ⇒ zero writes,
+  so "sync every change" costs nothing when nothing changed.
+- Status vocabulary is fixed select options derived from the doc markers; anything
+  the parser cannot classify becomes `未标注` with `状态原文` preserved. Absence of a
+  marker is never rendered as completion.
+- The parser adapts to the docs, not the reverse: an expected table header or section
+  that disappears fails the sync loudly.
+- Offline gate: `just verify-bitable` + `just test-scripts` (node:test, because
+  vitest is scoped to `packages/**`). `just sync-bitable` is manual like
+  `just sync-docs` — it needs the local lark-cli Keychain credential.
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

@@ -45,7 +45,7 @@ packages/server/         Fastify API + SSE + standalone worker entrypoints
 packages/web/            assistant-ui workbench (external-store projection)
 packages/cost-report/    daily self-assessment from session logs
 docs/                    product/architecture/plan docs + Feishu sync manifest
-scripts/                 guardrail self-test, doc sync, live pi smoke
+scripts/                 guardrail self-test, doc sync, live pi smoke, I2 import evidence
 .git-hooks/              naming + rule-change guard
 ref/                     READ-ONLY reference checkouts (teamagentx et al.)
 ```
@@ -89,9 +89,12 @@ and the UI with `pnpm --filter @my-team-agents/web dev`.
 | CLI smoke | cost-report | `just verify-cli` | yes |
 | Guardrail self-test | guardrail scripts | `just test-guardrails` | yes |
 | Doc-sync mapping | `docs/feishu-sync.json` + mapped sources | `just verify-docs` | yes |
+| Bitable sync mapping | `docs/feishu-bitable.json` + parsed sources | `just verify-bitable` | yes |
+| Sync-layer unit tests | `scripts/*.test.mjs` | `just test-scripts` | yes |
 | Package resolution | every workspace package | `just verify-packages` | yes |
 | Tests without any build | all packages | `just test-no-build` | yes |
 | Real Pi end-to-end | runtime-pi + live model | `just pi-smoke` | no (needs pi + network) |
+| Template import evidence | `packages/orchestrator/src/template-import.ts` | `just verify-import` | no (needs local `ref/` zips) |
 
 Every command above resolves to a real `justfile` target. Do not add a row that
 does not have one.
@@ -150,6 +153,32 @@ just sync-docs docs/architecture.md   # sync one doc
 - Feishu node titles follow each document's first `# ` heading — `overwrite`
   sets the docx title. Keep that heading stable if you need a stable label.
 
+### Progress tracker (Bitable)
+
+Project state is also mirrored into a Feishu Bitable under the same wiki space,
+so progress is live without reading Markdown:
+
+```bash
+just verify-bitable   # offline: parse docs + validate docs/feishu-bitable.json
+just test-scripts     # unit tests for the parser/upsert layer
+just sync-bitable     # upsert phases / milestones / risks / changelog
+just sync-all         # docs + Bitable in one go (the usual post-change command)
+```
+
+- Tables and fields are declared in `docs/feishu-bitable.json`; rows come from
+  `docs/project-plan.md` (阶段表、里程碑、风险登记、延后清单) and `CONTEXT.md`
+  (决策日志). `scripts/feishu-bitable.mjs` is the pure layer,
+  `scripts/sync-feishu-bitable.mjs` the lark-cli driver.
+- Upsert is keyed on stable business keys (阶段号 / 里程碑号 / 条目主键 / 风险 / 项).
+  Rows are never deleted: a row that leaves the docs is flagged `仓库内=已移除`,
+  and `进展记录` is append-only, deduplicated by content hash.
+  So human-added columns, rows and record ids survive every sync.
+- Same discipline as docs: the Bitable is a **projection**. Do not hand-maintain
+  derived columns in Feishu; edit `docs/project-plan.md` and run `just sync-bitable`.
+- `base_token` starts as `PENDING_FIRST_PROVISION`. The first `just sync-bitable`
+  in a terminal that can reach the Keychain creates the node, writes the real
+  tokens back into `docs/feishu-bitable.json`, and that rewrite must be committed.
+
 ## Conventions
 
 - TypeScript strict; `noUncheckedIndexedAccess` is on — index access needs guards.
@@ -206,6 +235,9 @@ checker; nothing here is advisory only.
 | Full matrix green on push/PR | repo | `.github/workflows/ci.yml` (CI) | gate |
 | Test scope excludes `ref/` | `vitest.config.ts` | `just test` | block |
 | Doc-sync mapping is complete | `docs/feishu-sync.json` + mapped sources | `just verify-docs` | block |
+| Bitable sync mapping is complete | `docs/feishu-bitable.json` + parsed docs | `just verify-bitable` | block |
+| Sync layer tests pass | `scripts/*.test.mjs` | `just test-scripts` | block |
+| Template package imports with rollback proven | `packages/orchestrator/src/template-import.ts` + `ref/teamagentx-templates/*.zip` | `just verify-import` | gate |
 
 ## Deferred Modules
 

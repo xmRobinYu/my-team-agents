@@ -69,7 +69,7 @@ echo "guardrails: Verification Matrix commands must exist in justfile"
 if [ ! -f "$ROOT/justfile" ]; then
   bad "justfile missing"
 else
-  for target in typecheck test build verify-cli test-guardrails verify-docs sync-docs verify-packages test-no-build; do
+  for target in typecheck test build verify-cli test-guardrails verify-docs verify-bitable test-scripts sync-docs sync-bitable sync-all verify-packages test-no-build; do
     if grep -qE "^${target}([ :])" "$ROOT/justfile"; then
       pass "justfile defines '${target}'"
     else
