@@ -119,14 +119,37 @@ revisit ≤ 5，审计开启。
 `tenant / project / member / model` 聚合并输出表格或 JSON。`--since-file` 写回
 entry-id 游标，使**每日重复运行幂等**（已实测：第二次运行新增 0 token）。
 
+## 6.5 持久化执行内核（P6）
+
+`ExecutionStore`（`orchestrator/execution-store.ts`）用 SQLite 持久化
+Task / Attempt / Event / Usage / 交接 outbox。
+
+- **崩溃不丢**：任务与事件落库，进程重启后可继续领取；`busy_timeout` 支持
+  API 与 Worker 分离的两个进程并发访问。
+- **租约**：心跳续租，过期由 `recoverExpired` 接管；fencing token 拒绝旧
+  Attempt 的迟到写入。
+- **重试**：每批次最多 3 次自动尝试 + 退避；人工重试开新批次并保留历史；
+  确定性恢复快照携带原始任务与上次错误；runtime 支持时恢复原 Pi 会话（Q18）。
+- **安全**：未知非只读工具结果转 `blocked`，需人工确认；取消链不可被重试复活。
+
+## 6.6 服务端与 UI 投影（P7a）
+
+`packages/server` 提供 Fastify API 与 SSE，API 与 Worker 为独立进程，共享 SQLite。
+
+UI 用 `@assistant-ui/react-pi` 的 `usePiRuntime`。`PiClient` 是传输无关接口，
+因此浏览器经 `createPiHttpClient({ baseUrl: "/api/pi" })` 连**我们自己的服务端**，
+**不直连 Pi 进程**。`pi-thread.ts` / `pi-routes.ts` 把 Task 投影为 Thread、把
+持久化事件翻译为 PiClient 事件，服务端保持唯一权威；刻意不使用会绕过持久化
+内核的 `createPiNodeClient`。详情面板仍读 `/api/tasks/:id`，因为 attempts、usage、
+handoffs、chain 是 PiClient 契约不建模的 P6 证据。
+
 ## 7. 扩展接口（刻意留白，不生效）
 
 | 接口 | 位置 | 未来填充 |
 |---|---|---|
-| 按 run 的 `agentDir` | `RunSpec.agentDir`、`Project.agentDir` | 多租户隔离；react-pi 的 `agentDir` 目前只能在 supervisor 构造时固定（已核实），需补丁 + 上游 PR |
+| 按 run 的 `agentDir` | `RunSpec.agentDir`、`Project.agentDir` | 多租户隔离；UI 经 `/api/pi` 投影连服务端，不直连 react-pi supervisor，租户隔离由服务端承担 |
 | 职级 | `Member.grade` | 晋升体系 / HR 评审 |
-| 队列持久化 | 当前为进程内 FIFO | 崩溃丢失排队任务，为已知 V1 限制（Q16） |
-| 鉴权与委托 | 尚未建模 | 职能型 / 分身型的前置条件 |
+| 鉴权与委托 | 尚未建模（P7b） | 职能型 / 分身型的前置条件；当前仅本机回环模式 |
 | 技能/工具市场 | 尚未建模 | 先做注册与版本，再做市场 |
 
 ## 8. 治理机制
@@ -143,8 +166,9 @@ entry-id 游标，使**每日重复运行幂等**（已实测：第二次运行�
 
 ## 9. 已知缺口（不掩盖）
 
-1. `pi` 全局二进制未安装 → Pi 适配器无法端到端冒烟（会以 `failed` 优雅报错）。
-2. codex 稳定结构化事件输出未确认 → 归一化按纯文本降级。
-3. 无 eslint → 刻意不提供 `just lint`，避免幻影门禁。
-4. 队列不持久 → 进程重启丢任务。
-5. 服务端与 assistant-ui 未接入 → V1 无 UI。
+1. codex 稳定结构化事件输出未确认 → 归一化按纯文本降级。
+2. 无 eslint → 刻意不提供 `just lint`，避免幻影门禁。
+3. 队列已持久化（SQLite + 租约 + fencing token）；崩溃不丢任务，重试保留历史。
+4. 服务端与 assistant-ui 已接入：`/api/pi` 投影 + `usePiRuntime`，服务端权威。
+5. P7b 未做：鉴权、租户隔离、审计；当前仅本机回环，不可暴露到共享环境。
+6. `node:sqlite` 为实验性 API，测试会打印 `ExperimentalWarning`。

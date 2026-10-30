@@ -1,5 +1,10 @@
 # P6/P7 实施分析：持久队列与服务端 API / assistant-ui 接入
 
+> **状态指引（2026-10-29）**：本文是落地**前**的差距分析快照，其「未提交 / 未装依赖 /
+> 门禁不通过 / 不建议用 react-pi」等结论**已成历史**。当前 P6 与 P7a 已完成并通过门禁，
+> UI 已全面改用 `@assistant-ui/react-pi`（经 `/api/pi` 投影，见 `CONTEXT.md` Q27）。
+> 现状以 `docs/project-plan.md`、`docs/architecture.md` §6.5–6.6 与代码为准；本文保留作决策溯源。
+>
 > 本文是**分析文档**，不描述已完成的事实，也不替代代码。结论以仓库当前工作树为准。
 > 决策依据：`CONTEXT.md` Q16（v1 队列为内存 FIFO）、Q18（任务级恢复）、Q19（SQLite +
 > API/Worker 分离 + 单活跃 Worker）、Q20（保守工具恢复 + 事务化 outbox）、Q21（3 次
