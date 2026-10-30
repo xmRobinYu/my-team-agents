@@ -18,6 +18,7 @@
 | P6 队列持久化 | 崩溃不丢任务、重试、租约 | ✅ 完成 |
 | P7a 服务端 + UI（本机） | API 骨架、SSE、assistant-ui（react-pi）接入 | ✅ 完成 |
 | P7b 团队服务化 | 鉴权、租户隔离、审计 | ⬜ 待启 |
+| P8 多 agent 群聊 | ChatRoom、团队模板导入、auto 接力与流程守卫 | ⬜ 下一步（PRD 已定稿） |
 
 已验证：`rm -rf packages/*/dist && just check` 退出码 0（含 `verify-docs` 映射检查）；
 `pnpm test` / `just test-no-build` 在无构建产物下退出码 0；
@@ -57,6 +58,20 @@ react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激�
 - ✅ assistant-ui 集成：`@assistant-ui/react-pi` 的 `usePiRuntime`，经 `/api/pi`
   投影层连服务端（不直连 Pi 进程，服务端保持权威）；
 - ⬜ 团队化（P7b）：鉴权、租户隔离、审计、按租户 `agentDir` 隔离。
+
+### M3.5 — 多 agent 群聊
+
+目标：从「单 agent 会话」升级为「团队群聊」，复用 teamagentx 的模板生态。
+
+- ⬜ ChatRoom 实体：共享消息流 + 成员 + 规则，与 Group（视图）分离；
+- ⬜ 团队模板导入：解析 teamagentx 包（room + agents + skills），一键成群；
+- ⬜ 人格隔离：每个 agent 独立 agentDir（cwd + skills + AGENTS.md）；
+- ⬜ auto 接力：`handoff_to` 优先 + `@` 文本次路径，按目标去重；
+- ⬜ 流程守卫：循环检测、轮次上限（默认 5）、`[讨论结束]` 终止，状态持久化；
+- ⬜ UI：三栏布局 + 多 agent 头像 + `@` 输入 + 成员面板 + 技能管理；
+- 验收：真实模型下导入 `全栈软件研发` 包并跑通 @提及、接力、守卫与崩溃恢复。
+
+PRD：`docs/prd/multi-agent-group-chat.md`；决策：`CONTEXT.md` Q28–Q35。
 
 ### M4 — 职能型数字员工
 

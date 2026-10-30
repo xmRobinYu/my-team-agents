@@ -9,6 +9,11 @@ Project context, vocabulary, and the decision log. Decisions here are
 |---|---|---|
 | Project | Owns one workspace (`.pi/`, AGENTS.md, git repo) | settled |
 | Group | A collaboration **view** over a project | settled |
+| ChatRoom | The **entity** that holds a shared message stream, its rules, and its own set of agents. A Group is only a view; a ChatRoom carries messages | settled (Q33) |
+| Agent persona | One agent's identity: its own agentDir (cwd + skills + AGENTS.md) plus role prompt | settled (Q29) |
+| Round | One agent trigger (by `@` or by tool). The round cap bounds agent-to-agent chatter | settled (Q30) |
+| Coordinator | The agent designated by a template package to wrap up when the round cap is hit | settled (Q30) |
+| Team template | A package (zip) importing a whole ChatRoom: room name + rules + N agents + their skills | settled (Q28) |
 | Member | Human or agent; agents bind to one project | settled |
 | Reporting role | PMO / group manager / HR; may span projects | settled |
 | Handoff | Structured agent-to-agent dispatch, bounded by guardrails | settled |
@@ -258,9 +263,119 @@ chat/mapping(+test), useWorkbenchData — all superseded by usePiRuntime.
 end-to-end via the real react-pi HTTP client (create → send → SSE → idle,
 underlying task `succeeded`).
 
+### Q28 — V1 多 agent 群聊与团队模板 (2026-10-30)
+**A**: replicate teamagentx's group chat under OUR durable kernel, importing
+whole-team template packages. **R**: user answered Q28.1–Q28.4.
+- **Template = whole-team snapshot, not a role.** A teamagentx template zip is
+  `manifest.json` + `snapshot.json`, and snapshot carries `room` (name, rules)
+  + `agents[]` (each with prompt, model, thinking mode, capabilities) +
+  `categories` + `cronTasks`. Importing one package produces a ready group.
+  (Verified: `全栈软件研发` = room + 5 agents; 32 packages available.)
+- **Collaboration semantics are ported, the backend is not.** teamagentx runs
+  Fastify + Socket.io + Prisma with loop/round guards in an **in-memory Map**
+  (its spec AC3.4 accepts losing state on restart). We keep the durable
+  ExecutionStore and implement mention-trigger, round cap, loop detection and
+  termination on top of it — group state, rounds and termination persist.
+- **The user is a group member** and sees the shared message stream, as in
+  teamagentx; `@name` selects who replies.
+- **Scope**: build the import mechanism and validate a small number of packages
+  first, not all 32.
+**Open (resolved in Q29)**: how a multi-agent group maps onto react-pi threads.
+
+### Q29 — Group/thread mapping, persona isolation, flow control (2026-10-30)
+**A**: one group = one thread with authored messages; each agent gets its own
+agentDir; all three flow guards land, persisted. **R**: user answered Q29.1–Q29.3.
+- **Group == one thread.** The shared stream is one PiClient thread; each
+  message carries its author (user or a specific agent). This is what makes the
+  UI look like teamagentx. Agent replies are projected into that thread.
+- **Persona = own agentDir** (cwd + skills + AGENTS.md), not just a prompt swap.
+  Sessions are isolated per agent too.
+- **All three guards** — loop detection, round cap (default 5), `[讨论结束]`
+  termination — but state lives in SQLite, not in memory as upstream does.
+- **UI scope for V1**: three-column layout (conversation list / group chat with
+  multi-agent avatars + `@` input / member panel). Task panels come later.
+
+### Q30 — Context scope, round counting, coordinator (2026-10-30)
+**A**: full group history is injected; a round is one agent trigger; the
+coordinator is designated by the template package. **R**: user answered Q30.1–Q30.3.
+- **Context**: when an agent is triggered it receives the full group
+  conversation, including other agents' messages, plus its own persona. This is
+  what makes it a group rather than parallel private chats.
+- **Round**: one agent trigger (by `@` or by tool) counts as one round; hitting
+  the cap forces the coordinator to wrap up (matches upstream AC2.1).
+- **Coordinator**: designated inside the template package (upstream uses
+  `defaultAgentId`); e.g. `齐活林（交付总监）` in `全栈软件研发`.
+**Tension resolved in Q31.**
+
+### Q31 — History injection, concurrency, out-of-scope template parts (2026-10-30)
+**A**: no session resume; agents in a group run serially; skip cronTasks and
+categories. **R**: user answered Q31.1–Q31.3.
+- **No resume.** Every trigger starts a clean Pi process and injects the group
+  history. No double-counting, and it *simplifies* recovery: a crashed trigger
+  is replayed by re-injecting the same history, so no Pi-internal state has to
+  be restored. This narrows Q18's "resume the original session" for group chat:
+  session resume stays a Pi-adapter capability but the group path does not use it.
+- **Serial per group.** One agent runs at a time within a group; a trigger for a
+  second agent waits. Keeps the shared stream readable and bounds cost spikes.
+- **Not migrated in V1**: `cronTasks` and `categories` from template packages.
+
+### Q32 — Skills, deliverable form, acceptance gate (2026-10-30)
+**A**: full skills management UI; deliver a PRD plus updated project plan;
+acceptance = one real template package + `@` + guards. **R**: user answered Q32.1–Q32.3.
+- **Skills**: ship skill management UI, not just skill injection. This widens V1
+  beyond the three-column chat scope agreed in Q29 by at least one more page;
+  confirmed by the user in Q33 as in-scope.
+- **Deliverable**: a PRD under `docs/prd/` with user stories and acceptance
+  criteria, plus an updated `docs/project-plan.md`.
+- **Acceptance gate**: import a real template package, `@mention` an agent and
+  get an authored reply, and show the guards firing — with a real model, not mock.
+
+### Q33 — ChatRoom vs Group; skills UI scope (2026-10-30)
+**A**: introduce `ChatRoom` as the entity that carries messages; `Group` stays a
+view. Full skills management UI ships in V1. **R**: user answered Q33.1–Q33.2.
+- **Why a new term**: the glossary defined `Group` as a *view* over a project.
+  A view cannot hold a message stream, members, rules or its own agent set.
+  Conflating them would have forced `Group` to mean two different things.
+- **Skills UI** is in V1 scope despite widening the UI surface agreed in Q29.
+
+### Q34 — Trigger mode, ChatRoom ownership, agent-to-agent dispatch (2026-10-30)
+**A**: auto mode (agents can trigger agents); a ChatRoom belongs to a Project and
+shares its workspace; both dispatch paths are recognised with `handoff_to` first.
+**R**: user answered Q34.1–Q34.3.
+- **Auto mode**: agent messages can trigger other agents, so loop detection and
+  the round cap are genuinely required, not defensive decoration.
+- **ChatRoom belongs to a Project**; imported agents become that project's
+  members and share the workspace (consistent with "agents bind to one project").
+- **Amends Q14**: agent-to-agent dispatch recognises both the structured
+  `handoff_to` tool and `@name` text in agent messages, with `handoff_to` taking
+  precedence. Q14's "prose is never scraped" is therefore narrowed — it still
+  holds for the authoritative path, but text mentions are a secondary trigger.
+
+### Q35 — Dispatch dedup (2026-10-30)
+**A**: both paths are parsed and results are deduplicated **by target agent**.
+**R**: user answered Q35.1.
+- A target is enqueued at most once per source message, so a message that names
+  the same agent via `handoff_to` and `@` triggers it once, not twice.
+- Distinct targets from the two paths are both honoured.
+
+**Amends Q8**: the claim that per-agent `agentDir` is blocked upstream applies
+only to react-pi's `createPiNodeClient` supervisor, which we never use. Our
+`PiAdapter` spawns `pi` itself (`cwd: spec.workspacePath`), so agentDir, skills
+and session dir are ours to set per run. `RunSpec.agentDir` exists
+(`runtime-core/src/adapter.ts:66`) but its comment still says "blocked upstream"
+— that comment is wrong for our architecture and must be corrected when P8
+lands. Verified Pi CLI flags: `--skill`, `--append-system-prompt`,
+`--session-dir`, `--extension`, `--no-context-files`.
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:
+
+- teamagentx web app is React + react-router + zustand + Socket.io + Radix/
+  Tailwind (shadcn `components.json`); three-column layout: conversation list,
+  chat area, side panel (agents / task-board / task-queue / history).
+- teamagentx `LICENSE` is MIT (Copyright 2026 dbfu) — copying UI structure is
+  permitted; attribution belongs in a NOTICE if we ship copied code.
 
 - `mention_agents` structured handoff replaced regex/prose parsing — adopted.
 - Handoff guardrails (fanout/depth/budget/revisit) are deterministic — adopted.

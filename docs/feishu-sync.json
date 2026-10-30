@@ -44,6 +44,13 @@
       "node": "P6/P7 实施分析：持久队列与服务端 API / assistant-ui 接入",
       "node_token": "Ky1jwZfMOiUjaUkvpT0cUPKhnGf",
       "document_id": "JGs3dnVfuosnVVxiYoscn6j8n1e"
+    },
+    {
+      "source": "docs/prd/multi-agent-group-chat.md",
+      "node": "PRD：多 Agent 群聊工作台（V1）",
+      "node_token": "PENDING_FIRST_SYNC",
+      "document_id": "PENDING_FIRST_SYNC",
+      "_note": "占位 ID。在可访问 Keychain 的交互终端执行 `just sync-docs` 前，需先创建飞书节点并把真实 node_token/document_id 填回此处；占位值不会命中任何真实文档，同步会报错而非覆盖。"
     }
   ]
 }
