@@ -7,9 +7,10 @@
  * UI fidelity, no mid-run steering — and the capability block below exists so the
  * server never offers an action the runtime cannot perform.
  *
- * Extension seams for later phases (do not implement now, keep the shape stable):
- *  - `agentDirPerRun`: per-tenant/per-project Pi config dir (blocked upstream in
- *    @assistant-ui/react-pi — agentDir is supervisor-construction-only).
+ * Extension seams:
+ *  - `agentDirPerRun`: per-run persona dir. Pi consumes it as the spawn `cwd`
+ *    (upstream Pi has no --agent-dir flag; resource discovery keys off cwd), so the
+ *    run no longer sees the project workspace — see `RunSpec.agentDir`.
  *  - `approval`: codex exposes --ask-for-approval/--sandbox; Pi has no built-in
  *    approval system, so Pi's boundary must come from the process/container.
  */
@@ -62,7 +63,14 @@ export interface RunSpec {
   memberId: string;
   /** Project-owned working directory (project dir is decoupled from group membership). */
   workspacePath: string;
-  /** Future: per-tenant/project Pi config dir. Ignored by v1 Pi adapter until upstream allows it. */
+  /**
+   * I3 persona dir for this run. Pi has no `--agent-dir` switch, so adapters apply
+   * it as the child process `cwd`: upstream `docs/cli.md` states that the working
+   * directory controls project configuration, resource discovery and session
+   * grouping. Cost of that mechanism: the agent can no longer see
+   * `workspacePath`. Adapters that cannot isolate per run ignore this and report
+   * `agentDirPerRun: false`.
+   */
   agentDir?: string;
   model?: string;
   prompt: string;

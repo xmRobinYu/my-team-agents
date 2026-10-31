@@ -124,14 +124,16 @@ describe("PiAdapter lifecycle", () => {
     const adapter = new PiAdapter({ approveProjectResources: false, spawn });
     const handle = await adapter.start(spec);
     // `response` and `extension_ui_request` are protocol records, not session
-    // activity (docs/rpc.md); only agent_settled may reach consumers.
+    // activity (node_modules/@earendil-works/pi-coding-agent/docs/rpc.md, upstream pi
+    // package docs); only agent_settled may reach consumers.
     for (const send of dataListeners) {
       send(`${JSON.stringify({ type: "response", command: "prompt", success: true })}\n`);
       send(`${JSON.stringify({ type: "extension_ui_request", id: "u1" })}\n`);
       send(`${JSON.stringify({ type: "agent_settled", aborted: false })}\n`);
     }
-    // The iterator terminates on stdout "end" / child "exit" (docs/rpc.md
-    // shutdown); the fake must emit one or the for-await loop hangs.
+    // The iterator terminates on stdout "end" / child "exit" (the upstream
+    // node_modules/@earendil-works/pi-coding-agent/docs/rpc.md shutdown section); the
+    // fake must emit one or the for-await loop hangs.
     child.emit("exit", 0, null);
     const seen: string[] = [];
     for await (const event of handle.events) seen.push(event.type);
@@ -165,5 +167,35 @@ describe("PiAdapter lifecycle", () => {
     const result = await handle.settled;
     expect(result.status).toBe("failed");
     expect(result.error).toContain("agent_settled");
+  });
+});
+
+describe("PiAdapter agentDir (I3)", () => {
+  /** Records the spawn options without launching any real process. */
+  const captureCwd = async (agentDir?: string): Promise<string | undefined> => {
+    let cwd: string | undefined;
+    const { spawn } = fakePi();
+    const wrapped = ((_command: string, args: string[], options?: { cwd?: string }) => {
+      cwd = options?.cwd;
+      return spawn(_command, args);
+    }) as unknown as typeof import("node:child_process").spawn;
+    const handle = await new PiAdapter({ approveProjectResources: true, spawn: wrapped })
+      .start({ ...spec, ...(agentDir ? { agentDir } : {}) });
+    for await (const _event of handle.events) { break; }
+    return cwd;
+  };
+
+  it("uses the persona dir as cwd when agentDir is present", async () => {
+    // Pi resolves personas from cwd, so this is the only mechanism that works;
+    // the trade-off is that the run cannot see the project workspace.
+    expect(await captureCwd("/tmp/persona/a1")).toBe("/tmp/persona/a1");
+  });
+
+  it("falls back to workspacePath when agentDir is absent", async () => {
+    expect(await captureCwd()).toBe(spec.workspacePath);
+  });
+
+  it("declares agentDirPerRun, matching the behaviour above", () => {
+    expect(new PiAdapter({ approveProjectResources: true }).capabilities.agentDirPerRun).toBe(true);
   });
 });

@@ -3,12 +3,17 @@
  *
  * Drives `pi --mode rpc` as a long-lived child process: strict JSONL framing on
  * stdin (one JSON object per line, LF-terminated) and JSONL events on stdout
- * (docs/rpc.md). The command set used here is from docs/rpc-commands.md:
- *   prompt / abort / clear_queue / get_session_stats
+ * (node_modules/@earendil-works/pi-coding-agent/docs/rpc.md — upstream pi package
+ * docs, not a file in this repo). The command set used here is from
+ * node_modules/@earendil-works/pi-coding-agent/docs/rpc-commands.md:
+ *   prompt / abort / clear_queue / get_state
  *
  * Trust: RPC mode cannot show Pi's interactive trust prompt, so this adapter
- * ALWAYS passes an explicit --approve/--no-approve. Without it, whether project
- * .pi/, AGENTS.md, and extensions load depends on a saved decision (docs/security.md).
+ * ALWAYS passes an explicit --approve/--no-approve, which overrides everything.
+ * Without it, whether protected project resources (.pi/settings.json, .pi/mcp.json,
+ * extensions) load falls back to a saved decision or defaultProjectTrust; context
+ * files such as AGENTS.md load either way
+ * (node_modules/@earendil-works/pi-coding-agent/docs/security.md).
  * Trust does not constrain tool access — isolation comes from the process/container.
  */
 
@@ -111,7 +116,8 @@ export class PiAdapter implements RuntimeAdapter {
     approval: "none",
     sandbox: "none",
     workspacePerRun: true,
-    agentDirPerRun: false,
+    // I3: the persona dir takes effect as the spawn cwd, so it is genuinely per-run.
+    agentDirPerRun: true,
     usageAttribution: "message",
     costCap: false,
     sessionResume: true,
@@ -142,7 +148,11 @@ export class PiAdapter implements RuntimeAdapter {
     if (this.options.extraArgs) args.push(...this.options.extraArgs);
 
     const spawnFn = this.options.spawn ?? spawn;
-    const child = spawnFn("pi", args, { cwd: spec.workspacePath });
+    // Pi has no --agent-dir switch: `@path` resource discovery, project config and
+    // session grouping all key off the working directory (upstream docs/cli.md), so
+    // the persona dir can only take effect as cwd. The accepted cost: while an
+    // agentDir run is active the agent cannot see the project workspace.
+    const child = spawnFn("pi", args, { cwd: spec.agentDir ?? spec.workspacePath });
 
     // A holder is used because the settled promise must be created before the
     // parser can call it, and the parser is what sees `agent_settled`.
@@ -152,7 +162,8 @@ export class PiAdapter implements RuntimeAdapter {
       onSessionFile?: (file: string) => void;
     } = {};
     // A resumed run already knows its session file; a fresh run learns it from
-    // `get_state` (docs/rpc-commands.md) once Pi has created the session.
+    // `get_state` (node_modules/@earendil-works/pi-coding-agent/docs/rpc-commands.md)
+    // once Pi has created the session.
     if (spec.session?.sessionPath) settledHolder.sessionFile = spec.session.sessionPath;
     const events = this.streamEvents(child, spec.runId, (record) =>
       settledHolder.onSettled?.(record), (file) => {
@@ -161,7 +172,8 @@ export class PiAdapter implements RuntimeAdapter {
     });
     const settled = this.settle(child, spec.runId, settledHolder);
 
-    // Kick off the run. `prompt` resolving means accepted, NOT completed (docs/rpc.md).
+    // Kick off the run. `prompt` resolving means accepted, NOT completed
+    // (node_modules/@earendil-works/pi-coding-agent/docs/rpc.md).
     this.send(child, { id: `${spec.runId}:prompt`, type: "prompt", message: spec.prompt,
       ...(spec.images && spec.images.length > 0
         ? { images: spec.images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType })) }
@@ -241,7 +253,8 @@ export class PiAdapter implements RuntimeAdapter {
         }
         const rawType = typeof record.type === "string" ? record.type : "";
         // `response` is a command reply and `extension_ui_request` an extension
-        // interaction, not session activity (docs/rpc.md). They are not model
+        // interaction, not session activity
+        // (node_modules/@earendil-works/pi-coding-agent/docs/rpc.md). They are not model
         // events: pushing them as `unknown` pollutes the transcript and would
         // surface protocol noise to the UI. Session events only.
         if (rawType === "response") {

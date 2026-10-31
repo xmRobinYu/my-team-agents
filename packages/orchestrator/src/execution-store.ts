@@ -24,7 +24,10 @@ export interface CreateTaskInput {
   projectId: string;
   memberId: string;
   workspacePath: string;
+  /** Persona dir for this run (I3): AGENTS.md + skills + cwd. Per-run, not per-supervisor. */
+  agentDir?: string;
   prompt: string;
+  /** Room id for group-chat tasks. Doubles as the serialization key (I3 AC3). */
   groupId?: string;
   model?: string;
   chainId?: string;
@@ -123,6 +126,8 @@ export class ExecutionStore {
   readonly db: DatabaseSync;
   /** Bounded-jitter source for retryDelay; override in tests for determinism. */
   readonly rng: () => number;
+  /** Nesting depth of the open transaction; node:sqlite cannot report it itself. */
+  private txDepth = 0;
 
   constructor(filename = ":memory:", options: { rng?: () => number } = {}) {
     this.rng = options.rng ?? Math.random;
@@ -145,6 +150,7 @@ export class ExecutionStore {
         project_id TEXT NOT NULL,
         member_id TEXT NOT NULL,
         workspace_path TEXT NOT NULL,
+        agent_dir TEXT,
         prompt TEXT NOT NULL,
         group_id TEXT,
         model TEXT,
@@ -214,14 +220,42 @@ export class ExecutionStore {
         UNIQUE(source_tool_call_id, target_member_id)
       );
     `);
+    // Databases created before I3 lack agent_dir; CREATE TABLE IF NOT EXISTS
+    // cannot add a column to an existing table.
+    const existing = this.all("PRAGMA table_info(tasks)");
+    if (!existing.some((column) => column.name === "agent_dir")) {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN agent_dir TEXT");
+    }
   }
 
   close(): void { this.db.close(); }
 
-  private tx<T>(fn: () => T): T {
+  /**
+   * One `BEGIN IMMEDIATE` for `fn`. A nested call joins the open transaction
+   * instead of starting a second one (SQLite forbids that), which is what lets
+   * `postRoomMessage` wrap message + Tasks + `createTask` in a single commit.
+   */
+  transaction<T>(fn: () => T): T {
+    if (this.txDepth > 0) {
+      this.txDepth += 1;
+      try { return fn(); } finally { this.txDepth -= 1; }
+    }
+    this.txDepth = 1;
     this.db.exec("BEGIN IMMEDIATE");
-    try { const out = fn(); this.db.exec("COMMIT"); return out; }
-    catch (err) { this.db.exec("ROLLBACK"); throw err; }
+    try {
+      const out = fn();
+      this.db.exec("COMMIT");
+      return out;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    } finally {
+      this.txDepth = 0;
+    }
+  }
+
+  private tx<T>(fn: () => T): T {
+    return this.transaction(fn);
   }
 
   private one(sql: string, ...args: Array<string | number | null>): Row | undefined {
@@ -246,6 +280,7 @@ export class ExecutionStore {
       projectId: text(row.project_id)!,
       memberId: text(row.member_id)!,
       workspacePath: text(row.workspace_path)!,
+      agentDir: text(row.agent_dir) ?? undefined,
       prompt: text(row.prompt)!,
       groupId: text(row.group_id) ?? undefined,
       model: text(row.model) ?? undefined,
@@ -285,11 +320,11 @@ export class ExecutionStore {
     const chainId = input.chainId ?? `chain-${randomUUID()}`;
     this.run("INSERT OR IGNORE INTO chains(id) VALUES(?)", chainId);
     this.run(`INSERT INTO tasks(
-      id,chain_id,parent_task_id,tenant_id,project_id,member_id,workspace_path,prompt,
+      id,chain_id,parent_task_id,tenant_id,project_id,member_id,workspace_path,agent_dir,prompt,
       group_id,model,depth,idempotency_key,recovery_snapshot,status,available_at,created_at,updated_at
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)`,
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)`,
       id, chainId, input.parentTaskId ?? null, input.tenantId, input.projectId,
-      input.memberId, input.workspacePath, input.prompt, input.groupId ?? null,
+      input.memberId, input.workspacePath, input.agentDir ?? null, input.prompt, input.groupId ?? null,
       input.model ?? null, input.depth ?? 0, input.idempotencyKey ?? null,
       input.recoverySnapshot ?? null, input.availableAt ?? now, now, now);
     return this.getTask(id)!;
@@ -393,6 +428,16 @@ export class ExecutionStore {
     }));
   }
 
+  /**
+   * Claim the next runnable Task.
+   *
+   * I3 AC3 — same-room serialisation: a Task carrying `groupId` is skipped while
+   * another Task of that group still owns a live Attempt (`leased`/`running` with an
+   * unexpired lease). The exclusion lives in this SELECT, inside the same
+   * `BEGIN IMMEDIATE` transaction as the Attempt INSERT, so two Worker processes
+   * cannot both claim into one room — serialisation is a property of the queue,
+   * not of "there happens to be only one Worker ticking".
+   */
   claimNext(workerId: string, now = Date.now(), leaseMs = 30_000): { task: TaskRecord; attempt: AttemptRecord } | null {
     return this.tx(() => {
       const row = this.one(`SELECT t.*,c.cancel_requested FROM tasks t
@@ -400,7 +445,13 @@ export class ExecutionStore {
         WHERE (t.status='queued' OR (t.status='retry_wait' AND t.available_at<=?))
           AND t.available_at<=? AND t.batch_attempts<3
           AND COALESCE(c.cancel_requested,0)=0
-        ORDER BY t.created_at LIMIT 1`, now, now);
+          AND (t.group_id IS NULL OR NOT EXISTS (
+            SELECT 1 FROM tasks busy
+            JOIN attempts live ON live.task_id=busy.id
+            WHERE busy.group_id = t.group_id AND busy.id <> t.id
+              AND live.status IN ('leased','running') AND live.lease_expires_at > ?
+          ))
+        ORDER BY t.created_at LIMIT 1`, now, now, now);
       if (!row) return null;
       const task = this.taskFrom(row)!;
       const fencing = task.fencingToken + 1;

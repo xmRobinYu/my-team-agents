@@ -25,6 +25,18 @@ export {
   type CreateRoomInput,
 } from "./room-store.js";
 export {
+  resolveMentions,
+  type MentionResolution,
+} from "./mention.js";
+export {
+  buildMentionPrompt,
+  postRoomMessage,
+  RoomTriggerError,
+  type PostedRoomMessage,
+  type PostRoomMessageInput,
+  type RoomTriggerErrorCode,
+} from "./room-trigger.js";
+export {
   importTemplatePackage,
   parseFrontmatter,
   parseTemplatePackage,

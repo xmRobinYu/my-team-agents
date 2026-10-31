@@ -5,6 +5,7 @@
  *   GET  /api/rooms                list ChatRooms
  *   GET  /api/rooms/:id/agents     the room's agents, coordinator flagged
  *   GET  /api/rooms/:id/messages   the shared message stream
+ *   POST /api/rooms/:id/messages   @mention trigger (I3): queue one Task per target
  *
  * Transport for the package — two shapes, both accepted:
  *   1. `{"path": "/abs/or/rel/包.zip", "projectId"?: "...", "dryRun"?: true}`
@@ -32,7 +33,10 @@ import { resolve } from "node:path";
 import {
   importTemplatePackage,
   planTemplateImport,
+  postRoomMessage,
+  RoomTriggerError,
   TemplateImportError,
+  type ExecutionStore,
   type ImportResult,
   type PlannedImport,
   type RoomStore,
@@ -41,10 +45,25 @@ import {
 
 export interface RoomRouteOptions {
   store: RoomStore;
+  /**
+   * I3: the mention trigger writes Tasks beside the message, so it needs the
+   * ExecutionStore over the SAME database handle as `store` (one commit, or none).
+   */
+  executions: ExecutionStore;
   /** Root for generated persona dirs. Defaults to `<cwd>/.rooms`. */
   roomsRoot?: string;
   /** Project an imported room belongs to when the caller does not say (Q34). */
   defaultProjectId?: string;
+  /** Project workspace the triggered Tasks run against. Defaults to `<cwd>`. */
+  defaultWorkspacePath?: string;
+  /** Task attribution tenant; the API is loopback-only, single-tenant (P7a). */
+  defaultTenantId?: string;
+}
+
+interface PostMessageBody {
+  content?: string;
+  /** Overrides the project workspace the Tasks point at. */
+  workspacePath?: string;
 }
 
 interface ImportBody {
@@ -109,9 +128,13 @@ export async function registerRoomRoutes(
   app: FastifyInstance,
   options: RoomRouteOptions,
 ): Promise<void> {
-  const { store } = options;
+  const { store, executions } = options;
   const roomsRoot = options.roomsRoot ?? resolve(process.cwd(), ".rooms");
   const defaultProjectId = options.defaultProjectId ?? "my-team-agents";
+  // Tasks run against the project workspace; the persona dir takes over the child
+  // cwd (I3), so workspacePath stays attribution + the fallback for agents without one.
+  const defaultWorkspacePath = options.defaultWorkspacePath ?? process.cwd();
+  const defaultTenantId = options.defaultTenantId ?? "default";
 
   await app.register(async (scope) => {
     // Raw zip upload: keep the bytes, do not try to parse them as JSON.
@@ -201,6 +224,37 @@ export async function registerRoomRoutes(
         const asked = Number(request.query.limit);
         const limit = Number.isFinite(asked) && asked > 0 ? Math.min(Math.floor(asked), 2000) : 500;
         return store.listMessages(request.params.id, limit);
+      },
+    );
+
+    // I3: @mention trigger. `postRoomMessage` owns the validation order and the
+    // all-or-nothing commit; this layer only maps codes onto statuses.
+    scope.post<{ Params: { id: string }; Body: PostMessageBody | undefined }>(
+      "/api/rooms/:id/messages",
+      async (request, reply) => {
+        const body = request.body ?? {};
+        try {
+          const result = postRoomMessage(store, executions, {
+            roomId: request.params.id,
+            content: typeof body.content === "string" ? body.content : "",
+            tenantId: defaultTenantId,
+            workspacePath: body.workspacePath?.trim() ? body.workspacePath : defaultWorkspacePath,
+          });
+          return reply.code(201).send(result);
+        } catch (err) {
+          if (err instanceof RoomTriggerError) {
+            const status = err.code === "ROOM_NOT_FOUND" ? 404 : 400;
+            return reply.code(status).send({
+              error: err.detail,
+              code: err.code,
+              names: err.names,
+              hint: "提及未生效：消息与任务都未写入（事务已回滚）",
+            });
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          request.log.error({ err }, "room message post failed");
+          return reply.code(500).send({ error: `触发失败：${message}`, code: "INTERNAL" });
+        }
       },
     );
   });

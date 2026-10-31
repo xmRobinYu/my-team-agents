@@ -1,7 +1,65 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import type { CanonicalEvent, RunHandle, RuntimeAdapter } from "@my-team-agents/runtime-core";
 import { ExecutionStore, retryDelay, type TaskResult } from "./execution-store.js";
 import { createDurableWorker } from "./durable-worker.js";
+
+describe("agent_dir migration (I3)", () => {
+  it("adds agent_dir to databases created before the column existed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mta-migrate-"));
+    const dbPath = join(dir, "queue.sqlite");
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        chain_id TEXT NOT NULL,
+        parent_task_id TEXT,
+        tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        member_id TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        group_id TEXT,
+        model TEXT,
+        depth INTEGER NOT NULL DEFAULT 0,
+        batch INTEGER NOT NULL DEFAULT 1,
+        batch_attempts INTEGER NOT NULL DEFAULT 0,
+        fencing_token INTEGER NOT NULL DEFAULT 0,
+        idempotency_key TEXT UNIQUE,
+        recovery_snapshot TEXT,
+        session_file TEXT,
+        status TEXT NOT NULL,
+        active_attempt_id TEXT,
+        available_at INTEGER NOT NULL,
+        result TEXT,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO tasks(id,chain_id,tenant_id,project_id,member_id,workspace_path,prompt,status,available_at,created_at,updated_at)
+        VALUES('legacy-task','legacy-chain','t1','p1','a','/workspace/legacy','old work','queued',100,100,100);
+    `);
+    legacy.close();
+
+    const store = new ExecutionStore(dbPath);
+    const migrated = store.createTask({ ...input, agentDir: "/tmp/persona/a1" }, 100);
+    const plain = store.createTask(input, 100);
+    expect(store.getTask(migrated.id)?.agentDir).toBe("/tmp/persona/a1");
+    expect(store.getTask(plain.id)?.agentDir).toBeUndefined();
+    expect(store.getTask("legacy-task")?.agentDir).toBeUndefined();
+    expect(store.getTask(migrated.id)?.workspacePath).toBe(input.workspacePath);
+    store.close();
+
+    const probe = new DatabaseSync(dbPath);
+    const columns = probe.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+    probe.close();
+    expect(columns.some((column) => column.name === "agent_dir")).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
 
 const result: TaskResult = { outcome: "success", summary: "done", artifacts: [], remainingRisks: [] };
 const event = (attemptId: string, extra: Partial<CanonicalEvent> = {}): CanonicalEvent => ({
@@ -128,6 +186,43 @@ describe("ExecutionStore", () => {
     expect(store.getUsage()[0]?.totalTokens).toBe(15);
     expect(store.getUsage()[0]?.totalCost).toBe(2);
   });
+
+  it("holds a group's second task while its first Attempt is live (I3 AC3)", () => {
+    const store = new ExecutionStore();
+    // availableAt is pinned to 100 for all four: createTask's `now` also stamps
+    // available_at, and these tests claim at t=100.
+    const first = store.createTask({ ...input, memberId: "a", groupId: "room-1", availableAt: 100 }, 100);
+    const second = store.createTask({ ...input, memberId: "b", groupId: "room-1", availableAt: 100 }, 101);
+    const other = store.createTask({ ...input, memberId: "c", groupId: "room-2", availableAt: 100 }, 102);
+    const loose = store.createTask({ ...input, memberId: "d", availableAt: 100 }, 103);
+    expect(store.claimNext("w1", 100)?.task.id).toBe(first.id);
+    // Another Worker cannot slip a second room-1 task in beside the live Attempt.
+    expect(store.claimNext("w2", 100)?.task.id).toBe(other.id);
+    expect(store.claimNext("w3", 100)?.task.id).toBe(loose.id);
+    expect(store.claimNext("w4", 100)).toBeNull();
+
+    // The blocked task is untouched, still queued — not failed, not lost.
+    expect(store.getTask(second.id)?.status).toBe("queued");
+    store.completeSuccess(
+      store.getTask(first.id)!.activeAttemptId!,
+      store.getTask(first.id)!.fencingToken,
+      result, [], 200,
+    );
+    expect(store.claimNext("w5", 200)?.task.id).toBe(second.id);
+    store.close();
+  });
+
+  it("releases a group when the live Attempt's lease expires", () => {
+    const store = new ExecutionStore();
+    const first = store.createTask({ ...input, groupId: "room-1" }, 100);
+    const second = store.createTask({ ...input, memberId: "b", groupId: "room-1" }, 101);
+    const claimed = store.claimNext("dead-worker", 100, 1_000)!;
+    expect(claimed.task.id).toBe(first.id);
+    expect(store.claimNext("w2", 1_050)).toBeNull();
+    // Past the lease the holder is presumed gone, so the room must not deadlock.
+    expect(store.claimNext("w2", 1_100)?.task.id).toBe(second.id);
+    store.close();
+  });
 });
 
 describe("retryDelay", () => {
@@ -210,5 +305,34 @@ describe("durable worker", () => {
     await worker.runOnce();
     expect(store.getTask(child!.id)?.status).toBe("succeeded");
     expect(store.getChain(child!.chainId).budgetUsed).toBe(1);
+  });
+
+  it("passes the task's agentDir to the adapter as a per-run persona dir (I3)", async () => {
+    const store = new ExecutionStore();
+    const seen: Array<string | undefined> = [];
+    const recording: RuntimeAdapter = {
+      kind: "pi",
+      capabilities: {
+        streaming: true, steer: false, cancel: true, approval: "none", sandbox: "none",
+        workspacePerRun: true, agentDirPerRun: true, usageAttribution: "message", costCap: false, sessionResume: false,
+      },
+      async start(spec): Promise<RunHandle> {
+        seen.push(spec.agentDir);
+        return {
+          runId: spec.runId,
+          events: (async function* () { yield event(spec.runId); })(),
+          settled: Promise.resolve({ runId: spec.runId, status: "completed" }),
+          async cancel() {},
+        };
+      },
+    };
+    store.createTask({ ...input, agentDir: "/persona/a1" }, 100);
+    store.createTask({ ...input, memberId: "b" }, 101);
+    const worker = createDurableWorker(store, { adapterFor: () => recording });
+    await worker.runOnce();
+    await worker.runOnce();
+    // A task without an agentDir stays undefined, not an empty string.
+    expect(seen).toEqual(["/persona/a1", undefined]);
+    store.close();
   });
 });

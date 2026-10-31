@@ -114,6 +114,9 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       const handle = await adapter.start({
         runId: attempt.id, tenantId: task.tenantId, projectId: task.projectId,
         memberId: task.memberId, workspacePath: task.workspacePath, prompt,
+        // I3: persona dir is per-run. Only the runtime that reports agentDirPerRun
+        // consumes it; the rest ignore it and keep using workspacePath.
+        ...(task.agentDir ? { agentDir: task.agentDir } : {}),
         ...(task.model ? { model: task.model } : {}),
         ...(resumeSession
           ? { session: {

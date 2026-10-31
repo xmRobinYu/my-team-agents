@@ -15,6 +15,10 @@ export interface AppOptions {
   rooms?: RoomStore;
   roomsRoot?: string;
   defaultProjectId?: string;
+  /** Project workspace for I3 mention-triggered Tasks. Defaults to `<cwd>` (same as /api/pi). */
+  defaultWorkspacePath?: string;
+  /** Task attribution tenant for triggered Tasks. Defaults to "default". */
+  defaultTenantId?: string;
 }
 
 interface TaskBody {
@@ -193,8 +197,13 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // parsers cannot change how /api/tasks and /api/pi see request bodies.
   await registerRoomRoutes(app, {
     store: rooms,
+    // Same handle by construction (`rooms` defaults to `new RoomStore(store.db)`),
+    // so the mention trigger's message + Tasks commit together.
+    executions: store,
     roomsRoot: options.roomsRoot,
     defaultProjectId: options.defaultProjectId,
+    defaultWorkspacePath: options.defaultWorkspacePath,
+    defaultTenantId: options.defaultTenantId,
   });
 
   if (options.staticRoot && existsSync(options.staticRoot)) {

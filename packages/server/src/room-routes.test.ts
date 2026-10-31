@@ -247,6 +247,116 @@ describe("GET /api/rooms/:id/... unknown room", () => {
   });
 });
 
+interface PostMessageResponse {
+  message: { id: string; seq: number; authorKind: string; content: string };
+  tasks: Array<{ id: string; memberId: string }>;
+  error?: string;
+  code?: string;
+  names?: string[];
+  hint?: string;
+}
+
+/** A room with two personas, created through the store the app is mounted on. */
+const seedRoom = (h: Awaited<ReturnType<typeof buildTestApp>>) => {
+  const room = h.rooms.createRoom({ projectId: "my-team-agents", name: "研发群" }, 100);
+  const arch = h.rooms.addAgent(
+    { roomId: room.id, name: "架构师", role: "架构", prompt: "You design.", agentDir: join(h.base, "persona/arch") },
+    101,
+  );
+  const qa = h.rooms.addAgent(
+    { roomId: room.id, name: "QA", role: "测试", prompt: "You test.", agentDir: join(h.base, "persona/qa") },
+    102,
+  );
+  return { room, arch, qa };
+};
+
+describe("POST /api/rooms/:id/messages (I3 mention trigger)", () => {
+  it("queues one Task per mentioned agent, with that agent's persona dir", async () => {
+    const h = await buildTestApp("post-messages");
+    const { room, arch, qa } = seedRoom(h);
+
+    const res = await h.app.inject({
+      method: "POST",
+      url: `/api/rooms/${room.id}/messages`,
+      payload: { content: "请 @架构师 定方案，@QA 复核", workspacePath: "/workspace/demo" },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as PostMessageResponse;
+    expect(body.message.authorKind).toBe("user");
+    expect(body.tasks.map((t) => t.memberId)).toEqual([arch.id, qa.id]);
+
+    const tasks = body.tasks.map((t) => h.store.getTask(t.id)!);
+    expect(tasks.map((t) => t.agentDir)).toEqual([
+      join(h.base, "persona/arch"),
+      join(h.base, "persona/qa"),
+    ]);
+    expect(tasks.map((t) => t.groupId)).toEqual([room.id, room.id]);
+    expect(tasks.map((t) => t.workspacePath)).toEqual(["/workspace/demo", "/workspace/demo"]);
+    expect(tasks[0]?.prompt).toContain("You design.");
+
+    // the message is readable through the existing GET, in stream order
+    const stream = await h.app.inject({ method: "GET", url: `/api/rooms/${room.id}/messages` });
+    expect((stream.json() as unknown[]).length).toBe(1);
+    await h.close();
+  });
+
+  it("answers 4xx with a code and writes nothing at all", async () => {
+    const h = await buildTestApp("post-messages-refused");
+    const { room, arch } = seedRoom(h);
+
+    const unknown = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`, payload: { content: "@不存在 来看下" },
+    });
+    expect(unknown.statusCode).toBe(400);
+    expect(unknown.json().code).toBe("UNKNOWN_MENTION");
+    expect(unknown.json().names).toEqual(["不存在"]);
+
+    const noMention = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`, payload: { content: "随便聊聊" },
+    });
+    expect(noMention.statusCode).toBe(400);
+    expect(noMention.json().code).toBe("NO_MENTION");
+
+    const empty = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`, payload: { content: "  " },
+    });
+    expect(empty.statusCode).toBe(400);
+    expect(empty.json().code).toBe("CONTENT_REQUIRED");
+
+    h.rooms.addAgent({ roomId: room.id, name: "架构师", prompt: "clone", agentDir: "/dup" }, 103);
+    const ambiguous = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`, payload: { content: "@架构师 处理" },
+    });
+    expect(ambiguous.statusCode).toBe(400);
+    expect(ambiguous.json().code).toBe("AMBIGUOUS_MENTION");
+    expect(String(ambiguous.json().error)).toContain("架构师");
+
+    const missing = await h.app.inject({
+      method: "POST", url: "/api/rooms/nope/messages", payload: { content: "@架构师 处理" },
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json().code).toBe("ROOM_NOT_FOUND");
+
+    // refused means nothing landed: no message, no task
+    expect(h.rooms.listMessages(room.id)).toEqual([]);
+    expect(h.store.listTasks()).toEqual([]);
+    expect(arch.roomId).toBe(room.id);
+    await h.close();
+  });
+
+  it("defaults workspacePath to the server project dir when the caller omits it", async () => {
+    const h = await buildTestApp("post-messages-defaults");
+    const { room } = seedRoom(h);
+    const res = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`, payload: { content: "@QA 看一眼" },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as PostMessageResponse;
+    expect(h.store.getTask(body.tasks[0]!.id)?.workspacePath).toBe(process.cwd());
+    await h.close();
+  });
+});
+
 describe("room routes do not disturb existing APIs", () => {
   it("keeps /api/tasks and /api/pi working with normal JSON bodies", async () => {
     const h = await buildTestApp("regression");
