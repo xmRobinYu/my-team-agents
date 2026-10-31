@@ -460,6 +460,54 @@ because one Worker process happens to tick would be a false guarantee.
   `room-trigger.test.ts` asserts the code mapping and that a mid-transaction insert
   failure writes nothing; `settle.test.ts` asserts cwd selection without spawning.
 
+### Q39 — I4: group history is injected, never resumed (2026-11-01)
+**A**: every group trigger is a clean Pi process that receives the room's shared
+history plus its own persona; a group Task never resumes a Pi session, and an
+agent's reply is written back into the room stream in the same transaction as
+its success.
+**R**: Q30 asks for full history including what other agents said, and Q31
+forbids resume so the same messages are never handed over twice. Both are
+unachievable unless the reply is persisted — see the first bullet.
+- **The reply had to be persisted for I4 to mean anything.** Before this,
+  `room_messages` was written in exactly one production place
+  (`room-trigger.ts`, `authorKind: "user"`); a successful Task's text went into
+  `tasks.result` and never touched a room table. Injecting `listMessages` would
+  therefore have injected a history containing only user turns: I4 would pass its
+  own test while group chat remained an illusion. Upstream has the same fact
+  modelled (`senderType = isHuman ? 'user' : 'agent'`, persisted both ways), so
+  omitting it would also have been a semantic divergence, not just a gap.
+- `buildRoomPrompt(room, agent, members, history, omitted?)` fixes six sections in
+  a stable order — persona prompt, `# 角色`, `# 群`, `# 群规则` (omitted when
+  empty), `# 成员`, `# 群聊记录`, `# 你的任务` — so the text can be asserted on
+  and replayed identically after a crash.
+- Authors are resolved from `authorAgentId` through the member list, falling back
+  to the raw id when the member is gone: a deleted agent keeps its message rather
+  than having history silently rewritten. `user` renders as 用户, `system` as 系统.
+- **Truncation is announced, never silent.** `ROOM_HISTORY_LIMIT` is 500;
+  `countMessages` counts outside the window, and when anything is dropped the
+  history section starts with `（已省略较早的 N 条消息）`. A silent cut would let
+  an agent believe it had read the whole conversation.
+- `durable-worker` forces `resumeSession = false` whenever `task.groupId` is set
+  (Q31). Tasks without a room keep Q18 behaviour and still resume on retry; a test
+  pins both halves (`[undefined, undefined]` vs `[undefined, sessionPath]`) so the
+  branch cannot rot into "never resumes".
+- `completeSuccess` and the agent's reply commit inside ONE
+  `store.transaction()`: a Task that succeeded without its reply in the room — or
+  a reply for a Task that did not succeed — would desynchronise the stream the
+  next trigger injects. Reply content is `structured.summary`, because the worker
+  only reaches that path with a validated structured result, so `summary` is the
+  one field guaranteed to be non-empty prose; raw `latestText` may be a JSON
+  envelope. Idempotent per `taskId`, so a replay cannot make an agent speak twice.
+- The group path records `sessionFile` as before (Q18) but never consumes it.
+  `WorkerOptions.rooms` is optional and must share the ExecutionStore's
+  `DatabaseSync` handle; a mismatched handle throws up front rather than failing
+  mid-run.
+- Failure is not posted to the room: only a successful Attempt speaks. Recorded as
+  a deliberate limit, not an oversight.
+- Gates: `room-trigger.test.ts` (prompt structure, author labels, truncation),
+  `room-reply.test.ts` (reply lands once, feeds the next trigger, stays out of
+  non-room Tasks), `recovery.test.ts` (the resume contrast above).
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

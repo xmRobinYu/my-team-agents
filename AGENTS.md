@@ -142,8 +142,11 @@ does not have one.
 - **Pi session resume**: a session persists by default. `--session-id` alone
   does NOT load history; `--session <path>` does, so `RunSpec.session.sessionPath`
   is what resume uses. Resume continues the conversation only — unknown tool
-  side effects still require human confirmation (Q18). `just pi-smoke` proves
-  both completion semantics and resume-with-memory against a live model.
+  side effects still require human confirmation (Q18). **Exception, group chat**:
+  a Task with a `groupId` never resumes; each trigger re-injects the room history
+  instead (Q31), so the same messages are not handed over twice.
+  `just pi-smoke` proves both completion semantics and resume-with-memory against
+  a live model.
 
 ## Documentation Sync
 
@@ -217,8 +220,9 @@ just sync-all         # docs + Bitable in one go (the usual post-change command)
 - `packages/orchestrator/src/dispatcher.ts` — handoffs dispatch only after
   settle, and only within guardrails. A runtime that throws on `start()` must
   degrade to `failed`, never propagate.
-- `packages/orchestrator/src/handoff-intent.ts` — handoff intent is declared via
-  the `handoff_to` tool, never scraped from prose.
+- `packages/orchestrator/src/handoff-intent.ts` — parses the authoritative
+  `handoff_to` tool call. Text `@name` in an agent's message is a secondary
+  trigger handled elsewhere (Q34); never scrape arbitrary prose here.
 - `packages/domain/src/handoff.ts` — guardrails must be deterministic, never
   model-dependent.
 - `packages/cost-report/src/parse.ts` — `since` cursor makes daily runs idempotent.
@@ -228,7 +232,9 @@ just sync-all         # docs + Bitable in one go (the usual post-change command)
 - **Project owns the workspace.** A group chat is a view; rebuilding a group
   never touches the workspace.
 - **Agents bind to one project.** Reporting roles (PMO/HR) may span projects.
-- **Handoff is structured**, never parsed from prose.
+- **Handoff prefers structure**: `handoff_to` is the authoritative path; `@name`
+  in an agent's own message is a secondary trigger, and the two are deduplicated
+  per target agent (Q34/Q35). Platform code never scrapes arbitrary prose.
 - **Deferred means deferred**: do not implement promotion, capability packages,
   or a 5-layer ledger in v1. Keep their seams stable instead.
 - Report verification honestly: run the command, report the exit code.
