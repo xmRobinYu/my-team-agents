@@ -29,7 +29,8 @@ export {
   type MentionResolution,
 } from "./mention.js";
 export {
-  buildMentionPrompt,
+  buildRoomPrompt,
+  ROOM_HISTORY_LIMIT,
   postRoomMessage,
   RoomTriggerError,
   type PostedRoomMessage,

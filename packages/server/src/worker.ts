@@ -1,12 +1,14 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createDurableWorker } from "@my-team-agents/orchestrator";
+import { createDurableWorker, RoomStore } from "@my-team-agents/orchestrator";
 import { openExecutionStore } from "./config.js";
 import { runtimeFor } from "./runtime.js";
 
 const { store, filename } = openExecutionStore();
-const worker = createDurableWorker(store, { adapterFor: runtimeFor });
+// I4: same handle as the API's RoomStore, so a group Task's success and its reply
+// in the room stream commit together.
+const worker = createDurableWorker(store, { adapterFor: runtimeFor, rooms: new RoomStore(store.db) });
 let working = false;
 const tick = async () => {
   if (working) return;

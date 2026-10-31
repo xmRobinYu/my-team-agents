@@ -5,10 +5,17 @@ import type { CanonicalEvent, RuntimeAdapter } from "@my-team-agents/runtime-cor
 import { DEFAULT_GUARDRAILS, evaluateHandoff } from "@my-team-agents/domain";
 import { ExecutionStore, type AttemptRecord, type TaskRecord, type TaskResult } from "./execution-store.js";
 import { parseHandoffArgs } from "./handoff-intent.js";
+import type { RoomStore } from "./room-store.js";
 
 export interface WorkerOptions {
   workerId?: string;
   adapterFor(memberId: string): RuntimeAdapter;
+  /**
+   * I4: rooms the worker writes agent replies into. Only group-chat Tasks
+   * (`groupId` set) touch it, so a worker without it still runs every other Task
+   * exactly as before.
+   */
+  rooms?: RoomStore;
   leaseMs?: number;
   idleTimeoutMs?: number;
   now?: () => number;
@@ -82,6 +89,39 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
   const now = options.now ?? Date.now;
   const onChange = options.onChange ?? (() => {});
   const active = new Map<string, { attempt: AttemptRecord; chainId: string }>();
+  const rooms = options.rooms;
+  // Same rule as `postRoomMessage`: the reply and the Task row must share one
+  // database handle, otherwise "task succeeded" and "reply landed" cannot commit
+  // together. Checked once up front instead of failing mid-run.
+  if (rooms && rooms.db !== store.db) {
+    throw new Error("createDurableWorker needs RoomStore and ExecutionStore over one database handle");
+  }
+
+  /**
+   * I4: post the agent's reply into the shared room stream, so the next trigger
+   * injects what this agent actually said. Without this the "history" would only
+   * ever contain user messages and group chat would be an illusion.
+   *
+   * Content is `structured.summary`: the worker only reaches here with a validated
+   * structured result, so `summary` is the one field guaranteed to be non-empty
+   * human-readable prose. The raw `latestText` may be a JSON envelope, which is
+   * unreadable as a chat message.
+   *
+   * Idempotent by `taskId`: a replay or a retried Attempt re-injects the same
+   * history and must not make the agent speak twice.
+   */
+  function appendAgentReply(task: TaskRecord, result: TaskResult): void {
+    if (!rooms || !task.groupId) return;
+    if (rooms.getMessageByTask(task.id)) return;
+    rooms.appendMessage({
+      roomId: task.groupId,
+      authorKind: "agent",
+      // `memberId` IS the RoomAgent id for group Tasks (see postRoomMessage).
+      authorAgentId: task.memberId,
+      content: result.summary,
+      taskId: task.id,
+    }, now());
+  }
 
   async function execute(task: TaskRecord, attempt: AttemptRecord): Promise<void> {
     active.set(attempt.id, { attempt, chainId: task.chainId });
@@ -109,7 +149,15 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       // Q18: resume the original session when the runtime supports it. Only a
       // retry resumes; the first Attempt has no session yet. The file must still
       // exist, otherwise Pi would start from an empty history silently.
-      const resumeSession = attempt.sequence > 1 && adapter.capabilities.sessionResume
+      //
+      // Q31 — the group-chat path NEVER resumes: `groupId` forces this false. Each
+      // trigger is a clean process that gets the room history re-injected (I4), so a
+      // resumed Pi session would hand the same messages over twice. Crash/retry
+      // replay works by injecting the same history again, not by restoring Pi's
+      // internal state. Session resume stays a Pi adapter capability that Tasks
+      // without a room still use.
+      const resumeSession = !task.groupId && attempt.sequence > 1
+        && adapter.capabilities.sessionResume
         && task.sessionFile && existsSync(task.sessionFile);
       const handle = await adapter.start({
         runId: attempt.id, tenantId: task.tenantId, projectId: task.projectId,
@@ -235,7 +283,14 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
         store.finishFailure(attempt.id, attempt.fencingToken, issues.join("; "), { now: now() });
         return;
       }
-      store.completeSuccess(attempt.id, attempt.fencingToken, structured, handoffs, now());
+      // One commit for both facts: a Task that succeeded without its reply in the
+      // room — or a reply for a Task that did not succeed — would desynchronise the
+      // stream the next trigger injects. `completeSuccess` joins this transaction
+      // instead of nesting a second one.
+      store.transaction(() => {
+        store.completeSuccess(attempt.id, attempt.fencingToken, structured, handoffs, now());
+        appendAgentReply(task, structured);
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       try { store.finishFailure(attempt.id, attempt.fencingToken, message, { now: now() }); }

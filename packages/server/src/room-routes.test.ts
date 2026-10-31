@@ -293,10 +293,15 @@ describe("POST /api/rooms/:id/messages (I3 mention trigger)", () => {
     expect(tasks.map((t) => t.groupId)).toEqual([room.id, room.id]);
     expect(tasks.map((t) => t.workspacePath)).toEqual(["/workspace/demo", "/workspace/demo"]);
     expect(tasks[0]?.prompt).toContain("You design.");
+    // I4: the trigger message arrives as shared history, not as a lone line —
+    // and it appears exactly once per Task.
+    expect(tasks[0]?.prompt).toContain("[1] 用户: 请 @架构师 定方案，@QA 复核");
+    expect(tasks[0]?.prompt).toContain("# 群聊记录");
+    expect((tasks[0]?.prompt ?? "").split("定方案").length - 1).toBe(1);
 
     // the message is readable through the existing GET, in stream order
     const stream = await h.app.inject({ method: "GET", url: `/api/rooms/${room.id}/messages` });
-    expect((stream.json() as unknown[]).length).toBe(1);
+    expect((stream.json() as Array<Record<string, unknown>>).length).toBe(1);
     await h.close();
   });
 

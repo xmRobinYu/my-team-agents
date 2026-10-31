@@ -274,6 +274,27 @@ export class RoomStore {
     return row ? this.messageFrom(row) : null;
   }
 
+  /**
+   * The message a Task already posted, if any. One Task speaks at most once: a
+   * replayed or retried Attempt must not duplicate the agent's reply, and the
+   * caller checks this inside its own `BEGIN IMMEDIATE` transaction, so the
+   * check-then-insert cannot interleave with another writer.
+   */
+  getMessageByTask(taskId: string): RoomMessage | null {
+    const row = this.one("SELECT * FROM room_messages WHERE task_id = ? ORDER BY seq LIMIT 1", taskId);
+    return row ? this.messageFrom(row) : null;
+  }
+
+  /**
+   * Total messages in a room, regardless of any window. `listMessages` can only
+   * report what it kept, so this is what lets the caller announce a truncation
+   * instead of hiding one (I4: injected history must say what was omitted).
+   */
+  countMessages(roomId: string): number {
+    const row = this.one("SELECT COUNT(*) AS n FROM room_messages WHERE room_id = ?", roomId);
+    return num(row?.n);
+  }
+
   listMessages(roomId: string, limit = 500): RoomMessage[] {
     return this.all(
       "SELECT * FROM room_messages WHERE room_id = ? ORDER BY seq DESC LIMIT ?", roomId, limit,

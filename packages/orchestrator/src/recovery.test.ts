@@ -91,6 +91,56 @@ describe("durable execution recovery", () => {
     rmSync(directory, { recursive: true, force: true });
   });
 
+  /**
+   * Q31: the group-chat path re-injects the room history instead of resuming Pi's
+   * session, so a retry must never receive `spec.session` — the same messages would
+   * arrive twice. A task WITHOUT a groupId goes through the same code on the same
+   * clock and MUST still resume, which is what proves the branch is live rather
+   * than "never resumes at all".
+   */
+  it("never resumes a session for a group-chat task, but still does for a plain one", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "mta-group-session-"));
+    sessionPath = join(directory, "s2.jsonl");
+    writeFileSync(sessionPath, "{}\n");
+    const store = new ExecutionStore();
+    const group = store.createTask({ ...input, groupId: "room-1" }, 100);
+    const plain = store.createTask({ ...input, memberId: "b" }, 100);
+
+    const groupSeen: Array<string | undefined> = [];
+    const plainSeen: Array<string | undefined> = [];
+    // Past both `availableAt` values and both retry backoffs, in two phases: the
+    // first Attempts now, the retries once the backoff has elapsed.
+    let clock = 200;
+    const worker = createDurableWorker(store, {
+      adapterFor: (memberId) => (memberId === group.memberId
+        ? sessionAdapter(groupSeen)
+        : sessionAdapter(plainSeen)),
+      now: () => clock,
+      leaseMs: 1000,
+    });
+
+    // Both first Attempts fail and report a session file.
+    expect(await worker.runOnce()).toBe(true);
+    expect(await worker.runOnce()).toBe(true);
+    expect(store.getTask(group.id)?.sessionFile).toBe(sessionPath);
+    expect(store.getTask(plain.id)?.sessionFile).toBe(sessionPath);
+
+    clock = 1_000_000;
+    expect(await worker.runOnce()).toBe(true);
+    expect(await worker.runOnce()).toBe(true);
+
+    expect(store.getAttempts(group.id).map((a) => a.sequence)).toEqual([1, 2]);
+    expect(store.getAttempts(plain.id).map((a) => a.sequence)).toEqual([1, 2]);
+    expect(store.getTask(group.id)?.status).toBe("succeeded");
+    expect(store.getTask(plain.id)?.status).toBe("succeeded");
+    // Group: Attempt 2 starts clean, no session at all.
+    expect(groupSeen).toEqual([undefined, undefined]);
+    // Plain: Attempt 2 resumes the recorded session file (Q18 unchanged).
+    expect(plainSeen).toEqual([undefined, sessionPath]);
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
   it("recovers an expired running attempt and preserves its history", async () => {
     const store = new ExecutionStore();
     const task = store.createTask(input, 100);

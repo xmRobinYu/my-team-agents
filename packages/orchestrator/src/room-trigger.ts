@@ -1,5 +1,6 @@
 /**
- * `@mention` trigger for a ChatRoom (I3): one user message -> one Task per target.
+ * `@mention` trigger for a ChatRoom (I3): one user message -> one Task per target,
+ * and (I4) the whole shared stream injected into each Task's prompt.
  *
  * Three things happen in this order:
  *  1. ambiguous / unknown / absent mentions are refused with a code the API can
@@ -10,12 +11,12 @@
  *  3. `groupId = roomId` is stamped, which is what makes the queue serialise the
  *     room (`ExecutionStore.claimNext`, AC3).
  *
- * I3 is trigger-only: a message with no mention is refused rather than stored as
- * idle chat, because a stored message nobody answers is the same silent failure
- * the 4xx exists to avoid. Shared history injection is I4, flow guards are I6.
+ * A message with no mention is refused rather than stored as idle chat, because a
+ * stored message nobody answers is the same silent failure the 4xx exists to
+ * avoid. Flow guards are I6.
  */
 
-import type { RoomAgent, RoomMessage } from "@my-team-agents/domain";
+import type { ChatRoom, RoomAgent, RoomMessage } from "@my-team-agents/domain";
 import { ExecutionStore } from "./execution-store.js";
 import { resolveMentions } from "./mention.js";
 import { RoomStore } from "./room-store.js";
@@ -62,15 +63,76 @@ export interface PostedRoomMessage {
 }
 
 /**
- * Role prompt first, then the user message. Full room history is deliberately NOT
- * included — that is I4's decision (format + truncation), and inventing a partial
- * version now would be the thing I4 has to undo.
+ * How many of the newest room messages get injected into one prompt (I4).
+ * Exported so the caller truncates with the same number it reports, and so a
+ * test can prove the cut is never silent.
  */
-export function buildMentionPrompt(agent: RoomAgent, content: string): string {
-  const header = agent.role.trim()
-    ? `# 角色：${agent.name}（${agent.role.trim()}）`
-    : `# 角色：${agent.name}`;
-  return `${agent.prompt.trim()}\n\n${header}\n\n# 用户消息\n${content}`;
+export const ROOM_HISTORY_LIMIT = 500;
+
+/** `- <name>（<role>）`, plus `（协调者）`; empty role is omitted entirely. */
+const memberLine = (member: RoomAgent): string => {
+  const named = member.role.trim() ? `${member.name}（${member.role.trim()}）` : member.name;
+  return member.isCoordinator ? `${named}（协调者）` : named;
+};
+
+/**
+ * Who produced one history line. A deleted agent still has its message: the id
+ * is better evidence than nothing, and dropping history would silently change
+ * what the agent sees (Q30).
+ */
+const authorLabel = (message: RoomMessage, names: Map<string, string>): string => {
+  if (message.authorKind === "user") return "用户";
+  if (message.authorKind === "system") return "系统";
+  const agentId = message.authorAgentId;
+  if (!agentId) return "未知成员";
+  return names.get(agentId) ?? agentId;
+};
+
+/**
+ * The prompt for one group-chat trigger (I4, Q30): role prompt, room identity,
+ * member roster and the shared history — including what the OTHER agents said.
+ * That is what makes this a group chat rather than parallel private chats.
+ *
+ * Sections are emitted in a fixed order, and history lines are sorted by `seq`,
+ * so the text is stable enough to assert on and to replay identically after a
+ * crash (Q31: replay re-injects the same history; it does not resume a session).
+ *
+ * `omitted` is how many older messages the caller had to drop at the limit; any
+ * history longer than `ROOM_HISTORY_LIMIT` is trimmed here too. Either way the
+ * trimming is announced inside 「# 群聊记录」 — a silent cut would let the agent
+ * believe it saw the whole conversation.
+ */
+export function buildRoomPrompt(
+  room: ChatRoom,
+  agent: RoomAgent,
+  members: RoomAgent[],
+  history: RoomMessage[],
+  omitted = 0,
+): string {
+  const names = new Map(members.map((member) => [member.id, member.name]));
+  const ordered = [...history].sort((a, b) => a.seq - b.seq);
+  const shown = ordered.length > ROOM_HISTORY_LIMIT
+    ? ordered.slice(ordered.length - ROOM_HISTORY_LIMIT)
+    : ordered;
+  const hidden = Math.max(0, omitted) + (ordered.length - shown.length);
+
+  const blocks: string[] = [agent.prompt.trim(), `# 角色：${memberLine(agent)}`, `# 群：${room.name}`];
+  if (room.rules.trim()) blocks.push(`# 群规则\n${room.rules.trim()}`);
+  blocks.push(`# 成员\n${members.length > 0 ? members.map((m) => `- ${memberLine(m)}`).join("\n") : "（暂无成员）"}`);
+
+  const lines: string[] = ["# 群聊记录"];
+  if (hidden > 0) lines.push(`（已省略较早的 ${hidden} 条消息）`);
+  lines.push(shown.length > 0
+    ? shown.map((m) => `[${m.seq}] ${authorLabel(m, names)}: ${m.content}`).join("\n")
+    : "（暂无消息）");
+  blocks.push(lines.join("\n"));
+
+  blocks.push(`# 你的任务
+请针对上面「群聊记录」里最新的一条消息发言：
+- 不要重复其他成员已经说过的内容；
+- 不要复述整段群聊记录；
+- 按要求输出结构化结果，其中 summary 会被原样发回群里。`);
+  return blocks.join("\n\n");
 }
 
 /**
@@ -120,6 +182,13 @@ export function postRoomMessage(
   const now = input.now ?? Date.now();
   return executions.transaction(() => {
     const message = rooms.appendMessage({ roomId: room.id, authorKind: "user", content }, now);
+    // I4: read the stream AFTER the append, so the current user message is the last
+    // history line. Adding a separate "用户消息" section on top of that would show
+    // the same message twice.
+    const history = rooms.listMessages(room.id, ROOM_HISTORY_LIMIT);
+    // `countMessages` is what makes the cut visible: the window can only report
+    // what it kept, never what it dropped.
+    const omitted = Math.max(0, rooms.countMessages(room.id) - history.length);
     const created = targets.map((agent) => executions.createTask({
       tenantId: input.tenantId,
       projectId: input.projectId ?? room.projectId,
@@ -127,7 +196,9 @@ export function postRoomMessage(
       workspacePath: input.workspacePath,
       // Reaches Pi as the child cwd: persona resources are discovered from cwd.
       agentDir: agent.agentDir,
-      prompt: buildMentionPrompt(agent, content),
+      // Q30: the same shared history for every target, each one wrapped in its
+      // OWN role prompt — group chat, not parallel private chats.
+      prompt: buildRoomPrompt(room, agent, agents, history, omitted),
       // The serialisation key: every later task in this room queues behind this one.
       groupId: room.id,
       model: agent.model ?? undefined,

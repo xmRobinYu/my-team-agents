@@ -69,6 +69,27 @@ describe("RoomStore — message stream", () => {
     expect(store.listMessages(b.id).map((m) => m.content)).toEqual(["in b"]);
     store.close();
   });
+
+  it("counts the whole stream even when the read window is smaller", () => {
+    const store = new RoomStore();
+    const r = store.createRoom(room());
+    for (let i = 0; i < 7; i += 1) store.appendMessage({ roomId: r.id, authorKind: "user", content: `m${i}` });
+    expect(store.countMessages(r.id)).toBe(7);
+    // The window cannot report what it dropped; the count is what makes that visible.
+    expect(store.listMessages(r.id, 3)).toHaveLength(3);
+    expect(store.listMessages(r.id, 3).map((m) => m.seq)).toEqual([5, 6, 7]);
+    expect(store.countMessages(store.createRoom(room("other")).id)).toBe(0);
+    store.close();
+  });
+
+  it("finds the message a task already posted", () => {
+    const store = new RoomStore();
+    const r = store.createRoom(room());
+    expect(store.getMessageByTask("task-9")).toBeNull();
+    const posted = store.appendMessage({ roomId: r.id, authorKind: "agent", authorAgentId: "a1", content: "回复", taskId: "task-9" });
+    expect(store.getMessageByTask("task-9")?.id).toBe(posted.id);
+    store.close();
+  });
 });
 
 describe("RoomStore — flow state persistence", () => {
