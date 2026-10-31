@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CanonicalEvent, RunHandle, RuntimeAdapter } from "@my-team-agents/runtime-core";
-import { ExecutionStore, type TaskResult } from "./execution-store.js";
+import { ExecutionStore, retryDelay, type TaskResult } from "./execution-store.js";
 import { createDurableWorker } from "./durable-worker.js";
 
 const result: TaskResult = { outcome: "success", summary: "done", artifacts: [], remainingRisks: [] };
@@ -74,7 +74,9 @@ describe("ExecutionStore", () => {
   });
 
   it("retries at most three automatic attempts, then preserves history for a new batch", () => {
-    const store = new ExecutionStore();
+    // rng pinned to 0.5 => zero jitter (exactly 5s/25s). This case walks exact
+    // claim clocks; the jitter window itself is asserted in the cases below.
+    const store = new ExecutionStore(":memory:", { rng: () => 0.5 });
     store.createTask(input, 100);
     for (let i = 0; i < 3; i += 1) {
       const claimed = store.claimNext("w1", 100 + i * 30000)!;
@@ -86,6 +88,17 @@ describe("ExecutionStore", () => {
     const next = store.claimNext("w1", 100001)!;
     expect(next.attempt.sequence).toBe(4);
     expect(next.attempt.batch).toBe(2);
+  });
+
+  it("throttles a failed task inside the bounded jitter window", () => {
+    const store = new ExecutionStore();
+    store.createTask(input, 100);
+    const claimed = store.claimNext("w1", 100)!;
+    store.finishFailure(claimed.attempt.id, claimed.attempt.fencingToken, "boom", { now: 110 });
+    const availableAt = store.getTask(claimed.task.id)!.availableAt;
+    // First tier: 5_000 x [0.8, 1.2]. Assert the interval, never an exact value.
+    expect(availableAt).toBeGreaterThanOrEqual(110 + 4_000);
+    expect(availableAt).toBeLessThanOrEqual(110 + 6_000);
   });
 
   it("deduplicates handoffs and commits the chain budget only once", () => {
@@ -114,6 +127,17 @@ describe("ExecutionStore", () => {
     store.appendEvent(claimed.attempt.id, claimed.attempt.fencingToken, event(claimed.attempt.id, { usage, provider: "p", model: "m" }));
     expect(store.getUsage()[0]?.totalTokens).toBe(15);
     expect(store.getUsage()[0]?.totalCost).toBe(2);
+  });
+});
+
+describe("retryDelay", () => {
+  it("is exact and bounded for an injected random source", () => {
+    expect(retryDelay(1, () => 0)).toBe(4_000);
+    expect(retryDelay(1, () => 0.5)).toBe(5_000);
+    expect(retryDelay(1, () => 1)).toBe(6_000);
+    expect(retryDelay(2, () => 0)).toBe(20_000);
+    expect(retryDelay(3, () => 0.5)).toBe(25_000);
+    expect(retryDelay(5, () => 1)).toBe(30_000);
   });
 });
 

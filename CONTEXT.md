@@ -393,6 +393,35 @@ without leaving Feishu, while keeping the repo as the single source of truth (Q1
   vitest is scoped to `packages/**`). `just sync-bitable` is manual like
   `just sync-docs` — it needs the local lark-cli Keychain credential.
 
+### Q37 — Retry backoff corrected (2026-10-31)
+**A**: Q21's "backoff and jitter" is now implemented for real: one shared
+`retryDelay(batchAttempts, rng)` (`orchestrator/execution-store.ts`) yields
+`5_000 x [0.8, 1.2]` after the first Attempt and `25_000 x [0.8, 1.2]` after
+later ones, i.e. a 4s–6s / 20s–30s bounded window, and **both** re-arm paths
+call it. **R**: audit found the crash/lease-expiry path had no throttle at all.
+- `finishFailure` already backed off (fixed 5s→25s, no jitter). `recoverAttempt`
+  wrote `available_at = now`, so a Task whose Worker crashed was re-claimed on
+  the next 250ms poll: a crash loop burned runtime and process slots with zero
+  throttling, and it disagreed with the failure path for the same Task.
+- Jitter is bounded (±20% of base) and the random source is injectable
+  (`new ExecutionStore(file, { rng })`), so tests either assert exact values with
+  a pinned `rng` or assert the interval. Determinism was kept by injecting the
+  source, **not** by disabling jitter.
+- Grace period, restated: Q21's "30s post-cancel grace period" is **not** an
+  independent configurable value. Cancellation is `requestCancelChain` setting
+  `cancel_requested=1` + `running`→`cancelling`, then the Worker watchdog polls
+  the chain every ≤1s and calls `handle.cancel("abort")`
+  (`durable-worker.ts:137-140`). If the runtime never terminates, the **only**
+  backstop is lease expiry, after which `recoverExpired` orphans the Attempt —
+  so the 30s lease effectively doubles as the grace window. Do not assume a
+  separate timer exists.
+- Still true from Q21: 3 Attempts per batch, 120s idle timeout, 30s lease with a
+  10s renewal, persisted attempt count, dead-letter as an operational view.
+- Gates: `recovery.test.ts` now asserts the takeover window and that a re-claim
+  inside it is refused; `execution-store.test.ts` pins `rng` for the clock-walking
+  case and asserts the interval for the jitter case, plus a direct `retryDelay`
+  unit test. These fail if either path drops its backoff.
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

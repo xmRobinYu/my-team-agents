@@ -98,10 +98,18 @@ describe("durable execution recovery", () => {
     store.appendEvent(claimed.attempt.id, claimed.attempt.fencingToken,
       { type: "message_update", runId: claimed.attempt.id, timestamp: "", text: "partial" }, 110);
     expect(store.expiredAttempts(31_100)).toHaveLength(1);
-    const worker = createDurableWorker(store, { adapterFor: () => successfulAdapter, now: () => 31_100 });
+    let clock = 31_100;
+    const worker = createDurableWorker(store, { adapterFor: () => successfulAdapter, now: () => clock });
     expect(worker.recoverExpired()).toBe(1);
     expect(store.getTask(task.id)?.status).toBe("retry_wait");
     expect(store.getTask(task.id)?.recoverySnapshot).toContain("partial");
+    // Q37: crash takeover throttles exactly like finishFailure. available_at has
+    // to land in the bounded window and a re-claim inside it must be refused.
+    const availableAt = store.getTask(task.id)!.availableAt;
+    expect(availableAt).toBeGreaterThanOrEqual(31_100 + 4_000);
+    expect(availableAt).toBeLessThanOrEqual(31_100 + 6_000);
+    expect(await worker.runOnce()).toBe(false);
+    clock = 31_100 + 6_000;
     expect(await worker.runOnce()).toBe(true);
     expect(store.getTask(task.id)?.status).toBe("succeeded");
     expect(store.getAttempts(task.id)).toHaveLength(2);

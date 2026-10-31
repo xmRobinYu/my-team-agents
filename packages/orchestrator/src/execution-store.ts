@@ -101,6 +101,18 @@ const json = <T>(v: unknown, fallback: T): T => {
 };
 
 /**
+ * Q21/Q37 shared retry backoff. Every path that re-arms a Task — normal
+ * failure (finishFailure) and crash takeover (recoverAttempt) — must throttle
+ * identically, or a crash-looping Task respawns on the next worker poll with
+ * no backoff at all. Jitter is bounded to [0.8, 1.2] x base and the random
+ * source is injectable, so tests can assert exact values or the window.
+ */
+export function retryDelay(batchAttempts: number, rng: () => number = Math.random): number {
+  const base = batchAttempts <= 1 ? 5_000 : 25_000;
+  return Math.round(base * (0.8 + rng() * 0.4));
+}
+
+/**
  * SQLite source of truth for the durable execution spine.
  *
  * All writes that decide execution ownership are conditional on a fencing token.
@@ -109,8 +121,11 @@ const json = <T>(v: unknown, fallback: T): T => {
  */
 export class ExecutionStore {
   readonly db: DatabaseSync;
+  /** Bounded-jitter source for retryDelay; override in tests for determinism. */
+  readonly rng: () => number;
 
-  constructor(filename = ":memory:") {
+  constructor(filename = ":memory:", options: { rng?: () => number } = {}) {
+    this.rng = options.rng ?? Math.random;
     this.db = new DatabaseSync(filename);
     // API and Worker are separate processes; without a busy timeout a
     // concurrent write fails immediately with SQLITE_BUSY instead of waiting.
@@ -470,7 +485,7 @@ export class ExecutionStore {
         cancelled ? "cancelled" : "failed", error, now, attemptId);
       const status: TaskStatus = cancelled ? "cancelled" : options.blocked ? "blocked"
         : task.batchAttempts < 3 ? "retry_wait" : "failed";
-      const delay = task.batchAttempts === 1 ? 5_000 : 25_000;
+      const delay = retryDelay(task.batchAttempts, this.rng);
       // Snapshot is generated after the failure is recorded, so a retry can see
       // why the previous Attempt ended instead of repeating it blindly.
       this.run(`UPDATE tasks SET status=?,active_attempt_id=NULL,available_at=?,error=?,updated_at=? WHERE id=?`,
@@ -495,9 +510,12 @@ export class ExecutionStore {
       const task = this.getTask(attempt.taskId)!;
       this.run("UPDATE attempts SET status='orphaned',error=?,updated_at=? WHERE id=?", reason, now, attemptId);
       const status: TaskStatus = blocked ? "blocked" : task.batchAttempts < 3 ? "retry_wait" : "failed";
+      // Crash takeover throttles exactly like finishFailure (Q37): writing
+      // available_at=now here let a crash-looping Task respawn instantly.
+      const availableAt = status === "retry_wait" ? now + retryDelay(task.batchAttempts, this.rng) : now;
       this.run(`UPDATE tasks SET status=?,active_attempt_id=NULL,fencing_token=fencing_token+1,
         available_at=?,error=?,recovery_snapshot=?,updated_at=? WHERE id=?`,
-        status, now, reason, this.recoverySnapshot(task.id), now, task.id);
+        status, availableAt, reason, this.recoverySnapshot(task.id), now, task.id);
       return status;
     });
   }
