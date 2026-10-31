@@ -422,6 +422,44 @@ call it. **R**: audit found the crash/lease-expiry path had no throttle at all.
   case and asserts the interval for the jitter case, plus a direct `retryDelay`
   unit test. These fail if either path drops its backoff.
 
+### Q38 — I3: agentDir takes effect as cwd, room serialisation is a queue property (2026-11-01)
+**A**: a mention becomes one Task per target, and the persona dir reaches Pi as the
+child `cwd`; tasks sharing a `groupId` are serialised by `claimNext` itself.
+**R**: upstream Pi offers no other mechanism, and a serial rule that only held
+because one Worker process happens to tick would be a false guarantee.
+- `agentDir` maps to the child `cwd`. The Pi CLI has no `--agent-dir`-style config
+  directory flag; the official `docs/cli.md` states that the working directory also
+  controls project configuration, resource discovery and session grouping. So a
+  persona directory can only take effect through cwd.
+- **Cost, accepted deliberately**: a run whose cwd is an `agentDir` **cannot see the
+  project workspace**. Not an omission to fix later — it is the price of persona
+  isolation, which is why `RunSpec.workspacePath` stays separate and is still
+  recorded on the Task (attribution, and the fallback when no `agentDir` exists).
+- Capability declarations: `PiAdapter.capabilities.agentDirPerRun` is `true`;
+  `runtime-cli` and the server mock adapter keep `false`, because they genuinely
+  ignore the field. The declaration is behaviour, not aspiration.
+- Same-room serialisation: `groupId = roomId`, and the exclusion lives inside the
+  `claimNext` SELECT — `NOT EXISTS` a `leased`/`running` Attempt with an
+  unexpired lease for that group — in the same `BEGIN IMMEDIATE` as the Attempt
+  INSERT. That makes it a property of the queue, so it holds across multiple
+  Worker processes, not just one ticking worker. An expired lease stops blocking,
+  so a crashed holder cannot lock a room forever.
+- Transaction: `ExecutionStore.tx` was promoted to a public re-entrant
+  `transaction()`; a nested call joins the open transaction instead of starting a
+  second one (SQLite forbids that). This is what lets "append the message + create
+  N Tasks" commit as one unit, so a refused or failed trigger leaves neither a
+  message nobody answers nor a Task with no message behind it. `postRoomMessage`
+  asserts `RoomStore` and `ExecutionStore` share one `DatabaseSync` handle — the
+  wiring `buildApp` already relies on.
+- I3 is trigger-only: a message without `@` is rejected 4xx rather than stored as
+  idle chat, because a stored message no one answers is the same silent failure
+  the 4xx exists to avoid. `ambiguous` / `unknown` mentions answer with the names
+  at fault. Shared-history injection is I4 and is deliberately not half-built here.
+- Gates: `group-serial.test.ts` runs two Workers over one SQLite file and asserts the
+  room's peak concurrency is 1 (falsified: with the exclusion removed it reads 2);
+  `room-trigger.test.ts` asserts the code mapping and that a mid-transaction insert
+  failure writes nothing; `settle.test.ts` asserts cwd selection without spawning.
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

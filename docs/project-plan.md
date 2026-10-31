@@ -18,13 +18,22 @@
 | P6 队列持久化 | 崩溃不丢任务、重试、租约 | ✅ 完成 |
 | P7a 服务端 + UI（本机） | API 骨架、SSE、assistant-ui（react-pi）接入 | ✅ 完成 |
 | P7b 团队服务化 | 鉴权、租户隔离、审计 | ⬜ 待启 |
-| P8 多 agent 群聊 | ChatRoom、团队模板导入、auto 接力与流程守卫 | ⬜ 下一步（PRD 已定稿） |
+| P8 多 agent 群聊 | ChatRoom、团队模板导入、auto 接力与流程守卫 | 🚧 进行中 |
 
-已验证：`rm -rf packages/*/dist && just check` 退出码 0（含 `verify-docs` 映射检查）；
-`pnpm test` / `just test-no-build` 在无构建产物下退出码 0；
-react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激活 → SSE → idle，
-底层 Task `succeeded`）；`just pi-smoke` 对真实 Pi 验证 agent_settled 与会话续跑；
-`check_rendered_harness.py` 判定 conform。
+**P8 分项进度**（I1–I10 定义见 `docs/prd/multi-agent-group-chat-issues.md`）：
+
+- ✅ 完成 I1 ChatRoom 领域模型与持久化（`2efdd93`）
+- ✅ 完成 I2 团队模板包解析与导入（`0f00560`；真实包 `全栈软件研发` 5 个 agent 导入通过）
+- ✅ 完成 飞书多维表格进度投影（`7d0b501`）
+- 🚧 进行中 I3 @提及触发与人格执行
+- ⬜ 未开始 I4 群历史注入 / I5 agent 间派发与去重 / I6 流程守卫 / I7 `/api/pi` 群聊投影 /
+  I8 UI 三栏布局 / I9 技能管理 UI / I10 真实端到端验证
+
+已验证：`rm -rf packages/*/dist && just check` 退出码 0（`just check` = build → typecheck →
+test → verify-cli → test-guardrails → verify-docs → verify-bitable → test-scripts →
+verify-packages，以 `justfile` 定义为准）；`pnpm test` / `just test-no-build` 在无构建产物下
+退出码 0；react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激活 → SSE → idle，
+底层 Task `succeeded`）；`just pi-smoke` 对真实 Pi 验证 agent_settled 与会话续跑。
 
 > 飞书网络同步依赖本机 lark-cli Keychain。沙箱/自动化环境读不到系统 Keychain 时，
 > `just sync-docs` 会失败（`verify-docs` 离线映射仍通过），需在有权限的交互终端执行。
@@ -63,12 +72,12 @@ react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激�
 
 目标：从「单 agent 会话」升级为「团队群聊」，复用 teamagentx 的模板生态。
 
-- ⬜ ChatRoom 实体：共享消息流 + 成员 + 规则，与 Group（视图）分离；
-- ⬜ 团队模板导入：解析 teamagentx 包（room + agents + skills），一键成群；
-- ⬜ 人格隔离：每个 agent 独立 agentDir（cwd + skills + AGENTS.md）；
-- ⬜ auto 接力：`handoff_to` 优先 + `@` 文本次路径，按目标去重；
-- ⬜ 流程守卫：循环检测、轮次上限（默认 5）、`[讨论结束]` 终止，状态持久化；
-- ⬜ UI：三栏布局 + 多 agent 头像 + `@` 输入 + 成员面板 + 技能管理；
+- ✅ ChatRoom 实体：共享消息流 + 成员 + 规则，与 Group（视图）分离（I1，`2efdd93`）；
+- ✅ 团队模板导入：解析 teamagentx 包（room + agents + skills），一键成群（I2，`0f00560`）；
+- ✅ 人格隔离：每个 agent 独立 agentDir（cwd + skills + AGENTS.md）（I2，`template-import.ts`）；
+- 🚧 auto 接力：`handoff_to` 优先 + `@` 文本次路径，按目标去重（I3/I5）；
+- ⬜ 流程守卫：循环检测、轮次上限（默认 5）、`[讨论结束]` 终止，状态持久化（I6）；
+- ⬜ UI：三栏布局 + 多 agent 头像 + `@` 输入 + 成员面板 + 技能管理（I7–I9）；
 - 验收：真实模型下导入 `全栈软件研发` 包并跑通 @提及、接力、守卫与崩溃恢复。
 
 PRD：`docs/prd/multi-agent-group-chat.md`；决策：`CONTEXT.md` Q28–Q35。

@@ -65,9 +65,9 @@
 | 停滞看门狗 | `orchestrator/src/stall-watchdog.ts:21-65` | 注入时钟、`unref()`、事件驱动 ping |
 | 每日自评估幂等 | `cost-report/src/parse.ts:41-100`、`cli.ts:88-110` | `since` 游标按 entry-id 增量 |
 | 原有 dispatcher 闭环 | `orchestrator/src/dispatcher.ts:65-155` | settle 后派发、确定性护栏、`start()` 抛错降级 failed |
-| UI 只读投影（实现中） | `packages/web/src/chat/conversation-store.ts:1-215` | `useExternalStoreRuntime` + `useSyncExternalStore`，线程内容完全由 Task/事件映射决定；未引 `react-pi` |
-| 事件 → 会话折叠（纯函数） | `packages/web/src/chat/mapping.ts:96-201` 及 `mapping.test.ts` | Attempt 合并、文本合并、running 占位、cursor 计算；14 例测试 |
-| 前端 API/SSE 客户端 | `packages/web/src/api/client.ts:37-165` | HTTP 操作 + 两种 `EventSource`（全局快照 / 单任务 after 游标）；路由仍是 `/api/*`，非 `/api/v1` |
+| ~~原 UI 只读投影~~ | ~~`packages/web/src/chat/conversation-store.ts`~~ | **已删除（b160b7c）**：全面改用 `@assistant-ui/react-pi` 的 `usePiRuntime`，见 `CONTEXT.md` Q27。本节其余行均为落地前的快照。 |
+| ~~事件 → 会话折叠~~ | ~~`packages/web/src/chat/mapping.ts` 及 `mapping.test.ts`~~ | **已删除（b160b7c）**；等价投影逻辑现位于服务端 `packages/server/src/pi-thread.ts`（`pi-thread.test.ts` 9 例）。 |
+| 前端 API 客户端 | `packages/web/src/api/client.ts` | 仍存在；行号已漂移（原 `:37-165`）。两种 `EventSource` 仍在；路由仍是 `/api/*`，非 `/api/v1` |
 
 ### 1.2 部分实现（有形状，缺关键语义）
 
@@ -89,10 +89,10 @@
 
 | 能力 | 影响 |
 |---|---|
-| `packages/web` 可运行 | 检查时点（2026-10-28 00:1x）已有 `api/`、`chat/`、`components/`、`hooks/`、`lib/`，**但入口未接齐**：`index.html` 引用的 `/src/main.tsx` 不存在；依赖未安装，故 `just build`/`just typecheck` 覆盖不到它 |
-| UI 断言与投影不变式 | `chat/mapping.test.ts` 已存在；但"未知事件必须显示为原始事件"、"断线重连按 cursor 幂等"等 §4.2 H 组场景尚未全部覆盖，且构建期"不得依赖 `react-pi`/`child_process`"没有自动检查 |
-| 鉴权 / 租户与项目授权 / SSE 鉴权 / 审计 | P7b 全部；当前 `GET /api/tasks` 无过滤（`app.ts:54`） |
-| 服务端解析 `workspacePath` | 客户端可指定任意目录（`app.ts:56-68`），本机即为任意目录执行风险 |
+| `packages/web` 可运行 | **已过时**：入口 `src/main.tsx` 已存在且挂载 `PiApp`；依赖已安装；`just build` 覆盖 web（`pnpm -r`），`pnpm --filter @my-team-agents/web build` 通过 |
+| UI 断言与投影不变式 | UI 至今无自动化测试；`pi-thread.test.ts` 覆盖服务端投影层（§4.2 H 块注记） |
+| 鉴权 / 租户与项目授权 / SSE 鉴权 / 审计 | P7b 全部；当前 `GET /api/tasks` 无过滤（行号漂移，现见 `app.ts:61`） |
+| 服务端解析 `workspacePath` | 客户端可指定任意目录（行号漂移，现见 `app.ts:62-79`），本机即为任意目录执行风险 |
 | schema 版本化迁移 | 仅 `CREATE TABLE IF NOT EXISTS`（`:114-196`），加列不会作用到既有 DB |
 | `attempts` 上的恢复快照 / session 字段 / 结束原因 | 无法审计"这次尝试为何结束" |
 | outbox 的链作用域与状态机 | `UNIQUE(source_tool_call_id, target_member_id)` 跨链冲突（见 §4.1 R2） |
@@ -533,8 +533,8 @@ data: {"reason":"cursor_expired","oldestAvailable":9800}
 ### 4.2 必须新增的测试用例
 
 > 检查时点基线：`npx vitest run` = 94 例 / 13 文件（2 文件、3 例失败，见 §1.4）。
-> 与 P6 直接相关的是 `execution-store.test.ts`（10 例）+ `recovery.test.ts`（3 例）；
-> UI 投影已有 `mapping.test.ts`（14 例）。下列按"能在无 `pi` 环境下跑"设计，
+> 与 P6 直接相关的是 `execution-store.test.ts`（13 例）+ `recovery.test.ts`（4 例）；
+> UI 投影的等价物现为服务端 `pi-thread.test.ts`（9 例；原 `mapping.test.ts` 已于 b160b7c 删除）。下列按"能在无 `pi` 环境下跑"设计，
 > 文件名是建议值，**覆盖优先于命名**。
 
 **A. 持久化与崩溃（`recovery.test.ts` / `crash.test.ts`）**

@@ -7,8 +7,8 @@ This file is the canonical entry point for agent work in this repository. Where
 process, `constraints.yaml` wins on thresholds, and code wins on behavior.
 
 Do not edit rule files silently. `AGENTS.md`, `CONTEXT.md`, `constraints.yaml`,
-`justfile`, and `.git-hooks/*` are guarded: a pre-commit hook rejects changes
-without `RULE_CHANGE_REASON` set.
+`justfile`, `vitest.config.ts`, `tsconfig.base.json`, and `.git-hooks/*` are guarded:
+a pre-commit hook rejects changes without `RULE_CHANGE_REASON` set.
 
 ## Project Identity
 
@@ -29,7 +29,7 @@ deliberately deferred — see `## Deferred Modules`.
 
 | Tool | Version | Notes |
 |---|---|---|
-| Node | >=22.22 | enforced by `engines` |
+| Node | >=22 | matches `engines` in `package.json` |
 | pnpm | 11.22.0 | `packageManager` field |
 | TypeScript | 5.9.3 | strict, NodeNext |
 | Vitest | 3.2.7 | scoped to `packages/**` |
@@ -81,7 +81,9 @@ pass, and do not add it to CI unless a model endpoint is available there.
 
 There is no `just lint` — eslint is not installed (readiness gap).
 There is no `just dev` — run the API with `pnpm --filter @my-team-agents/server dev`
-and the UI with `pnpm --filter @my-team-agents/web dev`.
+and the UI with `pnpm --filter @my-team-agents/web dev`. The server's `dev` script is
+`node --watch dist/server.js`, so it needs a prior `just build`; the web `dev` script is
+`vite` and does not.
 
 ## Verification Matrix
 
@@ -120,14 +122,23 @@ does not have one.
   constrain tool access — isolation comes from the process/container.
 - **Pi usage**: per-message `usage` is what makes cost attribution possible;
   `get_session_stats` is the session-level fallback.
-- **`agentDir` is per-supervisor, not per-thread**, upstream in react-pi. The
-  `agentDir` seam exists in `RunSpec` and is intentionally inert in v1.
+- **Two different `agentDir`** — do not conflate them.
+  `RunSpec.agentDir` (`runtime-core/src/adapter.ts`) is the execution-time seam for a
+  per-run Pi config dir; `PiAdapter` consumes it as the child `cwd`
+  (`agentDirPerRun: true`), because Pi has no `--agent-dir` flag and resource
+  discovery keys off cwd — the accepted cost is that such a run cannot see the
+  project workspace. CLI adapters still report `false`.
+  `RoomAgent.agentDir` (`domain/src/chat-room.ts`) is a **live** field: the template
+  import materialises one isolated persona dir per agent (cwd + skills + `AGENTS.md`),
+  see `template-import.ts:809,870-881` and its tests.
 - **dsh is a cordis profile launcher**, not a coding-agent runtime. It is
   supported as a CLI adapter only.
 - **Unknown events are never dropped**: unmapped upstream names surface as
   `type: "unknown"` with `rawType` preserved. Exception: RPC control frames
   (`response`, `extension_ui_request`) are protocol records, not session
-  activity, and are filtered before canonicalization (docs/rpc.md).
+  activity, and are filtered before canonicalization. Protocol reference:
+  `node_modules/@earendil-works/pi-coding-agent/docs/rpc.md` (upstream package docs,
+  not a file in this repo — we do not vendor a copy).
 - **Pi session resume**: a session persists by default. `--session-id` alone
   does NOT load history; `--session <path>` does, so `RunSpec.session.sessionPath`
   is what resume uses. Resume continues the conversation only — unknown tool
@@ -230,12 +241,12 @@ checker; nothing here is advisory only.
 | Rule | Where | Checked by | Level |
 |---|---|---|---|
 | Types compile | all packages | `just typecheck` | block |
-| Tests pass | `packages/cost-report`, `packages/domain`, `packages/runtime-cli` | `just test` | block |
+| Tests pass | all packages (`vitest.config.ts` scopes `packages/**/*.test.ts`) | `just test` | block |
 | Packages build | all packages | `just build` | block |
 | CLI is executable | `packages/cost-report` | `just verify-cli` | block |
 | Guardrails reject bad artifacts | `scripts/test-guardrails.sh` | `just test-guardrails` | block |
 | No forbidden artifact names | staged files | `.git-hooks/check-naming.sh` (pre-commit) | block |
-| Rule-file changes carry a reason | `AGENTS.md`, `CONTEXT.md`, `constraints.yaml`, `justfile`, `.git-hooks/check-naming.sh` | `.git-hooks/check-naming.sh` (pre-commit) | block |
+| Rule-file changes carry a reason | `AGENTS.md`, `CONTEXT.md`, `constraints.yaml`, `justfile`, `vitest.config.ts`, `tsconfig.base.json`, `.git-hooks/*` | `.git-hooks/check-naming.sh` (pre-commit) | block |
 | Full matrix green on push/PR | repo | `.github/workflows/ci.yml` (CI) | gate |
 | Test scope excludes `ref/` | `vitest.config.ts` | `just test` | block |
 | Doc-sync mapping is complete | `docs/feishu-sync.json` + mapped sources | `just verify-docs` | block |

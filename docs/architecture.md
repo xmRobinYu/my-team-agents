@@ -71,7 +71,7 @@ sandbox / workspacePerRun / agentDirPerRun / usageAttribution / costCap），使
 - **claude**：`--output-format stream-json`、`--input-format stream-json`、
   `--max-budget-usd`、`--permission-mode`。
 - **codex**：`--sandbox`、`-a/--ask-for-approval`、`--full-auto`、`-C/--cd`；其稳定的
-  结构化 JSON 事件输出**尚未确认**，因此当前按纯文本降级归一化（已知缺口，见 §7）。
+  结构化 JSON 事件输出**尚未确认**，因此当前按纯文本降级归一化（已知缺口，见 §9 第 1 条）。
 
 ## 4. 协作域模型
 
@@ -108,7 +108,8 @@ Handoff  { fromTaskId, toMemberIds, reason, depth }
 运行时抛错时错误文本同时进入 `issues`。
 
 护栏默认值（与 teamagentx 实测配置对齐）：fanout ≤ 20、depth ≤ 100、chain budget ≤ 20、
-revisit ≤ 5，审计开启。
+revisit ≤ 5。护栏判定本身是确定性纯函数（`packages/domain/src/handoff.ts`）；
+审计留存尚未实现，属 P7b（见 §9 已知缺口第 5 条与 `CONTEXT.md` Q23）。
 
 `StallWatchdog` 用注入式时钟与 `unref()` 定时器实现，`ping()` 由事件流驱动，超时触发
 `onStall` → 取消该 run，避免卡死的 run 长期占用队列槽位。
@@ -154,8 +155,8 @@ handoffs、chain 是 PiClient 契约不建模的 P6 证据。
 
 ## 8. 治理机制
 
-- `just check` = build → typecheck → test → verify-cli → test-guardrails →
-  verify-docs。**顺序有语义**：
+- `just check` = build → typecheck → test → verify-cli → test-guardrails → verify-docs →
+  verify-bitable → test-scripts → verify-packages。**顺序有语义**：
   包之间通过 `dist/*.d.ts` 互相消费，未 build 的干净检出会 `TS2307`。
   测试另经 `vitest.config.ts` 别名解析到 `src/`，因此 `pnpm test` 单独可跑（已实测）。
 - 命名与规则守卫：`.git-hooks/check-naming.sh` 拒绝 `.bak`/`_v2`/`tmp/` 等产物名，并要求

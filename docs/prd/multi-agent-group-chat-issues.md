@@ -155,7 +155,7 @@ agent 消息可触发其他 agent（auto 模式）。识别两条路径：结构
 - [ ] 受既有护栏约束（fanout ≤ 20、depth ≤ 100、budget ≤ 20、revisit ≤ 5）
 
 ### Validation
-- Command: `pnpm test`（`dispatch.test.ts`）
+- Command: `pnpm test`（`dispatcher.test.ts`）
 - Evidence: 用例通过
 
 ### Notes
@@ -188,7 +188,7 @@ User stories covered: Story 4、5、6、7
 - [ ] 单测覆盖上述每条
 
 ### Validation
-- Command: `pnpm test`（`guards.test.ts`）+ 重启进程验证持久化
+- Command: `pnpm test`（`packages/domain/src/handoff.test.ts`）+ 重启进程验证持久化
 - Evidence: 用例通过；重启脚本输出显示状态保持
 
 ### Notes
