@@ -15,7 +15,10 @@ without `RULE_CHANGE_REASON` set.
 `my-team-agents` — a multi-tenant, company-grade agent-team platform.
 
 - **Core agent loop: Pi** (`@earendil-works/pi-coding-agent`), driven over RPC.
-- UI: assistant-ui (`@assistant-ui/react-pi`) — not yet wired in v1.
+- UI: assistant-ui (`@assistant-ui/react` + `@assistant-ui/react-pi`) — wired in
+  `packages/web`; `PiApp` renders through assistant-ui primitives on
+  `usePiRuntime`, talking to our own `/api/pi` via `createPiHttpClient`. The UI
+  never drives Pi directly; the server is authoritative.
 - Monorepo: pnpm workspaces.
 
 V1 goal: stand up the collaboration skeleton modeled on `ref/teamagentx`
@@ -42,7 +45,8 @@ packages/domain/         entities + handoff guardrails
 packages/orchestrator/   dispatcher loop, structured handoff, stall watchdog,
                          durable SQLite execution store + worker
 packages/server/         Fastify API + SSE + standalone worker entrypoints
-packages/web/            assistant-ui workbench (external-store projection)
+packages/web/            assistant-ui workbench: usePiRuntime + createPiHttpClient
+                         against /api/pi (PiClient projection of the task store)
 packages/cost-report/    daily self-assessment from session logs
 docs/                    product/architecture/plan docs + Feishu sync manifest
 scripts/                 guardrail self-test, doc sync, live pi smoke, I2 import evidence
@@ -246,4 +250,4 @@ checker; nothing here is advisory only.
 | Capability packages | deferred; v1 scripture = LLM wiki + RAG |
 | Promotion / grading / HR review | deferred; v1 = daily self-assessment |
 | 5-layer cost ledger | deferred; v1 = session-log report |
-| assistant-ui integration | deferred; no UI package in v1 |
+| assistant-ui integration | **done in P7a** — `packages/web` on `usePiRuntime`; not deferred. Deferred part is team auth/tenancy (P7b) |
