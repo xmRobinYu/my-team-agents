@@ -449,6 +449,12 @@ data: {"reason":"cursor_expired","oldestAvailable":9800}
 
 ### 3.4 assistant-ui 如何"只做展示"
 
+> **⚠️ 本节的 react-pi 禁令已由 Q27 撤销**：`packages/web` 现在正是跑在
+> `usePiRuntime` + `createPiHttpClient({ baseUrl: "/api/pi" })` 上（见 `CONTEXT.md` Q27、
+> `docs/architecture.md` §6.6）。照抄下面这条去"移除 react-pi 依赖"会直接回退 P7a。
+> **仍然生效**的边界只有三条：UI 不 `spawn`/`exec` 任何进程、不读 `~/.pi`/`.pi/`/会话 JSONL、
+> 浏览器侧不保存权威状态。
+
 **硬边界（写入 lint/评审清单）**：
 
 - `packages/web` **不得依赖** `@assistant-ui/react-pi`，不得 `spawn`/`exec` 任何进程，
@@ -615,17 +621,23 @@ data: {"reason":"cursor_expired","oldestAvailable":9800}
 
 **H. UI 投影（纯函数，无需浏览器）**
 
-> `chat/mapping.test.ts` 已有 14 例：文本合并（累积/增量）、Attempt 合并规则、
-> running 占位、失败后 incomplete 标记、排序与 `transcriptCursor`。H1–H3 属补强，H4–H6 尚缺。
+> **注记（2026-10-31）**：`chat/mapping.ts` 与 `chat/mapping.test.ts` 已在 b160b7c（全面
+> 切换 react-pi）时删除，下面"现状"栏按现存接缝重写。投影逻辑现在在**服务端**
+> `packages/server/src/pi-thread.ts`，其 `pi-thread.test.ts` 有 9 例：线程元数据映射、
+> 流式增量折叠、`message_end` 定稿、事件翻译为 Pi 帧、契约无法表示的事件丢弃、snapshot
+> 结构、占位线程激活、列表与快照读取、未知 thread 404。
+> 如实区分：H 块原指"UI 侧纯函数投影测试"，其等价物现在服务端投影层；**UI 侧
+> （`packages/web`）至今没有任何自动化测试**。
 
 | # | 用例 | 断言 | 现状 |
 |---|---|---|---|
-| H1 | snapshot + 增量 → 状态 | 与服务端 `GET /tasks/:id` 一致 | 部分（无快照路径） |
-| H2 | 重复 id | 幂等，结果不变 | 缺 |
-| H3 | 乱序 id | 缓冲后一致 | 部分（有排序，无去重） |
-| H4 | 未知事件 | 出现在"原始事件"列表，不消失 | 缺 |
-| H5 | `blocked` → confirm | 只发一次请求，按钮在收到 `task.state` 前禁用 | 缺 |
-| H6 | 构建期断言 | 依赖图不含 `@assistant-ui/react-pi`，源码不含 `child_process`/`spawn` | 缺 |
+| H1 | snapshot + 增量 → 状态 | 与服务端 `GET /tasks/:id` 一致 | 部分：服务端投影层已断言 snapshot 与增量折叠（「snapshot carries…」「folds streaming deltas…」「message_end replaces…」）；端到端一致性仅由仓库外的 P7 E2E 脚本手工证明，无自动化 |
+| H2 | 重复 id | 幂等，结果不变 | 未覆盖：写侧有 `UNIQUE(attempt_id, attempt_sequence)`（`execution-store.ts:190`），但"重复投递不改变投影结果"无测试 |
+| H3 | 乱序 id | 缓冲后一致 | 未覆盖：读侧按 `id` 升序（`getEvents` `execution-store.ts:378`），无乱序注入测试 |
+| H4 | 未知事件 | 出现在"原始事件"列表，不消失 | 未覆盖，且现行为相反：`toPiClientEvent` 对 Pi 契约无法表示的事件返回 `null`（「skips frames the Pi contract cannot represent…」），事件只留在 `events` 表与 `/api/tasks/:id/events`，UI 不显示 |
+| H5 | `blocked` → confirm | 只发一次请求，按钮在收到 `task.state` 前禁用 | 未覆盖：服务端有状态守卫（`confirmBlocked` `execution-store.ts:612-615` → 409 `app.ts:114`）但无测试；UI 侧按钮禁用无测试 |
+| H6a | 构建期断言：UI 无进程/文件系统权限 | 源码不含 `child_process`/`spawn`，不读 `~/.pi`/`.pi/`/会话 JSONL | 缺 |
+| ~~H6b~~ | ~~依赖图不含 `@assistant-ui/react-pi`~~ | **已由 Q27 作废**：web 现在必须依赖 react-pi，不得再断言其不存在 | 作废 |
 
 ### 4.3 不安装 `pi` 的验证方式
 
@@ -701,6 +713,10 @@ A6/B5/C4/C6/X1/X2/X3/X4/X5 全绿；`events` 重投不产生重复行。
 跑通"创建 → 流式观察 → 取消 → 重试 → 完成"脚本化 E2E；loopback 下 UI 尚缺但 API 可用。
 
 ### 阶段 4 —— assistant-ui 只读投影（2 天）
+
+> **⚠️ 本节判据已被 Q27 取代**：下文的"显式不装 `@assistant-ui/react-pi`"与 §4.2 的 H6
+> "依赖图不含 react-pi"**已作废**，web 现在必须依赖 react-pi；仍生效的边界同 §3.4 注记
+> （不 spawn 进程、不读 `~/.pi`/会话 JSONL、浏览器侧无权威状态）。别把这两条当待办去"修"。
 
 - `packages/web` 已有 `api/`、`chat/`（含 `mapping.ts` + 14 例测试）、`hooks/`、`components/`、`lib/`；
   缺入口 `src/main.tsx`（`index.html` 已引用），缺依赖安装与锁文件条目。
