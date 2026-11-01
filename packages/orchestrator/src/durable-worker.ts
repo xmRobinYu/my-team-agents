@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type { CanonicalEvent, RuntimeAdapter } from "@my-team-agents/runtime-core";
-import { DEFAULT_GUARDRAILS, evaluateHandoff } from "@my-team-agents/domain";
+import { DEFAULT_GUARDRAILS, TERMINATION_MARKER, evaluateHandoff } from "@my-team-agents/domain";
+import type { ChatRoom } from "@my-team-agents/domain";
 import { ExecutionStore, type AttemptRecord, type TaskRecord, type TaskResult } from "./execution-store.js";
 import { parseHandoffArgs } from "./handoff-intent.js";
+import { evaluateTermination, evaluateTrigger, formatBlockReason } from "./room-guards.js";
+import { queueWrapUpTask } from "./room-trigger.js";
 import type { RoomStore } from "./room-store.js";
 
 export interface WorkerOptions {
@@ -35,6 +38,23 @@ export interface ResolvedHandoff {
     groupId?: string;
     model?: string;
   };
+}
+
+/**
+ * I6: the guard verdicts for one batch of handoffs, computed BEFORE the commit
+ * transaction and written INSIDE it (see `planRoomGuards`).
+ */
+interface GuardPlan {
+  roomId: string;
+  room: ChatRoom;
+  /** Handoffs the guards allowed; these become child Tasks. */
+  kept: ResolvedHandoff[];
+  /** Handoffs the guards refused; each gets a system message, no Task. */
+  blocked: Array<{ memberId: string; reason: string }>;
+  /** Some allowed handoff lands exactly on `maxRounds` (AC5.1). */
+  reachesCap: boolean;
+  /** Projected round count after all allowed handoffs of this batch. */
+  rounds: number;
 }
 
 export interface DurableWorker {
@@ -109,10 +129,14 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
    *
    * Idempotent by `taskId`: a replay or a retried Attempt re-injects the same
    * history and must not make the agent speak twice.
+   *
+   * The return value is what I6 needs: `true` means THIS call wrote the reply, so
+   * the flow-state writes that follow (rounds, termination) run exactly once per
+   * Task. Without it, a replay of a successful Task would count its rounds twice.
    */
-  function appendAgentReply(task: TaskRecord, result: TaskResult): void {
-    if (!rooms || !task.groupId) return;
-    if (rooms.getMessageByTask(task.id)) return;
+  function appendAgentReply(task: TaskRecord, result: TaskResult): boolean {
+    if (!rooms || !task.groupId) return false;
+    if (rooms.getMessageByTask(task.id)) return false;
     rooms.appendMessage({
       roomId: task.groupId,
       authorKind: "agent",
@@ -121,6 +145,136 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       content: result.summary,
       taskId: task.id,
     }, now());
+    return true;
+  }
+
+  /**
+   * I6 entry point C — the termination signal, read off the reply that was just
+   * written. Only the coordinator can end a room (AC6.1); anyone else typing
+   * `[讨论结束]` has the attempt ignored, with a warn AND a system message so the
+   * stream itself shows why nothing stopped (AC6.2).
+   *
+   * The marker is data in a chat log; the flag is written by code. That is the
+   * AGENTS.md rule in force: an agent can propose an ending, it cannot decide one.
+   */
+  function applyTermination(task: TaskRecord, result: TaskResult): void {
+    if (!rooms || !task.groupId) return;
+    const agent = rooms.getAgent(task.memberId);
+    if (!agent) {
+      // A group Task whose persona is gone cannot be judged as coordinator or not.
+      // Leaving the room running is the safe direction, and the reply is still in
+      // the stream, so nothing is silently dropped.
+      console.warn(`[room-guards] ${task.groupId}: 无法判定终止 — 找不到 agent ${task.memberId}`);
+      return;
+    }
+    const decision = evaluateTermination(result.summary, agent);
+    if (decision.terminate) {
+      rooms.markTerminated(task.groupId, now());
+      rooms.appendMessage({
+        roomId: task.groupId,
+        authorKind: "system",
+        content: `【流程守卫·终止】协调者 ${agent.name} 宣布讨论结束，本群后续 agent 触发将被阻断；用户发送新消息可重新开始。`,
+      }, now());
+      return;
+    }
+    if (decision.ignoredAttempt) {
+      console.warn(
+        `[room-guards] ${task.groupId}: 非协调者 ${agent.name} 输出了 ${TERMINATION_MARKER}，已忽略（终止权只在协调者）`,
+      );
+      rooms.appendMessage({
+        roomId: task.groupId,
+        authorKind: "system",
+        content: `【流程守卫·终止】${agent.name} 不是本群协调者，其 ${TERMINATION_MARKER} 被忽略，讨论继续。`,
+      }, now());
+    }
+  }
+
+  /**
+   * I6 entry point B — the loop and round guard for agent→agent dispatch.
+   *
+   * `handoff_to` already produces child Tasks (P6), so this IS the real
+   * interception point for A→B→A; nothing here waits for I5's `@name` path.
+   *
+   * Read, judgement and write all happen INSIDE the commit transaction
+   * (`BEGIN IMMEDIATE`), which is the only shape that is actually correct here:
+   *  - a user message posted while this Task was running resets the chain and the
+   *    round count. Judging against a snapshot read BEFORE the transaction would
+   *    let that reset slip in underneath and charge rounds to a turn that already
+   *    ended — so the state is read after the lock is held;
+   *  - "this handoff is blocked" + "the system message saying so" + "that round is
+   *    counted" + "the child Task exists" commit as one unit. Writing the system
+   *    message outside the transaction would let a crash leave a refusal nobody can
+   *    see, or a round counted for a child that was never queued.
+   *
+   * Because a batch can hold several handoffs, each later target is judged against a
+   * PROJECTION of the state (`rounds`/`chain` advanced by every allowed target)
+   * instead of the snapshot alone. Judging them all against the snapshot would let
+   * one reply burn five rounds at once and dispatch the same agent twice in a batch.
+   *
+   * Returns null when there is nothing to guard: no RoomStore wired, no `groupId`, or
+   * the room is gone. A null plan leaves the pure P6 path untouched.
+   */
+  function planRoomGuards(task: TaskRecord, handoffs: ResolvedHandoff[]): GuardPlan | null {
+    if (!rooms || !task.groupId) return null;
+    const room = rooms.getRoom(task.groupId);
+    if (!room) return null;
+    const state = rooms.getState(room.id);
+    const kept: ResolvedHandoff[] = [];
+    const blocked: GuardPlan["blocked"] = [];
+    let rounds = state.roundCount;
+    let chain = state.chain;
+    let reachesCap = false;
+    for (const handoff of handoffs) {
+      const decision = evaluateTrigger({ ...state, roundCount: rounds, chain }, room, handoff.toMemberId);
+      if (!decision.allowed) {
+        const name = rooms.getAgent(handoff.toMemberId)?.name ?? handoff.toMemberId;
+        blocked.push({ memberId: handoff.toMemberId, reason: formatBlockReason(name, decision) });
+        continue;
+      }
+      kept.push(handoff);
+      rounds += 1;
+      chain = [...chain, handoff.toMemberId];
+      // The trigger that lands exactly ON the cap is the one that schedules the
+      // forced ending, not the ones after it (which are refused by ROUND_CAP).
+      if (decision.reachesCap) reachesCap = true;
+    }
+    return { roomId: room.id, room, kept, blocked, reachesCap, rounds };
+  }
+
+  /**
+   * Write the plan inside the caller's transaction: one round per handoff that
+   * survived, and a system message for each that did not — AC4.1's "在流中显示系统
+   * 消息" only holds if the refusal lands together with the refusal.
+   */
+  function applyRoomGuards(plan: GuardPlan): void {
+    if (!rooms) return;
+    for (const handoff of plan.kept) {
+      rooms.recordTrigger(plan.roomId, handoff.toMemberId, now());
+    }
+    for (const block of plan.blocked) {
+      rooms.appendMessage({ roomId: plan.roomId, authorKind: "system", content: block.reason }, now());
+    }
+  }
+
+  /**
+   * AC5.1 — hitting the cap is not just a refusal, it is a forced ending. The Task
+   * is queued by the shared `queueWrapUpTask`, because a user message that mentions
+   * enough agents consumes the same budget as a chain of handoffs and AC5.1 does not
+   * distinguish the two: one implementation, or the two entry points drift.
+   *
+   * Called after the reply and the termination check, so if this very reply already
+   * ended the room there is nothing to force (the helper re-reads the flag itself).
+   */
+  function queueWrapUpIfNeeded(task: TaskRecord, plan: GuardPlan): void {
+    if (!rooms || !plan.reachesCap) return;
+    queueWrapUpTask(rooms, store, {
+      room: plan.room,
+      rounds: plan.rounds,
+      tenantId: task.tenantId,
+      projectId: task.projectId,
+      workspacePath: task.workspacePath,
+      now: now(),
+    });
   }
 
   async function execute(task: TaskRecord, attempt: AttemptRecord): Promise<void> {
@@ -287,9 +441,25 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       // room — or a reply for a Task that did not succeed — would desynchronise the
       // stream the next trigger injects. `completeSuccess` joins this transaction
       // instead of nesting a second one.
+      //
+      // I6: the flow guards run inside the SAME transaction, after the state has
+      // been read under the write lock. A room-guard refusal is not a runtime
+      // failure: the Task still succeeded and still said what it said — only the
+      // handoff it asked for is dropped, with a system message as the answer.
       store.transaction(() => {
-        store.completeSuccess(attempt.id, attempt.fencingToken, structured, handoffs, now());
-        appendAgentReply(task, structured);
+        const plan = planRoomGuards(task, handoffs);
+        store.completeSuccess(attempt.id, attempt.fencingToken, structured, plan ? plan.kept : handoffs, now());
+        const spoke = appendAgentReply(task, structured);
+        // A Task whose reply is already in the stream has already had its whole
+        // effect committed (`spoke` is the idempotency marker), so the flow-state
+        // writes below run exactly once per Task: rounds are not counted twice and
+        // no system message is duplicated.
+        if (!plan || !spoke) return;
+        // The order below is the order the room reads in: reply, then the guard's
+        // notes about what it refused, then the forced ending if this hit the cap.
+        applyRoomGuards(plan);
+        applyTermination(task, structured);
+        queueWrapUpIfNeeded(task, plan);
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

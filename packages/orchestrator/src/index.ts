@@ -29,14 +29,25 @@ export {
   type MentionResolution,
 } from "./mention.js";
 export {
+  applyTriggerGuards,
   buildRoomPrompt,
-  ROOM_HISTORY_LIMIT,
   postRoomMessage,
+  queueWrapUpTask,
+  ROOM_HISTORY_LIMIT,
   RoomTriggerError,
   type PostedRoomMessage,
   type PostRoomMessageInput,
   type RoomTriggerErrorCode,
 } from "./room-trigger.js";
+export {
+  evaluateTermination,
+  evaluateTrigger,
+  formatBlockReason,
+  WRAP_UP_INSTRUCTION,
+  type GuardBlockCode,
+  type TerminationDecision,
+  type TriggerDecision,
+} from "./room-guards.js";
 export {
   importTemplatePackage,
   parseFrontmatter,

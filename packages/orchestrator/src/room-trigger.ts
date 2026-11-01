@@ -13,12 +13,18 @@
  *
  * A message with no mention is refused rather than stored as idle chat, because a
  * stored message nobody answers is the same silent failure the 4xx exists to
- * avoid. Flow guards are I6.
+ * avoid.
+ *
+ * I6 adds a step between (1) and (2): inside the transaction the turn's flow state
+ * is reset and every target passes the flow guards, so "the message landed" and
+ * "this trigger was allowed / refused" commit together. See `applyTriggerGuards`
+ * and `queueWrapUpTask` below — the same two rules the worker applies to handoffs.
  */
 
 import type { ChatRoom, RoomAgent, RoomMessage } from "@my-team-agents/domain";
 import { ExecutionStore } from "./execution-store.js";
 import { resolveMentions } from "./mention.js";
+import { evaluateTrigger, formatBlockReason, WRAP_UP_INSTRUCTION, type GuardBlockCode } from "./room-guards.js";
 import { RoomStore } from "./room-store.js";
 
 /** Rejected for a reason the caller can surface verbatim. */
@@ -60,6 +66,12 @@ export interface PostedRoomMessage {
   message: RoomMessage;
   /** Created Tasks in mention order; `memberId` is the RoomAgent id. */
   tasks: Array<{ id: string; memberId: string }>;
+  /**
+   * I6: targets a flow guard refused. Not an error — the user message and the
+   * system message explaining the refusal are already committed — so the API
+   * answers 2xx with this list instead of a 4xx.
+   */
+  blocked: Array<{ memberId: string; code: GuardBlockCode; reason: string }>;
 }
 
 /**
@@ -135,11 +147,153 @@ export function buildRoomPrompt(
   return blocks.join("\n\n");
 }
 
+/** The seq of the newest user message in a window, 0 if there is none. */
+const lastUserSeq = (history: RoomMessage[]): number => {
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    if (history[i]!.authorKind === "user") return history[i]!.seq;
+  }
+  return 0;
+};
+
+/**
+ * Queue the coordinator's forced wrap-up Task (AC5.1), or say in the stream why it
+ * cannot be queued. Shared by both guard entry points — a user message that mentions
+ * enough agents can consume the whole round budget just as a chain of handoffs can,
+ * and AC5.1 does not distinguish the two, so only one implementation may exist.
+ *
+ * Must be called inside the caller's transaction: the wrap-up and the round that
+ * reached the cap commit together or not at all.
+ *
+ * The Task is created directly, never through `evaluateTrigger`: it is not counted as
+ * a round, because charging the coordinator for the budget it needs to close the
+ * discussion would spend the last round of the budget on the escape hatch itself.
+ *
+ * Idempotent per (room, user turn), so a replayed Attempt cannot queue a second
+ * one — and a later turn that also hits the cap (round counts always reset to the
+ * same numbers) still gets its own.
+ */
+export function queueWrapUpTask(
+  rooms: RoomStore,
+  executions: ExecutionStore,
+  options: {
+    room: ChatRoom;
+    /** Round count the cap was hit at — only used for the system message. */
+    rounds: number;
+    /** Attribution copied from the Task/message that reached the cap. */
+    tenantId: string;
+    projectId: string;
+    workspacePath: string;
+    now: number;
+  },
+): string | null {
+  const { room, now } = options;
+  if (rooms.getState(room.id).terminated) return null;
+  const capLine = `【流程守卫·轮次上限】本轮已达上限（${options.rounds}/${room.maxRounds}）`;
+  const coordinator = room.coordinatorAgentId ? rooms.getAgent(room.coordinatorAgentId) : null;
+  if (!coordinator) {
+    // Nothing to push: report that in the stream instead of pretending a forced
+    // ending was scheduled. The cap itself still blocks every later trigger.
+    rooms.appendMessage({
+      roomId: room.id,
+      authorKind: "system",
+      content: room.coordinatorAgentId
+        ? `${capLine}，但找不到协调者 ${room.coordinatorAgentId}，无法强制收尾；后续 agent 触发将被阻断。`
+        : `${capLine}，且本群未指定协调者，无法强制收尾；后续 agent 触发将被阻断，用户发送新消息可重新开始。`,
+    }, now);
+    return null;
+  }
+  const members = rooms.listAgents(room.id);
+  const history = rooms.listMessages(room.id, ROOM_HISTORY_LIMIT);
+  // The turn this belongs to: the newest user message in the window. A replay
+  // inside the same turn reuses the key (one wrap-up), a later turn that also
+  // hits the cap gets a fresh one instead of being deduped onto the first.
+  const turnKey = lastUserSeq(history);
+  const omitted = Math.max(0, rooms.countMessages(room.id) - history.length);
+  const task = executions.createTask({
+    tenantId: options.tenantId,
+    projectId: options.projectId,
+    memberId: coordinator.id,
+    workspacePath: options.workspacePath,
+    ...(coordinator.agentDir ? { agentDir: coordinator.agentDir } : {}),
+    // The coordinator still sees the whole discussion (I4); the platform's directive
+    // is appended last so it cannot be mistaken for another member's opinion.
+    prompt: `${buildRoomPrompt(room, coordinator, members, history, omitted)}\n\n${WRAP_UP_INSTRUCTION}`,
+    // Still the room's serialisation key: the wrap-up queues behind the room's
+    // running Task, never beside it.
+    groupId: room.id,
+    model: coordinator.model ?? undefined,
+    idempotencyKey: `wrapup:${room.id}:turn${turnKey}`,
+  }, now);
+  rooms.appendMessage({
+    roomId: room.id,
+    authorKind: "system",
+    content: `${capLine}，平台已向协调者 ${coordinator.name} 下发强制收尾指令（不计入轮次）。`,
+  }, now);
+  return task.id;
+}
+
+/**
+ * I6 entry point A's write half: run every target through `evaluateTrigger`, count a
+ * round for each that passes, and leave a system message for each that does not.
+ *
+ * Extracted rather than inlined for one reason: the refusal path is otherwise
+ * unreachable through `postRoomMessage` in production (`resolveMentions` dedupes
+ * targets, and the chain was just reset), so an inlined branch would be untested
+ * code pretending to be a guard. Here a test can drive it with a duplicated target
+ * or a pre-populated chain and assert the real behaviour (AC4.1).
+ *
+ * Must be called inside the caller's transaction: the system message and the round
+ * count have to commit together, or a crash leaves one without the other.
+ */
+export function applyTriggerGuards(
+  rooms: RoomStore,
+  room: ChatRoom,
+  targets: readonly RoomAgent[],
+  now: number,
+): {
+  allowed: RoomAgent[];
+  blocked: PostedRoomMessage["blocked"];
+  reachesCap: boolean;
+} {
+  const allowed: RoomAgent[] = [];
+  const blocked: PostedRoomMessage["blocked"] = [];
+  let reachesCap = false;
+  for (const agent of targets) {
+    // Re-read per target: an earlier allowed target already advanced the chain and
+    // the round count, so a message that names the same agent twice is refused the
+    // second time (LOOP) instead of being dispatched twice.
+    const decision = evaluateTrigger(rooms.getState(room.id), room, agent.id);
+    if (!decision.allowed) {
+      const reason = formatBlockReason(agent.name, decision);
+      rooms.appendMessage({ roomId: room.id, authorKind: "system", content: reason }, now);
+      blocked.push({ memberId: agent.id, code: decision.code!, reason });
+      continue;
+    }
+    rooms.recordTrigger(room.id, agent.id, now);
+    allowed.push(agent);
+    if (decision.reachesCap) reachesCap = true;
+  }
+  return { allowed, blocked, reachesCap };
+}
+
 /**
  * Append one user message to a room and queue a Task per mentioned agent.
  *
  * `rooms` and `executions` must share one `DatabaseSync` handle — how the server
  * wires them, and what lets a single `BEGIN IMMEDIATE` cover both tables.
+ *
+ * I6 changes what a successful POST can contain: the user message opens a NEW
+ * user turn, so flow state is reset first (AC4.2 chain, AC5.3 rounds, AC6.3
+ * terminated), then every target passes `evaluateTrigger` before it gets a Task,
+ * and an allowed target is recorded as one round.
+ *
+ * Two failure classes stay distinct, and the route layer maps them differently:
+ *  - `RoomTriggerError` = the request itself is wrong (no such room, no valid
+ *    `@`), so nothing is written and the answer is 4xx;
+ *  - a guard block = a well-formed request the platform refused to act on. The
+ *    message and an explanatory system message ARE committed and the answer is
+ *    2xx with `blocked` populated. Rolling back a guard block would delete the
+ *    user's own words, which is the opposite of "the stream is the record".
  */
 export function postRoomMessage(
   rooms: RoomStore,
@@ -182,6 +336,11 @@ export function postRoomMessage(
   const now = input.now ?? Date.now();
   return executions.transaction(() => {
     const message = rooms.appendMessage({ roomId: room.id, authorKind: "user", content }, now);
+    // I6 entry point A: a user message is the start of a new turn, so the chain,
+    // the round counter and `terminated` are cleared BEFORE any guard looks at
+    // them. Resetting after the Tasks were created would let the previous turn's
+    // chain block this turn's targets (AC4.2/AC5.3/AC6.3 all read as one rule).
+    rooms.resetState(room.id, now);
     // I4: read the stream AFTER the append, so the current user message is the last
     // history line. Adding a separate "用户消息" section on top of that would show
     // the same message twice.
@@ -189,7 +348,15 @@ export function postRoomMessage(
     // `countMessages` is what makes the cut visible: the window can only report
     // what it kept, never what it dropped.
     const omitted = Math.max(0, rooms.countMessages(room.id) - history.length);
-    const created = targets.map((agent) => executions.createTask({
+
+    // I6 entry point A. `resolveMentions` already deduped these targets, so in
+    // production the guards pass; the call is not a formality though — it is what
+    // makes "no trigger without a recorded round" a single rule for both entry
+    // points, and what `room-guards.test.ts` drives directly to prove the blocked
+    // branch writes a system message and creates no Task.
+    const { allowed, blocked, reachesCap } = applyTriggerGuards(rooms, room, targets, now);
+
+    const created = allowed.map((agent) => executions.createTask({
       tenantId: input.tenantId,
       projectId: input.projectId ?? room.projectId,
       memberId: agent.id,
@@ -207,6 +374,22 @@ export function postRoomMessage(
       // idempotency key on this endpoint yet (that is the P7b auth/guards issue).
       idempotencyKey: `mention:${message.id}:${agent.id}`,
     }, now));
-    return { message, tasks: created.map((task) => ({ id: task.id, memberId: task.memberId })) };
+    // AC5.1/AC5.4: this turn's mentions consumed the budget, so the forced ending is
+    // scheduled now, in the same commit. No extra round is charged for it.
+    if (reachesCap) {
+      queueWrapUpTask(rooms, executions, {
+        room,
+        rounds: rooms.getState(room.id).roundCount,
+        tenantId: input.tenantId,
+        projectId: input.projectId ?? room.projectId,
+        workspacePath: input.workspacePath,
+        now,
+      });
+    }
+    return {
+      message,
+      tasks: created.map((task) => ({ id: task.id, memberId: task.memberId })),
+      blocked,
+    };
   });
 }

@@ -57,10 +57,22 @@ const json = <T>(v: unknown, fallback: T): T => {
   try { return JSON.parse(String(v)) as T; } catch { return fallback; }
 };
 
+/**
+ * Savepoint names are per connection, and two RoomStore instances can share one
+ * handle, so the counter is module-level: a name is never reused.
+ */
+let nextSavepoint = 0;
+
 export class RoomStore {
   readonly db: DatabaseSync;
 
   private readonly ownsDb: boolean;
+
+  /**
+   * Nesting depth of the open transaction. SQLite has no API for this, so it is
+   * tracked here.
+   */
+  private txDepth = 0;
 
   constructor(dbOrFilename: DatabaseSync | string = ":memory:") {
     this.ownsDb = typeof dbOrFilename === "string";
@@ -119,10 +131,38 @@ export class RoomStore {
     if (this.ownsDb) this.db.close();
   }
 
+  /**
+   * One transaction for `fn`, re-entrant like `ExecutionStore.transaction`.
+   *
+   * Room state is written from inside a transaction the *ExecutionStore* already
+   * opened (I6: guards + Tasks + flow state commit as one unit), and SQLite
+   * rejects `BEGIN` inside an open transaction. `SAVEPOINT` is what nests:
+   * standalone it starts a transaction and `RELEASE` commits it; inside someone
+   * else's transaction it is a sub-transaction whose work is still discarded if
+   * the outer transaction rolls back. So `recordTrigger` keeps its "own
+   * transaction" contract without ever breaking atomicity with the Task rows.
+   */
   private tx<T>(fn: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
-    try { const out = fn(); this.db.exec("COMMIT"); return out; }
-    catch (err) { this.db.exec("ROLLBACK"); throw err; }
+    if (this.txDepth > 0) {
+      this.txDepth += 1;
+      try { return fn(); } finally { this.txDepth -= 1; }
+    }
+    // Names are per connection and two RoomStore instances can share one handle,
+    // so the counter is module-level: a savepoint name is never reused.
+    const savepoint = `mta_room_${nextSavepoint++}`;
+    this.db.exec(`SAVEPOINT ${savepoint}`);
+    this.txDepth = 1;
+    try {
+      const out = fn();
+      this.db.exec(`RELEASE ${savepoint}`);
+      return out;
+    } catch (err) {
+      try { this.db.exec(`ROLLBACK TO ${savepoint}`); this.db.exec(`RELEASE ${savepoint}`); }
+      catch { /* The outer transaction is already doomed; keep the original error. */ }
+      throw err;
+    } finally {
+      this.txDepth = 0;
+    }
   }
 
   private one(sql: string, ...args: Array<string | number | null>): Row | undefined {

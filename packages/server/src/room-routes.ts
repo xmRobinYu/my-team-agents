@@ -229,6 +229,15 @@ export async function registerRoomRoutes(
 
     // I3: @mention trigger. `postRoomMessage` owns the validation order and the
     // all-or-nothing commit; this layer only maps codes onto statuses.
+    //
+    // I6 keeps two outcomes apart, and the difference is the whole contract:
+    //  - `RoomTriggerError` = the REQUEST is wrong (unknown room, no valid `@`).
+    //    Nothing was written — the transaction rolled back — so 4xx is honest.
+    //  - a guard block (loop / round cap / terminated) = a valid request the
+    //    PLATFORM refused to act on. The user message and the system message
+    //    explaining the refusal are already committed, so this answers 201 with
+    //    `blocked`; rolling it back would delete what the user just said, and a
+    //    4xx would claim nothing happened when something demonstrably did.
     scope.post<{ Params: { id: string }; Body: PostMessageBody | undefined }>(
       "/api/rooms/:id/messages",
       async (request, reply) => {
@@ -240,7 +249,13 @@ export async function registerRoomRoutes(
             tenantId: defaultTenantId,
             workspacePath: body.workspacePath?.trim() ? body.workspacePath : defaultWorkspacePath,
           });
-          return reply.code(201).send(result);
+          // `blocked` is carried through verbatim: `{memberId, code, reason}` per
+          // refused target, `reason` being the exact text the stream shows.
+          return reply.code(201).send({
+            message: result.message,
+            tasks: result.tasks,
+            blocked: result.blocked,
+          });
         } catch (err) {
           if (err instanceof RoomTriggerError) {
             const status = err.code === "ROOM_NOT_FOUND" ? 404 : 400;

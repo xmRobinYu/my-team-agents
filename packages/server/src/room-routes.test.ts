@@ -250,6 +250,8 @@ describe("GET /api/rooms/:id/... unknown room", () => {
 interface PostMessageResponse {
   message: { id: string; seq: number; authorKind: string; content: string };
   tasks: Array<{ id: string; memberId: string }>;
+  /** I6: targets the flow guards refused — a normal result, so 2xx carries it. */
+  blocked: Array<{ memberId: string; code: string; reason: string }>;
   error?: string;
   code?: string;
   names?: string[];
@@ -358,6 +360,84 @@ describe("POST /api/rooms/:id/messages (I3 mention trigger)", () => {
     expect(res.statusCode).toBe(201);
     const body = res.json() as PostMessageResponse;
     expect(h.store.getTask(body.tasks[0]!.id)?.workspacePath).toBe(process.cwd());
+    await h.close();
+  });
+
+  it("answers 201 with an empty blocked array, and resets the terminated flag (AC6.3)", async () => {
+    const h = await buildTestApp("post-messages-guards");
+    const { room } = seedRoom(h);
+    // A room the coordinator already closed: a new user message must reopen it,
+    // because the user speaking is a new turn, not a trigger to be refused.
+    h.rooms.markTerminated(room.id, 150);
+    expect(h.rooms.getState(room.id).terminated).toBe(true);
+
+    const res = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`, payload: { content: "@架构师 继续" },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as PostMessageResponse;
+    // The contract: a guard block is a normal result, so the field is always present.
+    expect(body.blocked).toEqual([]);
+    expect(body.tasks).toHaveLength(1);
+    expect(h.rooms.getState(room.id)).toMatchObject({ terminated: false, roundCount: 1 });
+    await h.close();
+  });
+
+  it("a guard refusal answers 201 with blocked and keeps both messages written", async () => {
+    const h = await buildTestApp("post-messages-blocked");
+    const { room, arch } = seedRoom(h);
+    // A room whose whole budget is one round: the SECOND mention of the same message
+    // is refused by the cap. This is the route's real path to a non-empty `blocked`
+    // — the request is well formed, so nothing may be rolled back.
+    h.rooms.addAgent({
+      roomId: room.id, name: "PM", prompt: "You plan.", agentDir: join(h.base, "persona/pm"),
+    }, 103);
+    h.rooms.db.prepare("UPDATE chat_rooms SET max_rounds=1 WHERE id=?").run(room.id);
+
+    const res = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`, payload: { content: "@架构师 @QA 都看一下" },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as PostMessageResponse;
+    expect(body.tasks.map((t) => t.memberId)).toEqual([arch.id]);
+    expect(body.blocked).toHaveLength(1);
+    expect(body.blocked[0]).toMatchObject({ code: "ROUND_CAP" });
+    expect(body.blocked[0]?.reason).toContain("轮次上限");
+
+    // 2xx means "written": the user message AND the guard's system message are both
+    // in the stream, and GET shows them in order.
+    const stream = await h.app.inject({ method: "GET", url: `/api/rooms/${room.id}/messages` });
+    const notes = (stream.json() as Array<{ authorKind: string; content: string }>);
+    // `seedRoom` declares no coordinator, so the cap also announces that no forced
+    // wrap-up could be scheduled: user message, the refusal, that notice.
+    expect(notes.map((m) => m.authorKind)).toEqual(["user", "system", "system"]);
+    expect(notes[1]?.content).toContain("轮次上限");
+    expect(notes[2]?.content).toContain("未指定协调者");
+    // Only the allowed target got a Task.
+    expect(h.store.listTasks().filter((t) => (t.idempotencyKey ?? "").startsWith("mention:"))).toHaveLength(1);
+    await h.close();
+  });
+
+  it("AC5.1/AC5.4: a room whose mentions exhaust its own cap queues the wrap-up Task", async () => {
+    const h = await buildTestApp("post-messages-wrapup");
+    const room = h.rooms.createRoom({ projectId: "my-team-agents", name: "小群", maxRounds: 2 }, 100);
+    const lead = h.rooms.addAgent({
+      roomId: room.id, name: "协调者", prompt: "You coordinate.",
+      agentDir: join(h.base, "persona/lead"), isCoordinator: true,
+    }, 101);
+    h.rooms.addAgent({ roomId: room.id, name: "架构师", prompt: "You design.", agentDir: join(h.base, "persona/arch") }, 102);
+    h.rooms.addAgent({ roomId: room.id, name: "QA", prompt: "You test.", agentDir: join(h.base, "persona/qa") }, 103);
+
+    const res = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`,
+      payload: { content: "@架构师 @QA 一起看" },
+    });
+    expect(res.statusCode).toBe(201);
+    const wrapUp = h.store.listTasks().find((t) => (t.idempotencyKey ?? "").startsWith("wrapup:"));
+    expect(wrapUp?.memberId).toBe(lead.id);
+    expect(wrapUp?.prompt).toContain("[讨论结束]");
+    // 3 tasks = 2 mentions + 1 wrap-up; the wrap-up is not charged to the cap.
+    expect(h.rooms.getState(room.id).roundCount).toBe(2);
     await h.close();
   });
 });
