@@ -187,6 +187,58 @@ describe("ExecutionStore", () => {
     expect(store.getUsage()[0]?.totalCost).toBe(2);
   });
 
+  it("stores the real provider/model reported by the runtime, not 'unknown'", () => {
+    // The Pi adapter resolves attribution from the message object, so a usage row is
+    // attributable end to end. 'unknown' must survive only as the explicit signal that
+    // nothing was ever observed.
+    const store = new ExecutionStore();
+    store.createTask(input, 100);
+    const claimed = store.claimNext("w1", 100)!;
+    const usage = { input: 906, output: 3, cacheRead: 512, cacheWrite: 0, totalTokens: 1421,
+      cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 } };
+    store.appendEvent(claimed.attempt.id, claimed.attempt.fencingToken,
+      event(claimed.attempt.id, { usage, provider: "airouter", model: "deepseek-v4.1-flash" }));
+    const rows = store.getUsage();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.provider).toBe("airouter");
+    expect(rows[0]?.model).toBe("deepseek-v4.1-flash");
+
+    // No attribution at all -> still the explicit 'unknown', never an empty string.
+    store.appendEvent(claimed.attempt.id, claimed.attempt.fencingToken, event(claimed.attempt.id, { usage }));
+    const unattributed = store.getUsage().find((row) => row.model === "unknown");
+    expect(unattributed?.provider).toBe("unknown");
+    expect(store.getUsage().some((row) => row.model === "")).toBe(false);
+    store.close();
+  });
+
+  it("keeps two models inside one Attempt as two rows instead of merging under MAX()", () => {
+    // Upstream usage is cumulative, so MAX() dedup is right per model — but only per
+    // model. When attribution collapses to 'unknown' (the old bug) an auto-retry or
+    // compaction that switched models merged both into one row and understated the
+    // total: the two models' 900 + 700 cumulative reports collapsed into a single 900.
+    const store = new ExecutionStore();
+    store.createTask(input, 100);
+    const claimed = store.claimNext("w1", 100)!;
+    const usage = (total: number) => ({ input: total, output: 0, cacheRead: 0, cacheWrite: 0,
+      totalTokens: total, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
+    const append = (provider: string, model: string, total: number) =>
+      store.appendEvent(claimed.attempt.id, claimed.attempt.fencingToken,
+        event(claimed.attempt.id, { usage: usage(total), provider, model }));
+
+    append("airouter", "deepseek-v4.1-flash", 400);
+    append("airouter", "deepseek-v4.1-flash", 900); // cumulative report for model A
+    append("openrouter", "llama-4", 300);           // retry switched the model
+    append("openrouter", "llama-4", 700);           // cumulative report for model B
+
+    const rows = store.getUsage().map((row) => `${row.provider}/${row.model}`).sort();
+    expect(rows).toEqual(["airouter/deepseek-v4.1-flash", "openrouter/llama-4"]);
+    expect(store.getUsage().find((r) => r.model === "deepseek-v4.1-flash")?.totalTokens).toBe(900);
+    expect(store.getUsage().find((r) => r.model === "llama-4")?.totalTokens).toBe(700);
+    // MAX within a model, sum across models: nothing merged, nothing understated.
+    expect(store.getUsage().reduce((sum, row) => sum + row.totalTokens, 0)).toBe(1600);
+    store.close();
+  });
+
   it("holds a group's second task while its first Attempt is live (I3 AC3)", () => {
     const store = new ExecutionStore();
     // availableAt is pinned to 100 for all four: createTask's `now` also stamps

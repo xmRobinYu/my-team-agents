@@ -57,6 +57,81 @@ function canonicalType(raw: string): { type: CanonicalEvent["type"]; rawType?: s
   }
 }
 
+/**
+ * Model attribution: the `(provider, model)` pair a usage report belongs to.
+ *
+ * Either half may be missing — Pi's `Usage` object carries no attribution at all
+ * (node_modules/@earendil-works/pi-ai/dist/types.d.ts:285-303), so a report is only
+ * attributable through the message it came with.
+ */
+interface ModelAttribution {
+  provider?: string;
+  model?: string;
+}
+
+/**
+ * Read attribution off an assistant message.
+ *
+ * Why the message and not the event: Pi's RPC/JSON writers never put `model` or
+ * `provider` on the top level of a session record — verified against real session
+ * files where 0 of 31 assistant events carried either key. Attribution lives on
+ * `AssistantMessage.provider` / `.model` / `.responseModel`
+ * (node_modules/@earendil-works/pi-ai/dist/types.d.ts:368-381). Reading the top level
+ * is not just useless, it is misleading: it looks like a working fallback while every
+ * usage row silently lands in `(attempt_id,'unknown','unknown')`, and because
+ * `ExecutionStore.appendEvent` upserts with MAX() (cumulative usage), two models inside
+ * one Attempt would then collapse into a single row whose total understates both.
+ *
+ * `model` prefers `responseModel`: that is upstream's own aggregation key
+ * (`provider` / `responseModel ?? model`, node_modules/@earendil-works/pi-coding-agent/
+ * dist/core/usage-totals.js:47). Using the requested `model` instead would attribute a
+ * routed/virtual model's tokens to a name the provider never billed, so our breakdown
+ * would disagree with Pi's.
+ */
+function attributionOf(message: unknown): ModelAttribution | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const m = message as JsonRecord;
+  // Only assistant messages are model responses; user/toolResult entries have no
+  // provider/model and must not overwrite the attribution of the reply they precede.
+  if (m.role !== "assistant") return undefined;
+  const provider = typeof m.provider === "string" && m.provider.length > 0 ? m.provider : undefined;
+  const model = typeof m.responseModel === "string" && m.responseModel.length > 0
+    ? m.responseModel
+    : typeof m.model === "string" && m.model.length > 0
+      ? m.model
+      : undefined;
+  if (provider === undefined && model === undefined) return undefined;
+  return { ...(provider !== undefined ? { provider } : {}), ...(model !== undefined ? { model } : {}) };
+}
+
+/**
+ * `agent_end` carries the run's messages instead of a single `message`, so the last
+ * assistant entry is the one the usage reported so far belongs to.
+ */
+function lastAssistantAttribution(messages: unknown): ModelAttribution | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const found = attributionOf(messages[i]);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * `get_state` replies with `RpcSessionState`, whose `model` is the session's active
+ * model descriptor: `{ provider, id, ... }` (node_modules/@earendil-works/pi-coding-agent/
+ * dist/modes/rpc/rpc-types.d.ts:148-159). This is the only attribution source available
+ * *before* the first message, which is what makes the first `message_update` reportable.
+ */
+function attributionFromModelDescriptor(model: unknown): ModelAttribution | undefined {
+  if (typeof model !== "object" || model === null) return undefined;
+  const m = model as JsonRecord;
+  const provider = typeof m.provider === "string" && m.provider.length > 0 ? m.provider : undefined;
+  const id = typeof m.id === "string" && m.id.length > 0 ? m.id : undefined;
+  if (provider === undefined && id === undefined) return undefined;
+  return { ...(provider !== undefined ? { provider } : {}), ...(id !== undefined ? { model: id } : {}) };
+}
+
 function toUsage(value: unknown): Usage | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const u = value as JsonRecord;
@@ -208,6 +283,26 @@ export class PiAdapter implements RuntimeAdapter {
     let close: () => void = () => {};
     let fail: (err: Error) => void = () => {};
 
+    // Per-run attribution memory. Declared inside streamEvents, which `start()` calls
+    // once per run, so it dies with the run: a retried or resumed Attempt can never
+    // inherit the previous Attempt's model and mis-attribute its usage — each Attempt
+    // gets its own child process and its own closure here.
+    //
+    // Needed because `message_update` is delta-only on the wire: upstream's
+    // `toJsonEvent()` strips the cumulative message
+    // (node_modules/@earendil-works/pi-coding-agent/dist/modes/json-event.js:16-28),
+    // leaving `{type, usage, assistantMessageEvent}` — cumulative usage with no
+    // attribution attached. Without this memory every streaming report would collapse
+    // into the store's single ('unknown','unknown') row.
+    const lastKnown: ModelAttribution = {};
+    const remember = (found: ModelAttribution | undefined): void => {
+      if (!found) return;
+      // Halves are remembered independently: a source that only proves the provider
+      // must not erase a model learned earlier, and vice versa.
+      if (found.provider !== undefined) lastKnown.provider = found.provider;
+      if (found.model !== undefined) lastKnown.model = found.model;
+    };
+
     const queue: CanonicalEvent[] = [];
     const done = new Promise<void>((resolve, reject) => {
       close = () => resolve();
@@ -260,8 +355,13 @@ export class PiAdapter implements RuntimeAdapter {
         if (rawType === "response") {
           const data = record.data;
           if (typeof data === "object" && data !== null) {
-            const file = (data as JsonRecord).sessionFile;
+            const state = data as JsonRecord;
+            const file = state.sessionFile;
             if (typeof file === "string" && file.length > 0) onSessionFile?.(file);
+            // `get_state` reports the session's active model. It is the only source
+            // available before the first message, so it is what makes the very first
+            // `message_update` attributable rather than 'unknown'.
+            remember(attributionFromModelDescriptor(state.model));
           }
           continue;
         }
@@ -269,6 +369,14 @@ export class PiAdapter implements RuntimeAdapter {
         if (rawType === "agent_settled") onSettled?.(record);
         const { type, rawType: unknownRaw } = canonicalType(rawType);
         const tool = typeof record.toolName === "string" ? record.toolName : undefined;
+        // Resolve attribution for this record, then feed it back into the memory so a
+        // later delta-only `message_update` inherits it.
+        const recordAttribution = attributionOf(record.message) ?? lastAssistantAttribution(record.messages);
+        remember(recordAttribution);
+        const resolvedAttribution: ModelAttribution = {
+          model: recordAttribution?.model ?? lastKnown.model,
+          provider: recordAttribution?.provider ?? lastKnown.provider,
+        };
         push({
           type,
           ...(unknownRaw ? { rawType: unknownRaw } : {}),
@@ -279,8 +387,11 @@ export class PiAdapter implements RuntimeAdapter {
           ...(typeof record.toolCallId === "string" ? { toolCallId: record.toolCallId } : {}),
           ...(record.args !== undefined ? { args: record.args } : {}),
           ...(toUsage(record.usage) ? { usage: toUsage(record.usage) } : {}),
-          ...(typeof record.model === "string" ? { model: record.model } : {}),
-          ...(typeof record.provider === "string" ? { provider: record.provider } : {}),
+          // Attribution never comes from the top level of the record — see
+          // `attributionOf`. Order: this record's message, then `agent_end`'s message
+          // array, then whatever this run has already learned.
+          ...(resolvedAttribution.model !== undefined ? { model: resolvedAttribution.model } : {}),
+          ...(resolvedAttribution.provider !== undefined ? { provider: resolvedAttribution.provider } : {}),
           ...(type === "error"
             ? { isError: true, error: typeof record.error === "string" ? record.error : "extension_error" }
             : {}),
