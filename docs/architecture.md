@@ -84,11 +84,12 @@ Task     { tenantId, projectId, memberId, prompt, status }
 Handoff  { fromTaskId, toMemberIds, reason, depth }
 ```
 
-已确立语义（`CONTEXT.md` 决策记录 Q2/Q14/Q15）：
+已确立语义（`CONTEXT.md` 决策记录 Q2/Q14/Q15/Q34/Q35）：
 
 - 执行型 Agent 绑定**恰好一个**项目（其技能与记忆位于该项目工作区）。
 - 汇报类角色（PMO / 群管理员 / HR）可跨项目 → `projectId: null`。
-- 交接是**声明式**的（`handoff_to` 工具调用），绝不从散文/正则解析。
+- 交接是**声明式**的（`handoff_to` 工具调用）；agent 消息中的 `@name` 是次路径触发。
+  Q34 修订 Q14：`handoff_to` 优先，两条路径按目标去重（Q35）。平台代码不抓任意散文。
 - 交接只在 run **settle 之后**派发，不在流式中扇出。
 
 ## 5. 调度闭环

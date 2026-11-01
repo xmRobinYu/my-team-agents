@@ -508,6 +508,79 @@ unachievable unless the reply is persisted — see the first bullet.
   `room-reply.test.ts` (reply lands once, feeds the next trigger, stays out of
   non-room Tasks), `recovery.test.ts` (the resume contrast above).
 
+### Q40 — I6: flow guards are code, and their state is durable (2026-11-01)
+**A**: loop detection, the round cap and the termination signal are decided by one
+pure function over persisted `RoomState`, enforced at both trigger entry points;
+the coordinator is *pushed* toward an ending by a Task the platform queues, never by
+trusting an agent to stop on its own.
+**R**: AGENTS.md forbids a guard that depends on model behaviour, and Q28/Q29 refuse
+to inherit teamagentx's in-memory Map (its AC3.4 accepts losing flow state on
+restart). Both rules are only satisfiable if the decision is a pure function over
+state that lives in SQLite.
+- **Fixed judgement order**: `terminated` → chain membership (LOOP) → round count
+  (ROUND_CAP) → allowed, plus `reachesCap` for the trigger that lands exactly on the
+  cap. The order is a contract, not an accident: termination outranks everything so a
+  closed room cannot be resurrected by a loop-free, sub-cap trigger; LOOP outranks the
+  cap so A→B→A is named as a loop even when rounds remain.
+- **chain semantics**: one agent id may appear at most once per *user turn*. That is
+  what makes AC4.1 (A→B→A blocked) and AC4.3 (user→A→B→coordinator allowed) the same
+  rule rather than two special cases — the legal chain has no repeats.
+- **Round = one agent trigger** (Q30), counted at the moment the platform commits to
+  dispatching, never when the runtime later succeeds. A round is therefore recorded
+  for a Task that then fails: the budget measures dispatch attempts, which is the
+  thing a runaway loop consumes.
+- **A user message resets first, then guards.** `resetState` runs before any target is
+  judged, so AC4.2 (chain), AC5.3 (rounds) and AC6.3 (terminated) are one rule, not
+  three. Guarding first would let the previous turn's chain block this turn.
+- **The wrap-up Task is not charged a round.** Charging it would spend the last round
+  of the budget on the escape hatch that needs that budget. Its prompt is the shared
+  group prompt (I4) plus an explicit platform directive naming `[讨论结束]`, appended
+  last so it cannot read as another member's opinion. If the room has no coordinator
+  the cap is announced in the stream instead of pretending a forced ending was
+  scheduled.
+- **Both entry points share one wrap-up implementation.** A message mentioning enough
+  agents consumes the same budget as a chain of handoffs, and AC5.1 does not
+  distinguish them; two copies of that rule would drift. Same for the guard itself:
+  `applyTriggerGuards` is `postRoomMessage`'s write half, extracted because that
+  refusal path is otherwise unreachable in production (`resolveMentions` dedupes and
+  the chain was just reset) and would be untested code posing as a guard.
+- **Termination rights belong to code.** `[讨论结束]` in the stream is data; only the
+  coordinator's reply sets the flag (AC6.1), a non-coordinator's is ignored with a
+  warn *and* a system message (AC6.2) so the stream itself explains the silence. The
+  marker's author is read from the persisted `is_coordinator` column, so the rule
+  survives a restart and a template re-import rather than living in a prompt.
+- **Verdicts and writes commit together.** In the worker, guard reads/judgements/writes
+  all run *inside* the success transaction: a user message posted while the Task was
+  running would otherwise reset the chain underneath a snapshot read and charge rounds
+  to a turn that already ended. The room's reply idempotency (`getMessageByTask`) also
+  gates the flow-state writes, so a crash replay cannot count a round twice.
+- **`RoomStore.tx` became savepoint-based.** `recordTrigger` opened its own
+  `BEGIN IMMEDIATE`, which SQLite rejects inside an open transaction (verified:
+  `cannot start a transaction within a transaction`) — so any guard call from inside a
+  Task transaction would have thrown. `SAVEPOINT` is the primitive that nests:
+  standalone it commits, inside another transaction its work is still discarded on the
+  outer rollback. A test pins the second property, because the alternative — silently
+  keeping guard writes after a rolled-back Task — is the kind of divergence that only
+  shows up after a crash.
+- **A guard block is a normal result, not a 4xx.** `RoomTriggerError` still means "the
+  request was wrong" and still rolls everything back. A refusal by the loop/cap/
+  termination guard means "valid request, platform declined": the user message and the
+  system message are committed, so the API answers 201 with `blocked`. Rolling a block
+  back would delete what the user just typed.
+- **State is durable and verified as such.** `round_count` / `chain` / `terminated`
+  live in `room_state`; AC6.4 is tested by closing the file, reopening it with new
+  handles, and running a Worker that then refuses the handoff — not by asserting a
+  field on an object.
+- Deliberate limit: the cap counts rounds within one user turn, so a user who keeps
+  re-mentioning can extend a discussion indefinitely. That is intended — the guard
+  exists to stop agents from burning tokens on each other (PRD Story 4), not to limit
+  how much the human pays for their own turns.
+- Gates: `room-guards.test.ts` (31 cases, one `it` title per AC: 4.1/4.2/4.3,
+  5.1/5.2/5.3/5.4 plus the no-coordinator fallback, 6.1/6.2/6.3/6.4 end-to-end,
+  7.1, and the P6 regression for a Task with no `groupId` or no `RoomStore`),
+  `room-routes.test.ts` (201-with-`blocked` versus 4xx-rollback, wrap-up queued through
+  the route).
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

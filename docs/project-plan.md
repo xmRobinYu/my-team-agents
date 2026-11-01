@@ -44,7 +44,8 @@ verify-packages，以 `justfile` 定义为准）；`pnpm test` / `just test-no-b
 
 目标：把“任务 → 执行 → 声明交接 → 成本报告”跑成可验证的骨架。
 
-- ✅ 结构化交接（`handoff_to`），拒绝散文解析；
+- ✅ 结构化交接（`handoff_to`），拒绝散文解析（当时的 Q14 口径；此限制已由 Q34 修订，
+  见下方 M3.5 的次路径与去重）；
 - ✅ 确定性护栏（fanout / depth / budget / revisit）；
 - ✅ 运行时缺失时降级为 `failed`，不穿透调用方；
 - ✅ 停滞看门狗避免卡死 run 占位；

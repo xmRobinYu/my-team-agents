@@ -61,7 +61,7 @@
 | 结构化结果校验 | `durable-worker.ts:37-46`、`:62-73` | outcome/summary/artifacts/remainingRisks 缺一即失败 |
 | 链式取消 | `execution-store.ts:515-525` | 父取消 → 未完成后代置 cancelled，活跃者置 cancelling |
 | API/Worker 进程分离 | `server/src/server.ts:9-23`、`server/src/worker.ts:8-33` | API 只读 + 发信号；Worker 轮询 250ms；取消经 DB 标志跨进程生效 |
-| 结构化交接（声明式） | `orchestrator/src/handoff-intent.ts:45-93` | 只认 `tool_execution_start` 的 `handoff_to`，散文不解析 |
+| 结构化交接（声明式） | `orchestrator/src/handoff-intent.ts:45-93` | 只认 `tool_execution_start` 的 `handoff_to`，散文不解析。**本行是落地前快照，其「只认」已由 Q34 修订**：`@name` 文本现为次路径，两条路径按目标去重（Q35）；本模块仍只负责权威路径 |
 | 停滞看门狗 | `orchestrator/src/stall-watchdog.ts:21-65` | 注入时钟、`unref()`、事件驱动 ping |
 | 每日自评估幂等 | `cost-report/src/parse.ts:41-100`、`cli.ts:88-110` | `since` 游标按 entry-id 增量 |
 | 原有 dispatcher 闭环 | `orchestrator/src/dispatcher.ts:65-155` | settle 后派发、确定性护栏、`start()` 抛错降级 failed |
@@ -759,7 +759,7 @@ UI 状态与服务端 `GET /tasks/:id` 一致。
 | 不变式 | 代码检查点 | 测试 |
 |---|---|---|
 | 未知事件不可静默丢弃 | `adapter.ts:42-43` 落 `unknown`+`rawType`；`events` 全量追加；API 分页 `hasMore`；SSE 原样转发；UI 折叠展示 | A6/G4/H4 |
-| 交接须声明 | `handoff-intent.ts:80-93` 只认 `handoff_to`；`durable-worker.ts:169-171` | X3/X4 |
+| 交接须声明 | `handoff-intent.ts:80-93` 只认 `handoff_to`；`durable-worker.ts:169-171`。**该不变式已由 Q34 收窄**：agent 自己消息中的 `@name` 文本是次路径（解析在 `mention.ts` / `room-trigger.ts`，不在本检查点内），两条路径按目标去重（Q35）；`handoff-intent.ts` 依旧不抓任意散文 | X3/X4 |
 | 单活跃 Worker | `workers` 表 workspace 唯一 + 租约 | B3 |
 | 每 Task ≤3 Attempt、重启不清零 | `tasks.batch_attempts` 持久判定 | A4 |
 | 运行时缺失降级 failed 不崩调用方 | `durable-worker.ts:206-210` 捕获后 `finishFailure`；**现状另有 D11 未处理 rejection 必须修**；新增 `runtime_missing` 分类与创建预检 | F9/F10 |
