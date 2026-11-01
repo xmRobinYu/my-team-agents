@@ -12,12 +12,15 @@
  *
  * --check is the CI-enforceable surface: mapping is complete and every managed
  * source is registered. The network sync needs a local `lark-cli` user
- * credential, so it deliberately cannot run in CI.
+ * credential, so it deliberately cannot run in CI. Entries whose ids are still
+ * placeholders ("pending provisioning") are counted and listed by --check but do
+ * NOT fail it: clearing one means creating the Feishu node first, which no CI run
+ * can do. They are refused by the sync path instead, with an actionable message.
  */
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -51,8 +54,43 @@ function firstHeading(source) {
   return line ? line.slice(2).trim() : null;
 }
 
-function validate(documents) {
+/**
+ * Does this value look like a placeholder rather than a real Feishu id?
+ *
+ * Real node_token / document_id values are opaque ~27-char mixed-case ids and never
+ * start with these markers; a provisioning placeholder does ("PENDING_FIRST_SYNC",
+ * "TODO_...", "PLACEHOLDER..."). Empty values are NOT placeholders: they are already
+ * reported by the `entry missing "document_id"` check below, so counting them twice
+ * would double-report one fault.
+ */
+export function isPlaceholder(value) {
+  return typeof value === "string" && /^(PENDING_|TODO_|PLACEHOLDER)/i.test(value.trim());
+}
+
+const ID_KEYS = ["node_token", "document_id"];
+
+/** The first placeholder id on an entry, or null when every id is real. */
+export function placeholderOf(doc) {
+  for (const key of ID_KEYS) {
+    if (isPlaceholder(doc[key])) return { key, value: doc[key].trim() };
+  }
+  return null;
+}
+
+/**
+ * Structural validation of the mapping.
+ *
+ * Returns `{ problems, pending }`:
+ *  - `problems` — real errors only (missing field, duplicate, source not found,
+ *    entry outside the managed surface). Unchanged behaviour from before.
+ *  - `pending` — entries whose ids are placeholders: `{ source, node }`. Not errors,
+ *    because clearing a placeholder requires creating the wiki node, an external
+ *    action `--check` cannot take (and CI has no lark-cli credential at all). See
+ *    the `--check` branch for how the state is reported instead of failed.
+ */
+export function validate(documents, managed = collectManaged()) {
   const problems = [];
+  const pending = [];
   const seenSource = new Set();
   const seenDoc = new Set();
 
@@ -69,18 +107,20 @@ function validate(documents) {
       if (seenDoc.has(d.document_id)) problems.push(`duplicate document_id: ${d.document_id}`);
       seenDoc.add(d.document_id);
     }
+    const ph = placeholderOf(d);
+    if (ph) pending.push({ source: d.source, node: ph.value });
   }
 
-  for (const s of collectManaged()) {
+  for (const s of managed) {
     if (!seenSource.has(s)) problems.push(`managed doc not in manifest: ${s}`);
   }
   for (const d of documents) {
-    if (d.source && !collectManaged().has(d.source)) {
+    if (d.source && !managed.has(d.source)) {
       problems.push(`manifest entry is outside the managed surface: ${d.source}`);
     }
   }
 
-  return problems;
+  return { problems, pending };
 }
 
 function runLark(args) {
@@ -111,7 +151,27 @@ function runLark(args) {
   }
 }
 
-function syncOne(doc) {
+/**
+ * Why this entry cannot be synced yet, or null when its ids are real.
+ * Kept separate from syncOne so it is testable without touching lark-cli.
+ */
+export function provisioningProblem(doc, spaceId) {
+  const ph = placeholderOf(doc);
+  if (!ph) return null;
+  return (
+    `${doc.source} 的飞书节点尚未开通（${ph.key}=${ph.value}）；` +
+    `请先在 wiki space ${spaceId} 创建节点，` +
+    `把真实 node_token/document_id 写回 docs/feishu-sync.json，再重跑 just sync-docs`
+  );
+}
+
+function syncOne(doc, spaceId) {
+  // Refuse a placeholder before touching lark-cli. Letting it through would make the
+  // CLI fail on an id matching no document, and the message reads like an auth /
+  // Keychain problem — the two root causes would be indistinguishable in the log.
+  const pending = provisioningProblem(doc, spaceId);
+  if (pending) throw new Error(pending);
+
   const update = runLark([
     "docs",
     "+update",
@@ -164,50 +224,71 @@ function syncOne(doc) {
   return update.data?.document?.revision_id ?? "?";
 }
 
-const isCheck = process.argv[2] === "--check";
-const filters = process.argv.slice(isCheck ? 3 : 2).filter((a) => !a.startsWith("-"));
+function main() {
+  const isCheck = process.argv[2] === "--check";
+  const filters = process.argv.slice(isCheck ? 3 : 2).filter((a) => !a.startsWith("-"));
 
-const manifest = readJson(MANIFEST);
-const documents = manifest.documents ?? [];
-const problems = validate(documents);
+  const manifest = readJson(MANIFEST);
+  const documents = manifest.documents ?? [];
+  const { problems, pending } = validate(documents);
 
-if (problems.length > 0) {
-  console.error("docs/feishu-sync.json has problems:");
-  for (const p of problems) console.error(`  - ${p}`);
-  process.exit(1);
-}
-
-if (isCheck) {
-  const sorted = documents.map((d) => d.source).sort();
-  console.log(`feishu sync mapping OK: ${sorted.length} documents, space ${manifest.space_id}`);
-  for (const s of sorted) console.log(`  ${s}`);
-  process.exit(0);
-}
-
-for (const f of filters) {
-  if (!documents.some((d) => d.source === f)) {
-    console.error(`not in manifest: ${f}`);
-    console.error(`mapped: ${documents.map((d) => d.source).sort().join(", ")}`);
+  if (problems.length > 0) {
+    console.error("docs/feishu-sync.json has problems:");
+    for (const p of problems) console.error(`  - ${p}`);
     process.exit(1);
   }
-}
 
-const targets =
-  filters.length === 0 ? documents : documents.filter((d) => filters.includes(d.source));
-
-let failed = 0;
-for (const doc of targets) {
-  try {
-    const rev = syncOne(doc);
-    console.log(`synced ${doc.source} -> ${doc.node} (revision ${rev})`);
-  } catch (err) {
-    failed += 1;
-    console.error(`FAILED ${doc.source}: ${err.message}`);
+  if (isCheck) {
+    const sorted = documents.map((d) => d.source).sort();
+    // Placeholder entries are reported, never failed. Un-pending a placeholder means
+    // creating the wiki node in Feishu first — an external action CI cannot take (the
+    // network sync is deliberately outside CI: it needs a local lark-cli credential).
+    // Failing the gate there would park it on a state nobody can clear in CI; staying
+    // silent would make this line lie about coverage. So: exit 0, count both classes
+    // and name every pending source. Do not "tidy" this into a failure.
+    const head =
+      pending.length === 0
+        ? `feishu sync mapping OK: ${sorted.length} documents, space ${manifest.space_id}`
+        : `feishu sync mapping OK: ${sorted.length} documents ` +
+          `(${sorted.length - pending.length} ready, ${pending.length} pending provisioning), ` +
+          `space ${manifest.space_id}`;
+    console.log(head);
+    for (const s of sorted) console.log(`  ${s}`);
+    for (const p of pending) console.log(`  PENDING ${p.source} -> ${p.node}`);
+    process.exit(0);
   }
+
+  for (const f of filters) {
+    if (!documents.some((d) => d.source === f)) {
+      console.error(`not in manifest: ${f}`);
+      console.error(`mapped: ${documents.map((d) => d.source).sort().join(", ")}`);
+      process.exit(1);
+    }
+  }
+
+  const targets =
+    filters.length === 0 ? documents : documents.filter((d) => filters.includes(d.source));
+
+  let failed = 0;
+  for (const doc of targets) {
+    try {
+      const rev = syncOne(doc, manifest.space_id);
+      console.log(`synced ${doc.source} -> ${doc.node} (revision ${rev})`);
+    } catch (err) {
+      failed += 1;
+      console.error(`FAILED ${doc.source}: ${err.message}`);
+    }
+  }
+
+  if (failed > 0) {
+    console.error(`${failed}/${targets.length} document(s) failed to sync`);
+    process.exit(1);
+  }
+  console.log(`all ${targets.length} document(s) synced to Feishu space ${manifest.space_id}`);
 }
 
-if (failed > 0) {
-  console.error(`${failed}/${targets.length} document(s) failed to sync`);
-  process.exit(1);
+// Executes when run directly (`node scripts/sync-feishu-docs.mjs`, `just verify-docs`,
+// CI); stays inert when scripts/feishu-docs.test.mjs imports the pure helpers above.
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main();
 }
-console.log(`all ${targets.length} document(s) synced to Feishu space ${manifest.space_id}`);
