@@ -3,11 +3,18 @@ import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type { CanonicalEvent, RuntimeAdapter } from "@my-team-agents/runtime-core";
 import { DEFAULT_GUARDRAILS, TERMINATION_MARKER, evaluateHandoff } from "@my-team-agents/domain";
-import type { ChatRoom } from "@my-team-agents/domain";
+import type { ChatRoom, RoomAgent } from "@my-team-agents/domain";
 import { ExecutionStore, type AttemptRecord, type TaskRecord, type TaskResult } from "./execution-store.js";
-import { parseHandoffArgs } from "./handoff-intent.js";
+import { dedupeByOrigin, parseHandoffArgs, type DispatchOrigin } from "./handoff-intent.js";
+import { resolveMentions, resolveRosterTokens } from "./mention.js";
 import { evaluateTermination, evaluateTrigger, formatBlockReason } from "./room-guards.js";
-import { queueWrapUpTask } from "./room-trigger.js";
+import {
+  buildDispatchPrompt,
+  queueWrapUpTask,
+  snapshotDispatch,
+  type DispatchSnapshot,
+  type DispatchSource,
+} from "./room-trigger.js";
 import type { RoomStore } from "./room-store.js";
 
 export interface WorkerOptions {
@@ -26,18 +33,45 @@ export interface WorkerOptions {
 }
 
 export interface ResolvedHandoff {
+  /**
+   * Idempotency anchor. For the primary path this is the runtime's real tool call
+   * id; for the `@name` path there is no tool call, so the worker synthesises
+   * `mention:<source Task id>` — see `mentionSourceId`.
+   */
   sourceToolCallId: string;
   toMemberId: string;
   reason: string;
+  /** Which dispatch path produced it (Q34). Decides the dedup winner (Q35). */
+  origin: DispatchOrigin;
   input: {
     tenantId: string;
     projectId: string;
     memberId: string;
     workspacePath: string;
     prompt: string;
+    /** Target persona dir (I3/Q38); only ever set for group Tasks. */
+    agentDir?: string;
     groupId?: string;
     model?: string;
   };
+}
+
+/**
+ * One recorded refusal: the `【…】` label the stream shows, plus the text behind
+ * it. Both dispatch paths produce notes, and the label keeps the two kinds apart —
+ * 提及解析 is an unresolvable `@name` in prose (I5), 交接校验 is a `handoff_to`
+ * target this room does not declare (D5).
+ */
+interface ResolutionNote {
+  label: "提及解析" | "交接校验";
+  body: string;
+}
+
+/** One resolved dispatch target. `agent` is null when there is no roster to read. */
+interface DispatchEntry {
+  memberId: string;
+  name: string;
+  agent: RoomAgent | null;
 }
 
 /**
@@ -55,6 +89,15 @@ interface GuardPlan {
   reachesCap: boolean;
   /** Projected round count after all allowed handoffs of this batch. */
   rounds: number;
+  /**
+   * I5/D5: what a dispatch path resolved but did NOT dispatch — an unknown or
+   * ambiguous `@name` on the secondary path, or a `handoff_to` target this room
+   * does not declare on the primary path (D5-a). Recorded, never fatal: see the
+   * asymmetry note on `collectMentionHandoffs` and `resolveHandoffTargets`.
+   * `label` is what the stream shows, so a roster refusal is never mistaken for a
+   * prose refusal.
+   */
+  notes: ResolutionNote[];
 }
 
 export interface DurableWorker {
@@ -190,10 +233,252 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
   }
 
   /**
+   * The persona a dispatch target actually runs as (I3/Q38). A group Task's
+   * `memberId` IS a RoomAgent id, so the child must inherit that agent's own
+   * `agentDir` (Pi's child cwd — persona isolation) and `model`; a child without
+   * them silently runs in the project workspace with the parent's model, which
+   * breaks G2/G3 of the PRD and Q38's isolation rule.
+   *
+   * Deliberately only for group Tasks: a non-group `memberId` is an execution
+   * member with no persona row, and inheriting the PARENT's `agentDir` would be
+   * worse still — the child would run as the wrong person.
+   */
+  function personaFields(task: TaskRecord, memberId: string): { agentDir?: string; model?: string } {
+    if (!rooms || !task.groupId) return {};
+    const agent = rooms.getAgent(memberId);
+    if (!agent) return {};
+    return {
+      ...(agent.agentDir ? { agentDir: agent.agentDir } : {}),
+      ...(agent.model ? { model: agent.model } : {}),
+    };
+  }
+
+  /**
+   * Idempotency anchor for the `@name` path. There is no tool call, so the id is
+   * synthesised — and it must be STABLE across an Attempt replay, because
+   * `completeSuccess` dedupes children on `outbox(source_tool_call_id,
+   * target_member_id)` and on `idempotencyKey handoff:<chain>:<source>:<target>`.
+   * `task.id` is the durable row the replay re-claims, so `mention:<taskId>` names
+   * exactly one source message forever; a crash between commit and ack cannot queue
+   * a second child. `randomUUID()` or `Date.now()` would mint a fresh key per
+   * replay and silently double-dispatch.
+   */
+  const mentionSourceId = (taskId: string): string => `mention:${taskId}`;
+
+  /**
+   * D5-a: the roster check the PRIMARY dispatch path never had.
+   *
+   * `handoff_to` hands the platform a list of strings the model chose. Until now
+   * those strings went straight into `evaluateHandoff` and
+   * `ResolvedHandoff.toMemberId` unexamined, so a target the room does not contain
+   * was dispatched anyway: the child Task got `member_id="寇豆码"` (a name, not an
+   * id), `agent_dir=NULL` and `model=NULL` from `personaFields`' silent `{}`
+   * fallback, and spun in the project workspace as an anonymous agent. That is a
+   * silent mis-dispatch, and a real acceptance run proved it.
+   *
+   * So every declared token is resolved against `rooms.listAgents(task.groupId)`
+   * with `resolveRosterTokens` — the same id/name/role rules the `@name` path
+   * already uses (D2: name before role; a token two members answer to is
+   * `ambiguous` and is never guessed). A token that resolves to nobody is refused
+   * with a system message, not dropped quietly and not made fatal: the parent's run
+   * produced a valid structured result and stays `succeeded`, exactly the asymmetry
+   * `collectMentionHandoffs` documents for prose.
+   *
+   * Guardrails then see the RESOLVED member ids, which is the only correct input:
+   * `revisit ≤ 5` counts visits per member id, so a chain that reaches 寇豆码 three
+   * times via the token `工程师` must be stopped by the same rule as one reaching
+   * `agent-<uuid>` three times. Fanout is judged on what would actually dispatch —
+   * never more than what was declared, so refusing junk names shrinks it.
+   *
+   * A Task with no `groupId` has no roster to check (its `memberId` is an execution
+   * member, not a persona) and a worker with no `RoomStore` cannot read one: both
+   * return the tokens verbatim, so the P6 spine stays byte-identical.
+   */
+  function resolveHandoffTargets(
+    tokens: string[],
+    members: RoomAgent[] | null,
+  ): {
+    entries: DispatchEntry[];
+    /** Declared tokens no member of this room answers to. */
+    unknown: string[];
+    /** Declared tokens more than one member answers to. */
+    ambiguous: string[];
+  } {
+    // No roster to read — a Task without a `groupId`, a worker without a RoomStore,
+    // or a room that no longer exists: the tokens pass through verbatim, exactly as
+    // the P6 spine always did. Inventing a gate here would change what a roomless
+    // Task means by "member", and there is nothing to check it against.
+    if (members === null) {
+      return {
+        entries: tokens.map((token) => ({ memberId: token, name: token, agent: null })),
+        unknown: [],
+        ambiguous: [],
+      };
+    }
+    const { targets, unknown, ambiguous } = resolveRosterTokens(tokens, members);
+    return {
+      entries: targets.map((agent) => ({ memberId: agent.id, name: agent.name, agent })),
+      unknown,
+      ambiguous,
+    };
+  }
+
+  /**
+   * D5-a: the system messages the roster produced for this run, folded by token
+   * across every `handoff_to` call so one bad name costs one sentence instead of
+   * one per call — the same fold the mention path applies to an unresolvable `@`.
+   *
+   * Phrased in the existing guard vocabulary (`【…】…：…，未派发`) and named 交接校验
+   * rather than 提及解析: a refusal the MODEL asked for by calling a tool is not the
+   * same fact as a name in its prose, and the room has to be able to tell which path
+   * to fix. The sentence says 不是本群成员, because that is the actual finding — the
+   * target may exist elsewhere and simply not be in THIS room.
+   */
+  function handoffResolutionNotes(unknown: string[], ambiguous: string[]): ResolutionNote[] {
+    const notes: ResolutionNote[] = [];
+    if (unknown.length > 0) {
+      notes.push({
+        label: "交接校验",
+        body: `handoff_to 的目标不是本群成员：${unknown.join(" / ")}，未派发`,
+      });
+    }
+    if (ambiguous.length > 0) {
+      notes.push({
+        label: "交接校验",
+        body: `handoff_to 的目标在本群有重名成员，无法确定 ${ambiguous.join(" / ")} 指谁，未派发`,
+      });
+    }
+    return notes;
+  }
+
+  /**
+   * D6: the child Task input BOTH agent-dispatch paths build. One function, so
+   * "what a triggered colleague sees" cannot drift between `handoff_to` and `@name`
+   * the way it had: the primary path used to hand over nothing but the work text,
+   * so the child ran without its persona prompt, without the room and without any
+   * history (AC2.3/AC3.1), which Q30/I4 forbid.
+   *
+   * `snapshot` is the run's single room read (see `readSnapshot` in `execute`),
+   * `work` is the `handoff_to` `workPackage`/`reason`. The snapshot renders the
+   * injection and `work` is appended AFTER it as the dispatcher's instruction to the
+   * target, the way `queueWrapUpTask` appends the platform directive last. A `@name`
+   * child has no work text, so it gets the injection unchanged.
+   *
+   * A null snapshot — a Task with no `groupId`, a worker with no `RoomStore`, or a
+   * room that has vanished — keeps the old bare `work` prompt: there is no room to
+   * inject in any of those cases, and the P6 spine's behaviour must not move.
+   */
+  function dispatchInput(
+    task: TaskRecord,
+    entry: DispatchEntry,
+    snapshot: DispatchSnapshot | null,
+    work: string,
+  ): ResolvedHandoff["input"] {
+    return {
+      tenantId: task.tenantId, projectId: task.projectId, memberId: entry.memberId,
+      workspacePath: task.workspacePath,
+      prompt: snapshot && entry.agent
+        ? buildDispatchPrompt(snapshot, entry.agent, work)
+        : work,
+      ...(task.groupId ? { groupId: task.groupId } : {}),
+      // I5/bug-C: a group child must run AS its own persona, not in the parent's
+      // workspace with the parent's model.
+      ...personaFields(task, entry.memberId),
+    };
+  }
+
+  /**
+   * I5 entry point — the SECONDARY dispatch path (Q34): a `@name` inside the
+   * agent's own reply.
+   *
+   * The parsed text is `structured.summary`, i.e. exactly what `appendAgentReply`
+   * puts into the shared stream: what triggers a colleague and what that colleague
+   * can see are the same bytes, so a mention can never be "spoken" in the room
+   * without being honoured, or honoured without being visible.
+   *
+   * **The asymmetry against `postRoomMessage` is deliberate, not an oversight.**
+   * A *user* message with an unknown or ambiguous `@` is a bad request: nothing is
+   * written and the API answers 4xx (AC2.5), because the human must be told right
+   * away that nobody will answer. An *agent* reply is the output of work that has
+   * already cost a run: `@某人` may be narration ("上次 @老王 提过这个") or a name
+   * that does not exist in this room. Failing the Task would throw away a
+   * successful run over a text glitch, and dropping it in silence would be the
+   * invisible no-op the 4xx exists to avoid. So: the run still succeeds, and the
+   * unresolved names are answered in the stream as one system note.
+   *  - `unknown`  → recorded, never dispatched, never fatal;
+   *  - `ambiguous`→ recorded and NOT dispatched: with two candidates in the room
+   *    there is no way to choose, and dispatching the wrong persona is worse than
+   *    a declined mention (the same reasoning that makes the user path refuse).
+   *
+   * Guardrails are identical to the primary path on purpose: the same
+   * `evaluateHandoff` (fanout/depth/budget/revisit) with the budget this batch has
+   * already planned, then the same `planRoomGuards` (loop/round cap/termination).
+   * A weaker rule for `@` would be a documented way to bypass the budget: swap the
+   * tool call for a character.
+   *
+   * D6: the child is rendered from the run's SHARED snapshot — the same room read a
+   * `handoff_to` child is rendered from — so "what a triggered colleague sees" is
+   * one implementation for both paths, and one room read per run.
+   */
+  function collectMentionHandoffs(
+    task: TaskRecord,
+    text: string,
+    planned: number,
+    readSnapshot: () => DispatchSnapshot | null,
+  ): { handoffs: ResolvedHandoff[]; notes: ResolutionNote[] } {
+    const handoffs: ResolvedHandoff[] = [];
+    const notes: ResolutionNote[] = [];
+    const note = (body: string): void => { notes.push({ label: "提及解析", body }); };
+    const snapshot = readSnapshot();
+    // No snapshot means no room to read: nothing resolves, nothing dispatches, and
+    // no note is written — a stream nobody can append to is not a refusal.
+    if (!snapshot || snapshot.members.length === 0) return { handoffs, notes };
+    const members = snapshot.members;
+
+    const { targets, unknown, ambiguous } = resolveMentions(text, members);
+    if (targets.length === 0 && unknown.length === 0 && ambiguous.length === 0) {
+      return { handoffs, notes };
+    }
+
+    if (unknown.length > 0) note(`群里没有这些成员：@${unknown.join(" / ")}，未派发`);
+    if (ambiguous.length > 0) note(`群里有重名成员，无法确定 @${ambiguous.join(" / ")} 指谁，未派发`);
+    if (targets.length === 0) return { handoffs, notes };
+
+    const chain = store.getChain(task.chainId);
+    // `planned` is what the primary path of THIS reply already reserved. Without
+    // it one message could spend the chain budget twice — once per path.
+    const budgetUsed = chain.budgetUsed + planned;
+    const decision = evaluateHandoff({ depth: task.depth, budgetUsed, visitCounts: chain.visitCounts }, targets.map((a) => a.id));
+    if (!decision.allowed) {
+      note(`@ 派发的交接链护栏拒绝：${decision.reason ?? "guardrail"}`);
+      return { handoffs, notes };
+    }
+    const remaining = DEFAULT_GUARDRAILS.budgetMax - budgetUsed;
+    const affordable = targets.slice(0, Math.max(0, remaining));
+    if (affordable.length < targets.length) {
+      note(`@ 派发超出剩余预算：${targets.slice(affordable.length).map((a) => a.name).join(" / ")}`);
+    }
+    const speaker = snapshot.speakerName;
+    for (const agent of affordable) {
+      handoffs.push({
+        sourceToolCallId: mentionSourceId(task.id),
+        toMemberId: agent.id,
+        // The source message is the only reason the `@` path has.
+        reason: `${speaker} 在消息中 @ 了 ${agent.name}`,
+        origin: "mention",
+        // This path has no work package, so `work` is "" and the child reads the
+        // room injection and nothing else.
+        input: dispatchInput(task, { memberId: agent.id, name: agent.name, agent }, snapshot, ""),
+      });
+    }
+    return { handoffs, notes };
+  }
+
+  /**
    * I6 entry point B — the loop and round guard for agent→agent dispatch.
    *
-   * `handoff_to` already produces child Tasks (P6), so this IS the real
-   * interception point for A→B→A; nothing here waits for I5's `@name` path.
+   * `handoff_to` produces child Tasks (P6) and I5's `@name` path feeds the same
+   * batch, so this IS the real interception point for A→B→A on both paths.
    *
    * Read, judgement and write all happen INSIDE the commit transaction
    * (`BEGIN IMMEDIATE`), which is the only shape that is actually correct here:
@@ -214,7 +499,14 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
    * Returns null when there is nothing to guard: no RoomStore wired, no `groupId`, or
    * the room is gone. A null plan leaves the pure P6 path untouched.
    */
-  function planRoomGuards(task: TaskRecord, handoffs: ResolvedHandoff[]): GuardPlan | null {
+  function planRoomGuards(
+    task: TaskRecord,
+    handoffs: ResolvedHandoff[],
+    notes: ResolutionNote[] = [],
+  ): GuardPlan | null {
+    // I5: `handoffs` must already be folded by `dedupeByOrigin`. Two paths naming
+    // one target would otherwise make the second look like a LOOP here, and LOOP
+    // must mean only a real A→B→A.
     if (!rooms || !task.groupId) return null;
     const room = rooms.getRoom(task.groupId);
     if (!room) return null;
@@ -238,18 +530,29 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       // forced ending, not the ones after it (which are refused by ROUND_CAP).
       if (decision.reachesCap) reachesCap = true;
     }
-    return { roomId: room.id, room, kept, blocked, reachesCap, rounds };
+    return { roomId: room.id, room, kept, blocked, reachesCap, rounds, notes };
   }
 
   /**
    * Write the plan inside the caller's transaction: one round per handoff that
    * survived, and a system message for each that did not — AC4.1's "在流中显示系统
    * 消息" only holds if the refusal lands together with the refusal.
+   *
+   * I5/D5: both paths' notes ride along, in the same commit and behind the agent's
+   * own reply, so a name the room never got an answer to is visible in the stream
+   * instead of quietly dropped. They are not rounds and charge no budget: an
+   * unresolvable `@` or a non-member `handoff_to` target dispatched nothing, and
+   * counting it would bill the user for a trigger that never happened.
    */
   function applyRoomGuards(plan: GuardPlan): void {
     if (!rooms) return;
     for (const handoff of plan.kept) {
       rooms.recordTrigger(plan.roomId, handoff.toMemberId, now());
+    }
+    for (const note of plan.notes) {
+      rooms.appendMessage({
+        roomId: plan.roomId, authorKind: "system", content: `【${note.label}】${note.body}`,
+      }, now());
     }
     for (const block of plan.blocked) {
       rooms.appendMessage({ roomId: plan.roomId, authorKind: "system", content: block.reason }, now());
@@ -391,6 +694,33 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
 
       const handoffs: ResolvedHandoff[] = [];
       const issues: string[] = [];
+      // D6: ONE room read per run, memoised, and shared by BOTH dispatch paths. Two
+      // reads would let a user message posted while this Task ran give the
+      // `handoff_to` children a different history than the `@name` children of the
+      // very same reply — two children of one batch disagreeing about what the room
+      // said is exactly the drift the "one implementation" rule exists to prevent.
+      // Null when there is no room to read (no `groupId`, no RoomStore, no row),
+      // which is what keeps a roomless Task's prompt the bare work text.
+      let roomRead: DispatchSnapshot | null | undefined;
+      const readSnapshot = (): DispatchSnapshot | null => {
+        if (roomRead === undefined) {
+          const room = rooms && task.groupId ? rooms.getRoom(task.groupId) : null;
+          roomRead = rooms && room
+            ? snapshotDispatch(rooms, room, {
+                taskId: task.id, speakerId: task.memberId,
+                text: structured.summary, now: now(),
+              })
+            : null;
+        }
+        return roomRead;
+      };
+      // D5-a: tokens the room does not declare, folded per token across every
+      // `handoff_to` call of this run so one bad name costs one system message.
+      const rejectedUnknown: string[] = [];
+      const rejectedAmbiguous: string[] = [];
+      const merge = (list: string[], tokens: string[]): void => {
+        for (const token of tokens) if (!list.includes(token)) list.push(token);
+      };
       for (const event of events) {
         if (event.type !== "tool_execution_start" || event.toolName !== "handoff_to") continue;
         const parsed = parseHandoffArgs(event.args);
@@ -400,11 +730,18 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
           continue;
         }
         for (const intent of parsed.intents) {
-          const targets = intent.toMemberIds;
+          const resolved = resolveHandoffTargets(intent.toMemberIds, readSnapshot()?.members ?? null);
+          merge(rejectedUnknown, resolved.unknown);
+          merge(rejectedAmbiguous, resolved.ambiguous);
+          const targets = resolved.entries;
+          // Every declared token was refused by the roster: nothing to guard, and
+          // the system messages are already queued in `rejected*` — not an `issue`,
+          // so the parent's valid run is not voided by a bad name (D5-a).
+          if (targets.length === 0) continue;
           const chain = store.getChain(task.chainId);
           const decision = evaluateHandoff(
             { depth: task.depth, budgetUsed: chain.budgetUsed, visitCounts: chain.visitCounts },
-            targets,
+            targets.map((entry) => entry.memberId),
           );
           if (!decision.allowed) {
             issues.push(`handoff rejected: ${decision.reason ?? "guardrail"}`);
@@ -414,26 +751,48 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
           const affordable = targets.slice(0, Math.max(0, remainingBudget));
           const overBudget = targets.slice(affordable.length);
           if (overBudget.length > 0) {
-            issues.push(`handoff rejected: ${overBudget.join(", ")} exceeds remaining chain budget`);
+            issues.push(`handoff rejected: ${overBudget.map((t) => t.name).join(", ")} exceeds remaining chain budget`);
           }
-          for (const memberId of affordable) {
-            const args = typeof event.args === "object" && event.args !== null
-              ? event.args as Record<string, unknown> : {};
-            const work = typeof args.workPackage === "string" ? args.workPackage : intent.reason;
+          const args = typeof event.args === "object" && event.args !== null
+            ? event.args as Record<string, unknown> : {};
+          const work = typeof args.workPackage === "string" ? args.workPackage : intent.reason;
+          for (const entry of affordable) {
             handoffs.push({
               sourceToolCallId: event.toolCallId,
-              toMemberId: memberId,
+              toMemberId: entry.memberId,
               reason: intent.reason,
-              input: {
-                tenantId: task.tenantId, projectId: task.projectId, memberId,
-                workspacePath: task.workspacePath, prompt: work,
-                ...(task.groupId ? { groupId: task.groupId } : {}),
-              },
+              origin: "handoff_to",
+              // D6/AC3.1 + AC2.3: the SAME injection the `@name` path builds, with
+              // `workPackage` appended afterwards. Bare `work` only survives where
+              // there is no room to inject (a Task with no `groupId`).
+              input: dispatchInput(task, entry, readSnapshot(), work),
             });
           }
         }
       }
-      if (issues.length > 0 && handoffs.length === 0) {
+      const handoffNotes = handoffResolutionNotes(rejectedUnknown, rejectedAmbiguous);
+      // I5 — the secondary path reads the very text the room will see. Its notes
+      // are NOT `issues`: an unresolvable `@` in prose must not void a run that
+      // produced a valid structured result (that asymmetry is by design, see
+      // `collectMentionHandoffs`). Tasks without a `groupId` skip both calls, so
+      // the pure P6 path is untouched.
+      // The room read is shared, so the secondary path needs no `groupId` guard of
+      // its own: with no room it gets a null snapshot and dispatches nothing, exactly
+      // as before, and a roomless Task never reaches this line's data path at all.
+      const mentions = collectMentionHandoffs(
+        task, structured.summary, handoffs.length, readSnapshot,
+      );
+      // Q35/AC3.3: fold by target BEFORE `evaluateTrigger` ever sees the batch,
+      // `handoff_to` winning a tie. Deduping "on the way" through the guards would
+      // report the second hit as LOOP, which would be a lie about a loop.
+      //
+      // Scoped to group Tasks on purpose: per-target dedup is the group-chat rule
+      // (Q35 is about the two *dispatch paths* of a room message), and a Task with
+      // no `groupId` has only one path. Folding there would change what the P6
+      // spine already does with two identical `handoff_to` calls, and its behaviour
+      // must stay byte-identical.
+      const batch = task.groupId ? dedupeByOrigin([...handoffs, ...mentions.handoffs]) : handoffs;
+      if (issues.length > 0 && batch.length === 0) {
         store.finishFailure(attempt.id, attempt.fencingToken, issues.join("; "), { now: now() });
         return;
       }
@@ -447,8 +806,8 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       // failure: the Task still succeeded and still said what it said — only the
       // handoff it asked for is dropped, with a system message as the answer.
       store.transaction(() => {
-        const plan = planRoomGuards(task, handoffs);
-        store.completeSuccess(attempt.id, attempt.fencingToken, structured, plan ? plan.kept : handoffs, now());
+        const plan = planRoomGuards(task, batch, [...handoffNotes, ...mentions.notes]);
+        store.completeSuccess(attempt.id, attempt.fencingToken, structured, plan ? plan.kept : batch, now());
         const spoke = appendAgentReply(task, structured);
         // A Task whose reply is already in the stream has already had its whole
         // effect committed (`spoke` is the idempotency marker), so the flow-state

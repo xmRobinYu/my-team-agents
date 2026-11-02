@@ -15,6 +15,16 @@
  * stored message nobody answers is the same silent failure the 4xx exists to
  * avoid.
  *
+ * I5 and the asymmetry it deliberately does NOT copy: an agent's own reply is
+ * parsed for `@name` too (Q34's secondary path, in `durable-worker.ts`), but with
+ * the opposite failure policy. Here an unknown/ambiguous `@` is the USER's mistake
+ * and must be answered immediately with 4xx — nothing is written. On the agent
+ * path it is the model's prose glitch, and failing the Task would void a run that
+ * already produced a valid structured result, while dropping it in silence is the
+ * invisible no-op we refuse for users. So that path records the unresolved names
+ * as a system message and lets the run succeed. Two policies, one deliberate: see
+ * the note on `collectMentionHandoffs`.
+ *
  * I6 adds a step between (1) and (2): inside the transaction the turn's flow state
  * is reset and every target passes the flow guards, so "the message landed" and
  * "this trigger was allowed / refused" commit together. See `applyTriggerGuards`
@@ -88,6 +98,19 @@ const memberLine = (member: RoomAgent): string => {
 };
 
 /**
+ * D5-b: how a member may be addressed by `handoff_to`. This roster block is the
+ * ONLY place in the injected prompt where a model can read any identifier at all,
+ * so every form `resolveRosterTokens` accepts is spelled out here — and the line
+ * keeps `memberLine`'s text byte-for-byte, only appending after it, because the
+ * existing assertions (and Q39's "replay the same bytes verbatim") are pinned on
+ * `- <name>（<role>）（协调者）`.
+ */
+const HANDOFF_ROSTER_HINT =
+  "可交接的成员：toMemberIds 写下面的名字、角色或 id 均可，需逐个精确匹配；重名不猜。";
+
+const rosterLine = (member: RoomAgent): string => `- ${memberLine(member)}｜id: ${member.id}`;
+
+/**
  * Who produced one history line. A deleted agent still has its message: the id
  * is better evidence than nothing, and dropping history would silently change
  * what the agent sees (Q30).
@@ -113,6 +136,14 @@ const authorLabel = (message: RoomMessage, names: Map<string, string>): string =
  * history longer than `ROOM_HISTORY_LIMIT` is trimmed here too. Either way the
  * trimming is announced inside 「# 群聊记录」 — a silent cut would let the agent
  * believe it saw the whole conversation.
+ *
+ * D5-b: every roster line also carries the member's id after `｜id: `, and the
+ * block opens with one line saying what `handoff_to` accepts. A model can only
+ * dispatch to a colleague it can name, and until this the injected prompt held
+ * zero identifiers — so the primary path was unusable without the model going
+ * and reading import files. The original `memberLine` text and the section order
+ * are unchanged: the id rides at the END of the line, so 「# 成员」 stays
+ * replay-identical for everything before `｜id: ` (Q39).
  */
 export function buildRoomPrompt(
   room: ChatRoom,
@@ -130,8 +161,9 @@ export function buildRoomPrompt(
 
   const blocks: string[] = [agent.prompt.trim(), `# 角色：${memberLine(agent)}`, `# 群：${room.name}`];
   if (room.rules.trim()) blocks.push(`# 群规则\n${room.rules.trim()}`);
-  blocks.push(`# 成员\n${members.length > 0 ? members.map((m) => `- ${memberLine(m)}`).join("\n") : "（暂无成员）"}`);
-
+  blocks.push(`# 成员\n${members.length > 0
+    ? `${HANDOFF_ROSTER_HINT}\n${members.map(rosterLine).join("\n")}`
+    : "（暂无成员）"}`);
   const lines: string[] = ["# 群聊记录"];
   if (hidden > 0) lines.push(`（已省略较早的 ${hidden} 条消息）`);
   lines.push(shown.length > 0
@@ -145,6 +177,120 @@ export function buildRoomPrompt(
 - 不要复述整段群聊记录；
 - 按要求输出结构化结果，其中 summary 会被原样发回群里。`);
   return blocks.join("\n\n");
+}
+
+/** A group child Task may be appended with the dispatcher's own words (D6). */
+export interface DispatchSource {
+  /** The Task whose reply is dispatching: identifies the newest history line. */
+  taskId: string;
+  /** Member id of the dispatcher, used for the line's author and the heading. */
+  speakerId: string;
+  /** What the dispatcher said — the reply that will land in the stream. */
+  text: string;
+  now: number;
+}
+
+/**
+ * One read of the room, shared by every child Task THIS run dispatches (D6).
+ *
+ * Held in a caller-owned box so both dispatch paths render from the SAME bytes:
+ * reading per target would let a user message posted mid-run give the `handoff_to`
+ * children a different history than the `@name` children of the very same reply,
+ * and two children of one batch would then disagree about what the room said.
+ */
+export interface DispatchSnapshot {
+  room: ChatRoom;
+  members: RoomAgent[];
+  /** The stream as stored, with the dispatching reply appended as the newest line. */
+  history: RoomMessage[];
+  /** How many older messages the limit dropped (announced, never silent — Q39). */
+  omitted: number;
+  /** The dispatching member's name, for the heading of the appended instruction. */
+  speakerName: string;
+}
+
+/**
+ * Read the room once for a run that is about to dispatch children.
+ *
+ * The dispatching reply is NOT in `room_messages` yet — it commits in the same
+ * transaction as these child rows, after them — so it is appended here under a
+ * synthetic id. The child therefore reads exactly what the room is about to read;
+ * a target triggered by a message it cannot see would be answering a question
+ * nobody asked.
+ * Two shapes of the same fact must yield the same bytes: on the first pass the reply
+ * is not stored yet, so it is appended as the newest line under a synthetic id; on a
+ * crash replay (`appendAgentReply` committed, the Worker died before acking) it IS
+ * stored, and then the stored row is kept in place instead of a second copy being
+ * appended. Either way the child reads the reply exactly once, at the same seq —
+ * every history line is labelled `[seq]`, so a duplicated sentence or a shifted seq
+ * would rewrite the whole stream, and Q39 asks for the same injection to be
+ * re-playable, not merely for the same rows to exist.
+ */
+export function snapshotDispatch(
+  rooms: RoomStore,
+  room: ChatRoom,
+  source: DispatchSource,
+): DispatchSnapshot {
+  const members = rooms.listAgents(room.id);
+  const window = rooms.listMessages(room.id, ROOM_HISTORY_LIMIT);
+  // `omitted` is measured against the window AS STORED — the same measure
+  // `postRoomMessage` uses — so the truncation announcement never moves.
+  const omitted = Math.max(0, rooms.countMessages(room.id) - window.length);
+  const alreadySpoken = window.some((message) => message.taskId === source.taskId);
+  const history: RoomMessage[] = alreadySpoken
+    ? window
+    : [...window, {
+        id: `synthetic-${source.taskId}`,
+        roomId: room.id,
+        // Nothing is dropped on this branch, so the newest stored seq + 1 is exactly
+        // the seq `appendAgentReply` will give the row when it lands.
+        seq: (window.at(-1)?.seq ?? 0) + 1,
+        authorKind: "agent",
+        authorAgentId: source.speakerId,
+        content: source.text,
+        taskId: source.taskId,
+        createdAt: source.now,
+      }];
+  return {
+    room,
+    members,
+    omitted,
+    speakerName: members.find((member) => member.id === source.speakerId)?.name ?? source.speakerId,
+    history,
+  };
+}
+
+/**
+ * The prompt for a Task dispatched BY an agent, on either path (D6): the exact same
+ * injection a user trigger gets (persona + room identity + shared stream — AC2.3),
+ * plus — when the dispatcher wrote one — its own instruction for the target.
+ *
+ * ONE implementation for both paths (Q34). The `@name` path passes no `work`; the
+ * `handoff_to` path passes `workPackage`/`reason`. That is the ONLY difference
+ * between the two children, so what a triggered colleague sees can be changed in
+ * exactly one place. Before this, only the secondary path injected the room at all:
+ * a `handoff_to` child arrived with bare prose — no role prompt, no room, no
+ * history — which is what a real acceptance run measured ("请回一句话确认收到即可…")
+ * and Q30/I4 forbid.
+ *
+ * `work` is appended AFTER 「# 你的任务」, last, the way `queueWrapUpTask` appends
+ * the platform directive: it must read as the dispatcher's instruction to this
+ * agent, never as another member's opinion inside the stream.
+ */
+export function buildDispatchPrompt(
+  snapshot: DispatchSnapshot,
+  agent: RoomAgent,
+  work?: string,
+): string {
+  const base = buildRoomPrompt(
+    snapshot.room, agent, snapshot.members, snapshot.history, snapshot.omitted,
+  );
+  const instruction = work?.trim();
+  if (!instruction) return base;
+  return `${base}
+
+# 交接任务说明（来自 ${snapshot.speakerName}，平台附在群聊注入之后）
+${instruction}`;
 }
 
 /** The seq of the newest user message in a window, 0 if there is none. */
@@ -242,6 +388,11 @@ export function queueWrapUpTask(
  * code pretending to be a guard. Here a test can drive it with a duplicated target
  * or a pre-populated chain and assert the real behaviour (AC4.1).
  *
+ * Either way the batch must arrive ALREADY deduplicated by target: a repeated
+ * target reaching `evaluateTrigger` would be refused as LOOP, which reports a
+ * dedup as a cycle — `resolveMentions` folds it here (Q35), and the worker path
+ * folds both dispatch paths with `dedupeByOrigin` before judging.
+ *
  * Must be called inside the caller's transaction: the system message and the round
  * count have to commit together, or a crash leaves one without the other.
  */
@@ -314,7 +465,10 @@ export function postRoomMessage(
   const { targets, unknown, ambiguous } = resolveMentions(content, agents);
 
   // Ambiguity first: duplicate room names are an import hazard we report rather
-  // than resolve by coin flip.
+  // than resolve by coin flip — and the same is true of a `role` two members
+  // share, which `resolveMentions` folds into this one list (D2). `unknown` is
+  // only ever a name nobody declares: code notation like `@ts-ignore` is dropped
+  // in the resolver, so a human pasting a directive never gets this 4xx (D4).
   if (ambiguous.length > 0) {
     throw new RoomTriggerError(
       "AMBIGUOUS_MENTION",

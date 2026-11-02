@@ -3,10 +3,12 @@ import type { ChatRoom, RoomAgent, RoomMessage } from "@my-team-agents/domain";
 import { ExecutionStore } from "./execution-store.js";
 import { RoomStore } from "./room-store.js";
 import {
+  buildDispatchPrompt,
   buildRoomPrompt,
   postRoomMessage,
   ROOM_HISTORY_LIMIT,
   RoomTriggerError,
+  snapshotDispatch,
   type RoomTriggerErrorCode,
 } from "./room-trigger.js";
 
@@ -236,5 +238,118 @@ describe("buildRoomPrompt (I4 shared history injection)", () => {
     expect(task).toContain("最新的一条消息");
     expect(task).toContain("不要重复其他成员");
     expect(task).toContain("不要复述整段群聊记录");
+  });
+
+  // --- D5-b: the roster must tell the model how to address a member -------------
+  //
+  // `handoff_to` cannot be used for a target the prompt never named. These cases
+  // pin the ADDITION only: every pre-existing assertion above still reads the
+  // original `- 齐活林（交付总监）（协调者）` as a substring, because the id rides at
+  // the END of the line and `memberLine` itself did not change (Q39: the injected
+  // text is a replayable artifact, so widening it must not rewrite it).
+  it("lists the id each member can be handed off to, without rewriting the roster line", () => {
+    const prompt = buildRoomPrompt(chatRoom(), qa, members, [note(1, "user", "看这里")]);
+    const roster = prompt.slice(prompt.indexOf("# 成员"), prompt.indexOf("# 群聊记录"));
+    // The names/roles a `resolveRosterTokens` call may use, and their ids.
+    expect(roster).toContain("- 齐活林（交付总监）（协调者）｜id: a-lead");
+    expect(roster).toContain("- QA（测试）｜id: a-qa");
+    // Every form the parser accepts is spelled out, so the model is not left to
+    // guess that `寇豆码` is addressable at all.
+    expect(roster).toContain("名字");
+    expect(roster).toContain("角色");
+    expect(roster).toContain("id");
+    // And the 「# 角色：」 line of THIS agent is untouched — only the roster got ids.
+    expect(prompt).toContain("# 角色：QA（测试）\n");
+    // A member with no id to show would be a roster that lies about being usable.
+    expect(roster).not.toContain("｜id: \n");
+  });
+
+  it("an empty roster still says 暂无成员 and invents no hint line", () => {
+    const lone = roomAgent({ name: "光杆", role: "", prompt: "Solo.", isCoordinator: false });
+    const prompt = buildRoomPrompt(chatRoom(), lone, [], []);
+    expect(prompt).toContain("# 成员\n（暂无成员）");
+    expect(prompt).not.toContain("toMemberIds");
+  });
+});
+
+describe("buildDispatchPrompt (D6: one injection for both dispatch paths)", () => {
+  const setup = () => {
+    const store = new ExecutionStore(":memory:");
+    const rooms = new RoomStore(store.db);
+    const room = rooms.createRoom({ projectId: "proj-1", name: "研发群" }, 100);
+    const arch = rooms.addAgent({
+      roomId: room.id, name: "架构师", role: "架构", prompt: "You design.", agentDir: "/persona/arch",
+    }, 100);
+    const qa = rooms.addAgent({
+      roomId: room.id, name: "QA", role: "测试", prompt: "You test.", agentDir: "/persona/qa",
+    }, 101);
+    return { store, rooms, room, arch, qa, close: () => { rooms.close(); store.close(); } };
+  };
+
+  const source = (taskId: string, speakerId: string, text: string) => ({
+    taskId, speakerId, text, now: 200,
+  });
+
+  it("appends the dispatcher's instruction AFTER the room injection, not inside it", () => {
+    const h = setup();
+    const reply = "接口先定，具体用例请补。";
+    const snap = snapshotDispatch(h.rooms, h.room, source("task-1", h.arch.id, reply));
+    const base = buildDispatchPrompt(snap, h.qa);
+    const withWork = buildDispatchPrompt(snap, h.qa, "只测登录分支，不要跑全量回归。");
+    // Same snapshot, so the only difference is the appended instruction: one builder
+    // for both paths, and it cannot drift again.
+    expect(withWork.startsWith(base)).toBe(true);
+    expect(withWork.slice(base.length)).toContain("# 交接任务说明（来自 架构师");
+    expect(withWork.endsWith("只测登录分支，不要跑全量回归。")).toBe(true);
+    // The instruction is NOT part of the history: it must not read as a message the
+    // room said, which is why it lands after 「# 你的任务」.
+    expect(base.slice(base.indexOf("# 你的任务"))).not.toContain("登录分支");
+    expect(base).toContain(`: ${reply}`);
+    expect(base).toContain("# 群聊记录");
+    expect(base).toContain("You test.");
+    // The synthetic line is the newest in the stream and belongs to the source Task.
+    expect(snap.history.at(-1)?.id).toBe("synthetic-task-1");
+    expect(snap.history.at(-1)?.taskId).toBe("task-1");
+    h.close();
+  });
+
+  it("no work text means exactly the shared room prompt", () => {
+    const h = setup();
+    const reply = "接口先定，具体用例请补。";
+    const snap = snapshotDispatch(h.rooms, h.room, source("task-1", h.arch.id, reply));
+    const expected = buildRoomPrompt(
+      h.room, h.qa, h.rooms.listAgents(h.room.id),
+      [...h.rooms.listMessages(h.room.id, ROOM_HISTORY_LIMIT), {
+        id: "synthetic-task-1", roomId: h.room.id, seq: 1, authorKind: "agent" as const,
+        authorAgentId: h.arch.id, content: reply, taskId: "task-1", createdAt: 200,
+      }],
+      0,
+    );
+    expect(buildDispatchPrompt(snap, h.qa)).toBe(expected);
+    expect(buildDispatchPrompt(snap, h.qa, "   ")).toBe(expected);
+    expect(buildDispatchPrompt(snap, h.qa)).not.toContain("交接任务说明");
+    h.close();
+  });
+
+  it("a reply that already reached the stream is injected once, at the same seq", () => {
+    // The crash-replay shape: `appendAgentReply` committed the reply, then the Worker
+    // died before acking, and the same Attempt rebuilds the same child prompt. The
+    // stored row must be reused in place — a second copy, or a seq that moved, would
+    // rewrite the stream the child reads (Q39: re-inject the same history).
+    const h = setup();
+    const reply = "接口先定，具体用例请补。";
+    const before = buildDispatchPrompt(
+      snapshotDispatch(h.rooms, h.room, source("task-1", h.arch.id, reply)), h.qa,
+    );
+    h.rooms.appendMessage({
+      roomId: h.room.id, authorKind: "agent", authorAgentId: h.arch.id, content: reply,
+      taskId: "task-1",
+    }, 200);
+    const after = buildDispatchPrompt(
+      snapshotDispatch(h.rooms, h.room, source("task-1", h.arch.id, reply)), h.qa,
+    );
+    expect(occurrences(after, reply)).toBe(1);
+    expect(after).toBe(before);
+    h.close();
   });
 });

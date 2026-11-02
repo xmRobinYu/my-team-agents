@@ -1,8 +1,11 @@
 export { dispatch, type ChainState, type DispatchOutcome, type DispatchRequest, type DispatcherDeps } from "./dispatcher.js";
 export {
+  dedupeByOrigin,
   extractHandoffs,
   HANDOFF_TOOL_NAME,
   parseHandoffArgs,
+  type DispatchOrigin,
+  type DispatchTarget,
   type HandoffIntent,
   type HandoffParseResult,
 } from "./handoff-intent.js";
@@ -26,15 +29,21 @@ export {
 } from "./room-store.js";
 export {
   resolveMentions,
+  resolveRosterTokens,
   type MentionResolution,
+  type RosterResolution,
 } from "./mention.js";
 export {
   applyTriggerGuards,
+  buildDispatchPrompt,
   buildRoomPrompt,
   postRoomMessage,
   queueWrapUpTask,
   ROOM_HISTORY_LIMIT,
   RoomTriggerError,
+  snapshotDispatch,
+  type DispatchSnapshot,
+  type DispatchSource,
   type PostedRoomMessage,
   type PostRoomMessageInput,
   type RoomTriggerErrorCode,
@@ -70,3 +79,24 @@ export {
   type TemplateErrorCode,
   type ZipSource,
 } from "./template-import.js";
+
+// I9 (appended at the tail to stay merge-friendly with in-flight edits above).
+export {
+  agentSkillsRoot,
+  assertSkillSlug,
+  SKILL_SLUG_PATTERN,
+  installSkill,
+  listAgentSkills,
+  runSkillPaths,
+  skillDirOf,
+  SkillError,
+  uninstallSkill,
+  type AgentSkill,
+  type AgentSkillListing,
+  type InstalledSkill,
+  type InstallSkillInput,
+  type SkillErrorCode,
+  type SkillFileEntry,
+  type SkillIssue,
+  type SkillIssueCode,
+} from "./skills.js";

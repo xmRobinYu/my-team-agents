@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractHandoffs, HANDOFF_TOOL_NAME, parseHandoffArgs } from "./handoff-intent.js";
+import { dedupeByOrigin, extractHandoffs, HANDOFF_TOOL_NAME, parseHandoffArgs, type DispatchTarget } from "./handoff-intent.js";
 
 const toolEvent = (args: unknown, toolName = HANDOFF_TOOL_NAME) => ({
   type: "tool_execution_start",
@@ -82,5 +82,33 @@ describe("extractHandoffs", () => {
 
   it("returns nothing for a run with no handoff", () => {
     expect(extractHandoffs([{ type: "agent_end" }]).intents).toHaveLength(0);
+  });
+});
+
+describe("dedupeByOrigin — 两条路径按目标折叠（Q35 / AC3.3）", () => {
+  const t = (toMemberId: string, origin: DispatchTarget["origin"]): DispatchTarget & { tag: string } => ({
+    toMemberId, origin, tag: `${origin}:${toMemberId}`,
+  });
+
+  it("同一目标两条路径命中 → 保留 handoff_to，且不论谁先出现", () => {
+    const mentionFirst = [t("b", "mention"), t("b", "handoff_to")];
+    expect(dedupeByOrigin(mentionFirst).map((x) => x.origin)).toEqual(["handoff_to"]);
+    expect(dedupeByOrigin([t("b", "handoff_to"), t("b", "mention")]).map((x) => x.origin)).toEqual(["handoff_to"]);
+  });
+
+  it("不同目标都保留，并保持首次出现顺序", () => {
+    const batch = [t("c", "mention"), t("b", "handoff_to"), t("c", "mention")];
+    expect(dedupeByOrigin(batch).map((x) => x.toMemberId)).toEqual(["c", "b"]);
+  });
+
+  it("同一路径内部重复 → 保留第一条（先到先得，不按 reason 猜）", () => {
+    const doubled = [t("b", "handoff_to"), t("b", "handoff_to")];
+    expect(dedupeByOrigin(doubled)).toHaveLength(1);
+    expect(dedupeByOrigin(doubled)[0]!.tag).toBe("handoff_to:b");
+  });
+
+  it("空输入返回空；单条原样返回", () => {
+    expect(dedupeByOrigin([])).toEqual([]);
+    expect(dedupeByOrigin([t("b", "mention")])).toHaveLength(1);
   });
 });

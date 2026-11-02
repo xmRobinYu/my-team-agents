@@ -15,11 +15,33 @@
  * files such as AGENTS.md load either way
  * (node_modules/@earendil-works/pi-coding-agent/docs/security.md).
  * Trust does not constrain tool access — isolation comes from the process/container.
+ *
+ * Skills (AC8.2/I9): every loadable skill directory in `spec.agentDir` is handed to
+ * Pi as its own `--skill <dir>`; see `./skills.ts` for why discovery alone cannot
+ * work for a persona directory.
+ *
+ * Structured handoff (D1/I10): Pi 1.4.0 ships `read`/`bash`/`edit`/`write` and nothing
+ * else, so `handoff_to` does not exist until we declare it. It arrives as an explicit
+ * `--extension <path>` pointing at the uncompiled `pi-extensions/handoff-to.js`, which
+ * survives both `--no-extensions` and a declined project trust (pi --help: "explicit -e
+ * paths still work"). Without that flag the primary dispatch branch of
+ * `orchestrator/durable-worker.ts` is dead code and only the `@name` fallback ever
+ * fires — see `./handoff-extension.ts`.
+ *
+ * Session isolation (D3/I10): `agentDir` was only ever the spawn `cwd`, while Pi wrote
+ * every transcript to the shared `~/.pi/agent/sessions`, so one persona could read
+ * another room's conversation with `read`/`bash`. A run that has a persona dir now also
+ * gets `--session-dir <agentDir>/.pi/sessions`; resume with `--session <path>` still
+ * works (measured) — see `./session-isolation.ts`.
  */
 
+import { existsSync } from "node:fs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { RuntimeAdapter, RuntimeCapabilities, RunHandle, RunResult, RunSpec } from "@my-team-agents/runtime-core";
 import type { CanonicalEvent, Usage } from "@my-team-agents/runtime-core";
+import { handoffExtensionPath } from "./handoff-extension.js";
+import { piSessionDirArgs } from "./session-isolation.js";
+import { piSkillDirs } from "./skills.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -180,6 +202,20 @@ export interface PiAdapterOptions {
   /** Extra Pi args (e.g. --tools, --model). */
   extraArgs?: string[];
   spawn?: typeof spawn;
+  /**
+   * D1: declare the `handoff_to` tool by loading our Pi extension. Default true.
+   * `false` is the escape hatch that restores the pre-D1 command line exactly; it is
+   * what proves the new flags are additive rather than a rewrite of the old argv.
+   */
+  handoffExtension?: boolean;
+  /** Extension file override (tests only). Default resolves from this module's URL. */
+  handoffExtensionPath?: string;
+  /**
+   * D3: keep Pi's session files inside `spec.agentDir` via `--session-dir`. Default
+   * true, and only ever applied when the run HAS a persona dir — a workspace-only
+   * Task keeps the upstream session behaviour byte-for-byte.
+   */
+  isolatePersonaSessions?: boolean;
 }
 
 export class PiAdapter implements RuntimeAdapter {
@@ -202,6 +238,8 @@ export class PiAdapter implements RuntimeAdapter {
 
   async start(spec: RunSpec): Promise<RunHandle> {
     const args = ["--mode", "rpc"];
+    // Ephemeral runs write nothing, so there is no session file to isolate.
+    let ephemeralSession = false;
     if (spec.session?.sessionPath) {
       // Resume the original session WITH history: --session <path> loads it,
       // --session-id alone only selects a file and starts with empty context.
@@ -213,14 +251,40 @@ export class PiAdapter implements RuntimeAdapter {
       args.push("--session", sessionPath);
     } else if (spec.session?.resume === false) {
       // Explicitly ephemeral: nothing is written, so nothing can be resumed.
+      ephemeralSession = true;
       args.push("--no-session");
     }
     // Default: let Pi persist a new session. Passing --no-session unconditionally
     // made resume impossible, because the first run never wrote anything.
+    //
+    // D3: a persona run keeps those files to itself. `--session-dir` wins over both
+    // `PI_CODING_AGENT_SESSION_DIR` and the derived agent-dir default
+    // (docs/cli.md:96-97), and it does not disable `--session <path>` above: the pair
+    // was measured against the real binary — the file reopened with its history.
+    if (this.options.isolatePersonaSessions !== false && !ephemeralSession) {
+      args.push(...piSessionDirArgs(spec.agentDir));
+    }
     args.push(this.options.approveProjectResources ? "--approve" : "--no-approve");
     if (spec.model) args.push("--model", spec.model);
     if (spec.thinking) args.push("--thinking", spec.thinking);
     if (this.options.extraArgs) args.push(...this.options.extraArgs);
+    // D1: the handoff extension is a resource injection, so it joins the resource
+    // block after extraArgs and before the skills. `--extension` is REPEATABLE and
+    // additive, not last-wins: measured with two extensions, the model saw and called
+    // both tools. So an `--extension` in extraArgs adds a second extension and does
+    // NOT replace this one — use `handoffExtension: false` to actually drop it.
+    if (this.options.handoffExtension !== false) {
+      args.push("--extension", this.handoffExtensionFile());
+    }
+    // AC8.2 (I9 defect 2): persona skills never reached Pi. `<agentDir>/skills/`
+    // is not one of Pi's discovery roots and `.pi/skills/` is trust-gated, so the
+    // only mechanism that works under both --approve and --no-approve is the
+    // explicit repeatable `--skill <dir>` (docs/cli.md). Read from the persona dir
+    // at spawn time instead of carried on RunSpec: install/uninstall then takes
+    // effect on the next trigger with no new field for adapters that cannot honour
+    // it. No skills -> nothing appended, so a skill-less Task keeps byte-identical
+    // args (pinned by its own regression test).
+    for (const skillDir of piSkillDirs(spec.agentDir)) args.push("--skill", skillDir);
 
     const spawnFn = this.options.spawn ?? spawn;
     // Pi has no --agent-dir switch: `@path` resource discovery, project config and
@@ -266,6 +330,28 @@ export class PiAdapter implements RuntimeAdapter {
       },
       settled,
     };
+  }
+
+  /**
+   * Absolute path of the `handoff_to` extension for this running module. Resolved
+   * from `import.meta.url`, NOT from cwd: from `src/adapter.ts` and from
+   * `dist/adapter.js` it lands on the same uncompiled file, which is why one copy
+   * serves both vitest (src alias) and production (dist).
+   *
+   * A missing file is a hard error, never a silent skip. Dropping `--extension`
+   * quietly is precisely defect D1: the run still works, the primary handoff path
+   * simply does not exist, and nothing anywhere says so.
+   */
+  private handoffExtensionFile(): string {
+    const file = this.options.handoffExtensionPath ?? handoffExtensionPath();
+    if (!existsSync(file)) {
+      throw new Error(
+        `handoff_to extension is missing: ${file}. ` +
+          "Pi has no handoff tool of its own, so without this file the structured " +
+          "handoff path is dead code. Restore the file or pass handoffExtension: false.",
+      );
+    }
+    return file;
   }
 
   private send(child: ChildProcessWithoutNullStreams, record: JsonRecord): void {
