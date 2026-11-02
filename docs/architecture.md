@@ -217,7 +217,10 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
 8. 单 agent thread 不支持追问：`POST /api/pi/threads/<task>/messages` 只接受第一条消息，
    之后返回 409 `FOLLOW_UP_NOT_SUPPORTED`；多轮由群 thread 承担（Q42）。
    这是记录的限制，不是遗漏。
-9. 第 5 项的强制收尾依赖真实模型输出 `[讨论结束]`：**实测不稳定**。首跑 r7 FAIL ——
-   协调者收尾 Task 连续 3 次 Attempt 全失败、没有 `[讨论结束]`、`terminated=false`，
-   探针因此无从验证阻断；单独重跑该项与其后的定稿全量跑（r8）都 PASS。
-   六项 PASS 是 r8 这一次的事实，不能据此宣称该项稳定（`CONTEXT.md` Q44）。
+9. 第 5 项的强制收尾依赖真实模型输出 `[讨论结束]`。首跑 r7 FAIL —— 协调者收尾 Task
+   连续 3 次 Attempt 全失败、没有 `[讨论结束]`、`terminated=false`；单独重跑该项与其后的
+   定稿全量跑（r8）都 PASS。**补测 13 次单跑：12 PASS / 1 FAIL，且那次 FAIL 的收尾是成功的**
+   （`[讨论结束]` 与终止消息都在），失败出在 AC5.2 探针的前置条件上 —— 两件事不能混为一谈。
+   于是 AC5.2 探针被加固为"失败换新群重试一次 + 记录每个群的原文与计数"，断言未放宽；
+   r7 那种收尾 Task 全失败在 13 次抽样里未复现，但收尾依赖模型输出这一事实不变
+   （`CONTEXT.md` Q44）。

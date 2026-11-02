@@ -765,73 +765,83 @@ async function item5(base) {
   // ===== AC5.2 单独验证：ROUND_CAP 的真实拒绝 =====
   // 上面那跑观察到的是【流程守卫·已终止】，不是 ROUND_CAP：maxRounds=1 时收尾不占轮次、
   // 协调者随即输出 [讨论结束] 把群置为 terminated，而判定顺序 terminated 优先，超限拒绝
-  // 永远轮不到。要稳定看到 ROUND_CAP，必须**消除竞态**：把群设成「无协调者」
+  // 永远轮不到。要看到 ROUND_CAP，必须**消除竞态**：把群设成「无协调者」
   // （coordinator_agent_id = NULL），于是 queueWrapUpTask 只落一条「无法强制收尾」的系统
   // 消息、terminated 永远不会变真，第 2 次触发必然撞上 ROUND_CAP。
   // 这同时验证了 Q40 记录的无协调者回退路径。
+  //
+  // 判定顺序是 terminated → LOOP → ROUND_CAP（room-guards.ts:39-40），所以「第 2 次触发」
+  // 的目标还必须落在链外，否则先撞 LOOP。
+  //
+  // 探针的前置条件是**模型按指令在 summary 里 @ 到那个链外目标**。这一环由模型决定，
+  // 实测约 1/13 次不成立（模型改用别的措辞或不 @ 人），此时是探针的构造没搭起来，
+  // 而不是守卫被绕过。所以失败时换一个全新群重试一次，并且**把每次的原文与计数都留下**：
+  // 重试只消除构造噪声，断言本身一个字没放松（两个群都没观察到 -> 仍是 FAIL）。
+  const runCapProbe = async (attemptNo) => {
+    const room = await importRoom(base, `i10-item5-cap${attemptNo > 1 ? `-r${attemptNo}` : ""}`);
+    if (room.error) return { ok: false, why: `建群失败：${room.error}` };
+    const pm = byRole(room, "产品经理"), eng = byRole(room, "工程师");
+    if (!pm || !eng) return { ok: false, why: "缺 产品经理/工程师，无法构造" };
+    const qa = byRole(room, "QA工程师");
+    const coord = room.agents.find((x) => x.isCoordinator);
+    if (!qa || !coord) return { ok: false, why: "缺 QA/协调者，无法构造第 2 次触发" };
+
+    store.db.prepare("UPDATE chat_rooms SET max_rounds = 1, coordinator_agent_id = NULL WHERE id = ?").run(room.id);
+    const row = rooms.getRoom(room.id);
+    ev.push(`AC5.2[${attemptNo}] 专用群=${room.id} maxRounds=${row.maxRounds} coordinatorAgentId=${row.coordinatorAgentId}（无协调者 → 不会 terminated，窗口稳定）`);
+
+    // 第 1 轮：用户 @工程师（链外）→ 工程师进链，round 1/1，调度收尾但因无协调者只落消息。
+    const t1 = await post(base, room.id, `@${eng.name} 一句话说明本轮只占一格。不要使用任何工具。`);
+    ev.push(`AC5.2[${attemptNo}] turn1 HTTP ${t1.status}（@${eng.name}，链外目标）`);
+    await settleRoom(room.id, left());
+    const st1 = rooms.getState(room.id);
+    const noCoord = rooms.listMessages(room.id).filter(
+      (m) => m.authorKind === "system" && m.content.includes("无法强制收尾"),
+    );
+    ev.push(`AC5.2[${attemptNo}] 无协调者回退消息：${noCoord.map((m) => `[seq ${m.seq}] ${clip(m.content, 220)}`).join(" | ") || "（无）"}`);
+    ev.push(`AC5.2[${attemptNo}] 第1轮后：round_count=${st1.roundCount}/${row.maxRounds} terminated=${st1.terminated} chainLen=${st1.chain.length}`);
+
+    // 第 2 次触发：注入一条 QA 任务，其回复 @协调者（链外）→ 目标不在链内，于是命中 ROUND_CAP。
+    const qaTask = store.createTask({
+      tenantId: "i10", projectId: `i10-item5-cap${attemptNo}`, memberId: qa.id, workspacePath: WS,
+      agentDir: qa.agentDir,
+      prompt: buildRoomPrompt(rooms.getRoom(room.id), qa, rooms.listAgents(room.id), rooms.listMessages(room.id))
+        + `\n\n平台补充：请把下面这句话原样作为你的 summary 输出，一个字都别改，也不要使用任何工具：\n已记录，请 @${coord.name} 复核。${SAY}`,
+      groupId: room.id, model: MODEL,
+      idempotencyKey: `i10-5-cap:${room.id}:${hex(4)}`,
+    });
+    ev.push(`AC5.2[${attemptNo}] 播入 ${qa.name} 任务 ${taskLine(qaTask)}（其回复 @${coord.name}＝链外目标，即为第 2 次触发）`);
+    await settleRoom(room.id, left());
+
+    const qaAfter = store.getTask(qaTask.id);
+    ev.push(`AC5.2[${attemptNo}] ${qa.name} 任务终态：status=${qaAfter?.status} error=${clip(qaAfter?.error, 200)} 回复=${clip(msgsOf(room.id, "agent", qa.id).at(-1)?.content, 200) || "（无）"}`);
+    const st2 = rooms.getState(room.id);
+    const capMsgs = rooms.listMessages(room.id).filter(
+      (m) => m.authorKind === "system" && m.content.startsWith("【流程守卫·轮次上限】")
+        && m.content.includes("不再处理新的 agent 触发"),
+    );
+    const coordTasks = roomTasks(room.id).filter((t) => t.memberId === coord.id).length;
+    ev.push(`AC5.2[${attemptNo}] 第2次触发后：round_count=${st2.roundCount}/${row.maxRounds} terminated=${st2.terminated}`);
+    ev.push(`AC5.2[${attemptNo}] ROUND_CAP 拒绝消息（必须含「不再处理新的 agent 触发」）：${capMsgs.map((m) => `[seq ${m.seq}] ${clip(m.content, 240)}`).join(" | ") || "（无）"}`);
+    ev.push(`AC5.2[${attemptNo}] 专用群全流=${rooms.listMessages(room.id).map((m) => `[${m.seq}]${m.authorKind}:${clip(m.content, 70)}`).join(" | ")}`);
+    ev.push(`AC5.2[${attemptNo}] 目标 ${coord.name} 的 Task 数=${coordTasks}（被 ROUND_CAP 拒绝则必须为 0）`);
+    const ok = capMsgs.length > 0 && coordTasks === 0 && !st2.terminated;
+    // 没观察到时给出可区分的原因，别把"探针没搭起来"含糊成"守卫没生效"。
+    const why = ok ? "" : !st2.terminated
+      ? `未命中 ROUND_CAP：${qaAfter?.status !== "succeeded" ? `任务未成功（${qaAfter?.status}）` : "回复里没有指向链外目标的 @ 触发"}`
+      : "群被终止（terminated），判定顺序轮不到 ROUND_CAP";
+    return { ok, why };
+  };
+
   let capProbe = "未跑";
   let capBlocked = false;
-  const capRoom = await importRoom(base, "i10-item5-cap");
-  if (capRoom.error) {
-    capProbe = `建群失败：${capRoom.error}`;
-  } else {
-    const capPm = byRole(capRoom, "产品经理"), capEng = byRole(capRoom, "工程师");
-    if (!capPm || !capEng) {
-      capProbe = "缺 产品经理/工程师，无法构造";
-    } else {
-      store.db.prepare("UPDATE chat_rooms SET max_rounds = 1, coordinator_agent_id = NULL WHERE id = ?").run(capRoom.id);
-      const capRoomRow = rooms.getRoom(capRoom.id);
-      const capQa = byRole(capRoom, "QA工程师");
-      const capCoord = capRoom.agents.find((x) => x.isCoordinator);
-      ev.push(`AC5.2 专用群=${capRoom.id} maxRounds=${capRoomRow.maxRounds} coordinatorAgentId=${capRoomRow.coordinatorAgentId}（无协调者 → 不会 terminated，窗口稳定）`);
-
-      // 判定顺序是 terminated → LOOP → ROUND_CAP（room-guards.ts:39-40）。所以只要目标是
-      // 链内成员，必先撞 LOOP。要看到 ROUND_CAP，必须让「第 2 次触发」的目标落在链外，
-      // 同时这一轮轮次已满。
-      //   第 1 轮：用户 @工程师（链外）→ 工程师进链，round 1/1，调度收尾但因无协调者只落消息。
-      //   第 2 次：注入一条 QA 任务，其回复 @协调者（链外）→ 目标不在链内，于是命中 ROUND_CAP。
-      const t1 = await post(base, capRoom.id, `@${capEng.name} 一句话说明本轮只占一格。不要使用任何工具。`);
-      ev.push(`AC5.2 turn1 HTTP ${t1.status}（@${capEng.name}，链外目标）`);
-      await settleRoom(capRoom.id, left());
-      const capState = rooms.getState(capRoom.id);
-      const noCoordMsgs = rooms.listMessages(capRoom.id).filter(
-        (m) => m.authorKind === "system" && m.content.includes("无法强制收尾"),
-      );
-      ev.push(`AC5.2 无协调者回退消息：${noCoordMsgs.map((m) => `[seq ${m.seq}] ${clip(m.content, 220)}`).join(" | ") || "（无）"}`);
-      ev.push(`AC5.2 第1轮后：round_count=${capState.roundCount}/${capRoomRow.maxRounds} terminated=${capState.terminated} chainLen=${capState.chain.length}`);
-
-      if (!capQa || !capCoord) {
-        capProbe = "缺 QA/协调者，无法构造第 2 次触发";
-      } else {
-        const qaTask = store.createTask({
-          tenantId: "i10", projectId: "i10-item5-cap", memberId: capQa.id, workspacePath: WS,
-          agentDir: capQa.agentDir,
-          prompt: buildRoomPrompt(rooms.getRoom(capRoom.id), capQa, rooms.listAgents(capRoom.id), rooms.listMessages(capRoom.id))
-            + `\n\n平台补充：请把下面这句话原样作为你的 summary 输出，一个字都别改，也不要使用任何工具：\n已记录，请 @${capCoord.name} 复核。${SAY}`,
-          groupId: capRoom.id, model: MODEL,
-          idempotencyKey: `i10-5-cap:${capRoom.id}:${hex(4)}`,
-        });
-        ev.push(`AC5.2 播入 ${capQa.name} 任务 ${taskLine(qaTask)}（其回复 @${capCoord.name}＝链外目标，即为第 2 次触发）`);
-        await settleRoom(capRoom.id, left());
-
-        const qaAfter = store.getTask(qaTask.id);
-        ev.push(`AC5.2 ${capQa.name} 任务终态：status=${qaAfter?.status} error=${clip(qaAfter?.error, 200)} 回复=${clip(msgsOf(capRoom.id, "agent", capQa.id).at(-1)?.content, 200) || "（无）"}`);
-        const capState2 = rooms.getState(capRoom.id);
-        const capBlockedMsgs = rooms.listMessages(capRoom.id).filter(
-          (m) => m.authorKind === "system" && m.content.startsWith("【流程守卫·轮次上限】")
-            && m.content.includes("不再处理新的 agent 触发"),
-        );
-        const coordTaskCount = roomTasks(capRoom.id).filter((t) => t.memberId === capCoord.id).length;
-        ev.push(`AC5.2 第2次触发后：round_count=${capState2.roundCount}/${capRoomRow.maxRounds} terminated=${capState2.terminated}`);
-        ev.push(`AC5.2 ROUND_CAP 拒绝消息（必须含「不再处理新的 agent 触发」）：${capBlockedMsgs.map((m) => `[seq ${m.seq}] ${clip(m.content, 240)}`).join(" | ") || "（无）"}`);
-        ev.push(`AC5.2 专用群全流=${rooms.listMessages(capRoom.id).map((m) => `[${m.seq}]${m.authorKind}:${clip(m.content, 70)}`).join(" | ")}`);
-        ev.push(`AC5.2 目标 ${capCoord.name} 的 Task 数=${coordTaskCount}（被 ROUND_CAP 拒绝则必须为 0）`);
-        capBlocked = capBlockedMsgs.length > 0 && coordTaskCount === 0 && !capState2.terminated;
-        capProbe = capBlocked
-          ? "真实 worker 在 round_count 达上限且未终止时、对链外目标按 ROUND_CAP 拒绝了新触发"
-          : "未观察到 ROUND_CAP 拒绝（见上面原文/计数）";
-      }
-    }
+  for (let attempt = 1; attempt <= 2 && !capBlocked; attempt += 1) {
+    const r = await runCapProbe(attempt);
+    capBlocked = r.ok;
+    ev.push(`AC5.2[${attempt}] 结论：${r.ok ? "命中 ROUND_CAP" : `未命中 —— ${r.why}`}`);
+    capProbe = r.ok
+      ? `真实 worker 在 round_count 达上限且未终止时、对链外目标按 ROUND_CAP 拒绝了新触发（第 ${attempt} 个群）`
+      : `未观察到 ROUND_CAP 拒绝（第 ${attempt} 个群也未命中：${r.why}）`;
   }
   ev.push(`AC5.2 探针结论：${capProbe}`);
 
