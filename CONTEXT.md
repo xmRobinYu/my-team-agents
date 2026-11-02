@@ -581,6 +581,175 @@ state that lives in SQLite.
   `room-routes.test.ts` (201-with-`blocked` versus 4xx-rollback, wrap-up queued through
   the route).
 
+### Q41 — I5：两条派发路径，去重在守卫之前 (2026-11-02)
+**A**: `handoff_to` 为主路径，agent 自己回复里的 `@name` 为次路径；
+同一目标在**同一条源消息**里最多入队一次；
+两条路径受**完全相同**的护栏与 I6 三守卫约束。
+**R**: Q34 已定两条路径都要识别，Q35 定了按目标去重；
+而 `LOOP` 必须只表示真的 A→B→A。
+- **去重发生在 `evaluateTrigger` 之前**（`dedupeByOrigin`，`handoff-intent.ts`）。
+  若在守卫里"顺路"折叠，第二次命中会被报成 `【流程守卫·循环】` ——
+  那是对一个不存在的循环说谎，还会白烧一条用户无法处理的系统消息。
+- 优先级由 `ORIGIN_RANK`（`handoff_to: 0`、`mention: 1`）表达，**与列表顺序无关**：
+  平局时活下来的是 `handoff_to` 那条，连同它的 reason（Q35）。
+  折叠**只对群 Task 生效**：非群任务只有一条路径，
+  折叠它两次相同的 `handoff_to` 调用会移动 P6 主干的行为。
+- 次路径没有 tool call，幂等锚是合成的 **`mention:<sourceTaskId>`**。
+  它必须跨 Attempt 重放稳定，因为 `completeSuccess` 按
+  `outbox(source_tool_call_id, target_member_id)` 与
+  `idempotencyKey handoff:<chain>:<source>:<target>` 去重；
+  `randomUUID()` 或时间戳会让每次重放拿到新键，于是多派发一个子 Task。
+- 次路径只解析 `structured.summary`，即**即将写进群流的那段字节**：
+  说出口的提及与被履行的提及必须是同一份内容，
+  否则群里会出现一次从未发生的派发。
+- **与用户路径的不对称是有意的，不是遗漏。** 用户消息里未知/重名的 `@` →
+  4xx 且什么都不写（AC2.5，人必须立刻知道没人应答）；agent 正文里的 →
+  记录进流但**不失败**：一次已产出有效结构化结果的运行，
+  不该被一个文本瑕疵作废；且重名**不派发**。
+- 修掉一个真实缺陷：主路径子 Task 的 `input` 原先**不带 `agentDir`/`model`**，
+  于是自动接力的子 agent 会在项目 workspace 里以父的模型跑 ——
+  直接违背 Q38 的人格隔离与 PRD G2/G3。现在两条路径都经 `personaFields`，
+  且**只对群 Task 生效**：非群的 `memberId` 是执行成员、没有 persona 行，
+  继承父的 `agentDir` 只会更糟 —— 子任务会冒充成别人。
+- Gates: `room-handoff-mention.test.ts`（去重、重放幂等、`@` 路径上的守卫、无群回归）、
+  `handoff-intent.test.ts`（`dedupeByOrigin` 与 schema 校验）、
+  `mention.test.ts`（两条路径共用一份花名册规则）。
+
+### Q42 — I7+I8：群是一个 thread，作者身份走 custom 消息 (2026-11-02)
+**A**: `ChatRoom` 投影为一个 Pi thread，与既有 Task thread 共用**同一套** `/api/pi` 路由；
+三栏 UI 由 `usePiRuntime` 驱动。
+**R**: Q29 定"一个群 = 一个 thread"，Q27 定服务端权威；
+而 react-pi 的 `PiThreadMetadata` 契约里**没有** `kind` 字段，
+所以命名空间只能落在 id 上。
+- thread id：群 = **`room:<roomId>`**，单 agent = 裸 task id（P7a 线上格式不变）。
+  不靠"碰巧不撞"：`ExecutionStore` 只产 `task-<uuid>`、`RoomStore` 只产 `room-<uuid>`，
+  分隔符 `:` 不属于任一字母表，且 `threadKind()` 是**全函数**、由字符串本身判定，不查库。
+- 作者载体：`role:"user"` 保持**原生** ——
+  react-pi 靠同文本的 `role:"user"` transcript 条目对账乐观消息，
+  改成 custom 会让用户的话重复显示。agent/system → `role:"custom"` +
+  `customType: room-agent|room-system` +
+  `details{authorKind,agentId,name,role,emoji,color,isCoordinator,seq,messageId,taskId}` +
+  **`display: true`**（`display: false` 会被投影器整条跳过）。刻意**不**把作者名拼进正文。
+- 群 thread 状态：任一 Task 在飞即 `running`。**故意不看**
+  `roundCount`/`chain`/`maxRounds`/`terminated` ——
+  流状态约束的是*未来*触发，不代表当下有无工作，报成 thread 状态就是猜。
+  终止通过流里的系统消息可见（Q40）。
+- 取消只作用于**当前在飞的那条 chain**。取消群的全部 chain 会把别的链上尚未执行的
+  Task（含排队中的收尾任务）直接判成 `cancelled`，而 `cancel_requested=1` 之后
+  `retryTask` 永久拒绝该链 —— 那是摧毁尚未发生的工作，不是停止当下的运行。
+  空闲群回答 `cancelled: false` 而非 4xx：投影不是一次运行，让停止按钮报错毫无意义。
+- 删除 = **tombstone + 取消在飞**，绝不删 P6 行、绝不删群消息
+  （"项目拥有工作区，群聊是视图"）。幂等：已不存在也 204。
+- 补齐了 `PiClient` 契约缺的端点（PATCH / DELETE / queue-clear / models / model /
+  thinking / archive / host-ui），诚实优先于齐全：`queue/clear` 返回空数组是**事实**
+  （P6 没有 Pi 的 steer/followUp 队列）；`thinking` 是 no-op 且**不**在
+  `metadata.config` 里回显；`GET /models` 用**白名单正向构造**读
+  `<agent-dir>/models.json`，凭据字段结构上不可能泄漏；群线程**拒绝**线程级模型
+  （`ROOM_MODEL_IS_PER_AGENT`），而不是悄悄覆盖每个人格。
+- **记录一条限制而非遗漏**：单 agent thread 只接受**第一条**消息，
+  追问返回 **409 `FOLLOW_UP_NOT_SUPPORTED`**。原先的代码调 `retryTask` 并**丢弃**
+  `content` 还回 204 —— react-pi 对 2xx 一律 resolve 并保留乐观消息，
+  而 transcript 由旧 `task.prompt` 重建，于是用户的话短暂出现后消失、
+  worker 重跑旧 prompt。多轮由**群 thread** 承担（Q29）；
+  给单个 Task 造有序 turn 列表需要新投影，
+  且按 `chainId` 聚合会把 handoff 子 Task 的 prompt 冒充成用户消息。
+- I8：三栏（会话列表 / 群聊区 / 成员面板）。渲染**只信 `details`/`customType`，
+  不信 `role`**（react-pi 已把每个 `custom` 行重写成 assistant 消息）；
+  system 消息**零头像**且样式明显不同（Q40 不许把平台提示伪装成成员发言）；
+  `@` 选择器插值到**光标处**；发送前就拦下"无 `@`"与"未知 `@`"
+  （后端严格 4xx，不该发一个注定失败的请求），而 `blocked` 是 **2xx 结果不是错误**。
+- Gates: `pi-room-thread.test.ts`、`pi-room-routes.test.ts`、`pi-room-client.test.ts`
+  （真实 `createPiHttpClient` + 真实 reducer + UI 用的同一套投影规则；
+  校验器会**静默丢弃**畸形消息，所以"路由返回 200"什么都不证明）、
+  `pi-contract.test.ts`、`pi-thread.test.ts`（单 agent 回归）。
+  浏览器验证用真实 Chromium + CDP 跑过（`.i8-evidence/`，未跟踪），**不是**常驻门禁。
+
+### Q43 — I9：技能要真的被加载，判定只有一份 (2026-11-02)
+**A**: 技能落 `<agentDir>/skills/<slug>/`，由 `PiAdapter` 逐个传 `--skill <dir>`；
+清单/安装/卸载走 `/api/rooms/:id/agents/:agentId/skills`；
+"Pi 会不会加载它"的判定唯一地放在 `runtime-core`。
+**R**: 实测两个缺陷，不是推测 —— ①`<agentDir>/skills/` **不在** Pi 的发现路径
+（项目级是 `.pi/skills/` 与 `.agents/skills/`；`<agent-dir>/skills/` 属于
+`PI_CODING_AGENT_DIR`，人格目录刻意不是它）；②适配器从不传 `--skill`。
+**结论：导入的技能此前从未生效过。**
+- 为什么选 `--skill` 而不是改落盘到 `.pi/skills/`：后者受 **trust 门控**，
+  `--no-approve` 下技能会消失（`scripts/pi-smoke-*.mjs` 正是
+  `approveProjectResources: false`）；`--skill` 两种 trust 都加载。
+- 共享判定放 `runtime-core`：它是写入方（orchestrator）与加载方（runtime-pi）
+  **唯一已存在的共同依赖**，放别处要么复制规则（缺陷①正是这么产生的），
+  要么反转依赖方向。
+- **"看得见但不会生效"是一等结果**：缺非空 `description` 的 `SKILL.md` Pi 根本不加载，
+  所以清单返回 `loadable: false` + 具名 `verdict` + 中文 `issues`，而不是静默省略。
+- 无技能 Task 的 argv **逐字节不变**，由自己的回归测试钉住。
+- 路径穿越：slug 白名单 `^[a-z0-9][a-z0-9-]{0,63}$`、`resolve` 后前缀校验、
+  逐文件 `safeRelPath`、卸载再走 `realpath` 纵深；
+  **symlink 在 list/inject/remove 三侧一律不跟随**。
+- 卸载不存在的技能返回 **404 而非幂等 204**：破坏性操作把一个 typo 报成成功更危险。
+- 范围如实记录：I9 交付的是**服务面**（清单/安装/卸载，全部有门禁）加注入。
+  `packages/web` 里独立的技能**页面**仍未做（见 `docs/architecture.md` §9）。
+- Gates: `orchestrator/src/skills.test.ts`、`runtime-pi/src/skills.test.ts`、
+  `server/src/skill-routes.test.ts`、`skill-import-e2e.test.ts`
+  （导入→清单→argv 是**同一个事实的三次读取**；真实 pi 用例 `MTA_REAL_PI=1`）。
+
+### Q44 — I10：真实模型验收，以及它暴露的六个缺陷 (2026-11-02)
+**A**: PRD §6 六项在真实模型下全部通过，由 `scripts/prd-acceptance.mjs` 可重复执行 ——
+真实 `pi` + 真实 provider + 真实服务端 + **独立进程** worker + 同一 SQLite
+（`MTA_RUNTIME=mock` 直接 abort）。
+**R**: 此前只覆盖过 §6 第 2 项与守卫的 mock 级证明。
+- **验收的价值在于它推翻了我们自己的假设。**
+- **D1（高）**：`handoff_to` 在 Pi 1.4.0 里**根本不存在**
+  （内建只有 read/bash/edit/write/grep/find/ls），
+  于是 Q34 所称的"权威主路径"**从未在真实运行里触发过**，I5 的去重有一半不可达。
+  修法：自带 `pi-extensions/handoff-to.js`，经显式 `--extension` 加载
+  （显式路径不受 `--no-extensions` 与 trust 门控）。记一句事实：`PiAdapter`
+  默认就传该 flag（`handoffExtension: true`），所以 `runtime.ts` 无需改动，
+  缺的是扩展文件本身。`execute()` **只登记不派发**（派发在提交事务里，P6 权威）。
+  `--extension` 是**可重复叠加**，不是 last-wins（实测）。
+- **D3（中）**：`agentDir` 只是 cwd，Pi 会话默认写全局 `~/.pi/agent/sessions`，
+  按目录**分组是命名约定不是访问边界** —— 真实模型实测能 `read`/`bash`
+  翻出其他群、其他角色的完整发言。修法：有 `agentDir` 时传
+  `--session-dir <agentDir>/.pi/sessions`（实测与 `--session <path>` 共存不冲突，
+  `messageCount 3→5`，Q18 优先）。完整沙箱属 P7b。
+- **D5（高）**：`handoff_to` 的目标**不校验花名册**，模型填名字时会静默建出
+  `agent_dir=NULL` 的子 Task 去空转失败；而注入的「# 成员」段**从不含 id**，
+  schema 却要求 "exact ids"。修法：`resolveRosterTokens` 复用 `@name` 那套
+  id/名/角色规则（名优先、重名 ambiguous 不猜），解析不出即**拒绝 + 系统消息**；
+  花名册行**追加** id 而**不改** `memberLine` 字节（Q39 的逐字重放断言钉在它上面）。
+  护栏因此看到**已解析的 member id** —— `revisit ≤ 5` 按 id 计数，
+  否则经 `工程师` 三次触达与经 `agent-<uuid>` 三次触达会被算成两条链。
+- **D6（中）**：主路径子 Task 的 prompt 原先只有 `workPackage`，
+  **没有角色 prompt/群身份/群历史**，与 Q30/I4 不一致；
+  D1 修好后这条分歧才第一次真实可达。修法：两条路径共用
+  `dispatchInput`/`buildDispatchPrompt`，且**每次运行只读一次群快照**
+  （两次读会让同批两个孩子对"群里说过什么"意见不一致）。
+- **D2/D4（中/低）**：`@架构师` 按**角色**解析（PRD §6 原文就是这么写的）；
+  `@ts-ignore`/`@types/node`/`@media` 不再被当未知成员 —— **闭合小写清单** +
+  "群若真声明该词则白名单让位"的逃生门。**绝不**用"看着像 ASCII 就当代码"的启发式：
+  成员名合法地可以是 ASCII，误吞一个真名字是**静默丢派发**。
+- **D5-b / D6 已在修复后重跑并直接观察到**（不再是只有单测证明）：
+  `outbox.source_tool_call_id = call_00_O7IT5wtOXBuenYDt2GOx3110`（真实 toolCallId），
+  本轮模型调用的工具只有 `[handoff_to]`、**没有 `bash`**，注入的花名册有 5 行带 `｜id: agent-…`
+  （修复前恒为 0 行），故不再需要翻磁盘；子 Task 的 prompt 含 `# 角色：`、含 `# 群聊记录`、
+  含父这条回复原文，末尾才附「# 交接任务说明（来自 高见远，…）」；
+  阶段 B 要求只写名字时模型填 `"寇豆码"`，被解析成真实 `target_member_id` 且子 Task `succeeded`
+  （D5-a 的"名字/角色/id 三种写法"端到端成立）。完整群注入没有拖慢运行：第 3 项 142.6s→49.9s，
+  全量 349.5s→209.4s。
+- **第 5 项在真实模型下不稳定**：同一份代码、同一份提示，首跑（r7）FAIL —— 协调者收尾 Task
+  连续 3 次 Attempt 全部 `failed`、没有输出 `[讨论结束]`、`terminated=false`，
+  探针因此无从验证阻断；单独重跑该项（r7-item5a）与其后的定稿全量跑（r8）都 PASS。
+  平台能保证的是"收尾 Task 被派发且不占轮次"，**不能**保证每一跑都收到终止标记 ——
+  终止权在代码里，但终止的**触发信号**仍依赖模型输出。六项 PASS 是 r8 这一次的事实。
+- **仍未证明的（不要写成已证明）**：
+  - AC5.2 的 `ROUND_CAP` **真实**拒绝未被直接观察：`maxRounds=1` 时收尾不占轮次、
+    协调者随即终止，而判定顺序 `terminated` 优先，所以真实流里出现的后续阻断是
+    `【流程守卫·已终止】`（第 5 项的探针）。超限阻断本身仍只有 mock 证明。
+  - I8 的浏览器验证是一次性脚本，**不是**常驻门禁。
+- Gates: `node scripts/prd-acceptance.mjs`（手动：需要 pi + provider + 网络，
+  与 `just pi-smoke` 同类，**不入 CI**）。当前代码上一次全量运行退出码 0、209.4s；
+  离线门禁 `just build` / `just check` 退出码 0，
+  `pnpm vitest run packages/orchestrator packages/server` 为 Test Files 26 passed、
+  Tests 395 passed / 2 skipped。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

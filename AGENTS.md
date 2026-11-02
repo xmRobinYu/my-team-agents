@@ -49,7 +49,8 @@ packages/web/            assistant-ui workbench: usePiRuntime + createPiHttpClie
                          against /api/pi (PiClient projection of the task store)
 packages/cost-report/    daily self-assessment from session logs
 docs/                    product/architecture/plan docs + Feishu sync manifest
-scripts/                 guardrail self-test, doc sync, live pi smoke, I2 import evidence
+scripts/                 guardrail self-test, doc sync, live pi smoke, I2 import evidence,
+                         PRD §6 real-model group-chat acceptance
 .git-hooks/              naming + rule-change guard
 ref/                     READ-ONLY reference checkouts (teamagentx et al.)
 ```
@@ -101,9 +102,11 @@ and the UI with `pnpm --filter @my-team-agents/web dev`. The server's `dev` scri
 | Tests without any build | all packages | `just test-no-build` | yes |
 | Real Pi end-to-end | runtime-pi + live model | `just pi-smoke` | no (needs pi + network) |
 | Template import evidence | `packages/orchestrator/src/template-import.ts` | `just verify-import` | no (needs local `ref/` zips) |
+| PRD §6 群聊验收 | orchestrator+server+real model | `node scripts/prd-acceptance.mjs` | no (needs pi + provider + network) |
 
-Every command above resolves to a real `justfile` target. Do not add a row that
-does not have one.
+Every `just …` command above resolves to a real `justfile` target; a row whose
+command is a script must name a script that exists and runs. Do not add a row that
+has neither.
 
 ## Important Development Notes
 
@@ -147,6 +150,20 @@ does not have one.
   instead (Q31), so the same messages are not handed over twice.
   `just pi-smoke` proves both completion semantics and resume-with-memory against
   a live model.
+- **`packages/runtime-pi/pi-extensions/*.js` deliberately lives OUTSIDE `src/`.** That
+  package's `tsc` input is `include: ["src/**/*.ts"]` with `rootDir: src`, so the compiler
+  never reads, transforms or copies these files. `src/adapter.ts` and `dist/adapter.js`
+  both sit one level below the package root, so `../pi-extensions/handoff-to.js` resolves
+  to the SAME file from either — no second copy can appear under `dist/`, and vitest (via
+  the `src` alias) and production (via `dist`) cannot diverge. Moving these files into
+  `src/` would fork them into two artifacts.
+- **Thread-id namespace: a room is `room:<roomId>`, a single agent is the bare Task id.**
+  `PiThreadMetadata` has **no** `kind` field in the react-pi contract, so the namespace
+  lives in the id and `packages/server/src/pi-thread-id.ts:threadKind()` decides the kind
+  from the string alone (no database probe). Do not stuff a non-contract field such as
+  `kind` into thread metadata: react-pi's validator only accepts the known fields, so the
+  UI could never rely on it, and resolving the kind by probing the database instead would
+  let one id mean two things depending on which layer looked at it.
 
 ## Documentation Sync
 
@@ -226,6 +243,15 @@ just sync-all         # docs + Bitable in one go (the usual post-change command)
 - `packages/domain/src/handoff.ts` — guardrails must be deterministic, never
   model-dependent.
 - `packages/cost-report/src/parse.ts` — `since` cursor makes daily runs idempotent.
+- `packages/server/src/pi-thread-id.ts` — the thread-id namespace
+  (`room:<roomId>` vs a bare Task id). Both projections are routed by `threadKind()`
+  from this one file, so changing the prefix or the separator routes the two kinds to
+  each other. `PiThreadMetadata` has no `kind` field, so there is no second signal to
+  fall back on.
+- `packages/orchestrator/src/mention.ts` — ONE roster rule (`resolveMentions` for prose
+  `@name`, `resolveRosterTokens` for a `handoff_to` token) over a shared index. Both
+  dispatch paths resolve the same string to the same member; forking the rule means the
+  two paths of Q34 silently disagree about who a name refers to.
 
 ## Agent Operating Rules
 

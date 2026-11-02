@@ -6,6 +6,7 @@ import type { ServerResponse } from "node:http";
 import { RoomStore, type CreateTaskInput, type DurableWorker, type ExecutionStore } from "@my-team-agents/orchestrator";
 import { registerPiRoutes } from "./pi-routes.js";
 import { registerRoomRoutes } from "./room-routes.js";
+import { registerSkillRoutes } from "./skill-routes.js";
 
 export interface AppOptions {
   store: ExecutionStore;
@@ -191,7 +192,13 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     },
   );
 
-  registerPiRoutes(app, { store, worker, notify });
+  // I7: `/api/pi` now projects two kinds of thread — a Task (P7a) and a
+  // ChatRoom (Q29) — so it reads the room store over the same database handle
+  // `buildApp` already shares with the room routes.
+  registerPiRoutes(app, {
+    store, worker, notify, rooms,
+    defaultWorkspacePath: options.defaultWorkspacePath,
+  });
 
   // I2: rooms are additive. Registered after /api/pi so its encapsulated body
   // parsers cannot change how /api/tasks and /api/pi see request bodies.
@@ -205,6 +212,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     defaultWorkspacePath: options.defaultWorkspacePath,
     defaultTenantId: options.defaultTenantId,
   });
+
+  // I9: agent skill management rides the same RoomStore seam as /api/rooms, in
+  // its own encapsulated scope so it cannot alter any existing body handling.
+  await registerSkillRoutes(app, { store: rooms });
 
   if (options.staticRoot && existsSync(options.staticRoot)) {
     await app.register(fastifyStatic, { root: resolve(options.staticRoot), prefix: "/" });

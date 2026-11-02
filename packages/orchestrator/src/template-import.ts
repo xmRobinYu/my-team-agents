@@ -35,6 +35,12 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join, resolve } from "node:path";
 import { unzipSync } from "fflate";
 import type { ChatRoom, RoomAgent } from "@my-team-agents/domain";
+import {
+  PERSONA_SKILLS_DIR,
+  SKILL_SLUG_PATTERN,
+  judgeSkillFiles,
+  readSkillFrontmatter,
+} from "@my-team-agents/runtime-core";
 import type { CreateRoomAgentInput, CreateRoomInput, RoomStore } from "./room-store.js";
 
 /** A package arrives either as a path on disk or as an already-uploaded buffer. */
@@ -301,23 +307,14 @@ const readOptionalJsonArray = (
  * Minimal YAML reader for persona frontmatter: top-level `key: scalar` only.
  * Nested maps (the IP package's `displayName: { zh, en }`) are skipped rather
  * than guessed — a wrong guess would corrupt the persona.
+ *
+ * I9: the implementation moved to `@my-team-agents/runtime-core` because the
+ * skill inspector needs the same rule, and two readers that drift would make the
+ * importer and the listing disagree about a skill's own frontmatter. This keeps
+ * the exported name stable for persona callers.
  */
 export function parseFrontmatter(prompt: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  const lines = prompt.replace(/^\r?\n/, "").split(/\r?\n/);
-  if (lines[0]?.trim() !== "---") return out;
-  for (let i = 1; i < lines.length; i += 1) {
-    const line = lines[i];
-    if (line === undefined) break;
-    if (line.trim() === "---") break;
-    if (/^\s/.test(line)) continue; // nested value belonging to the previous key
-    const kv = /^([A-Za-z0-9_.-]+):[ \t]*(.*)$/.exec(line);
-    if (!kv) continue;
-    const key = kv[1];
-    const value = (kv[2] ?? "").trim();
-    if (key && value) out[key] = value.replace(/^["'](.*)["']$/, "$1");
-  }
-  return out;
+  return readSkillFrontmatter(prompt);
 }
 
 // --- coordinator -----------------------------------------------------------
@@ -560,6 +557,24 @@ export function parseTemplatePackage(source: ZipSource, options: ParseOptions = 
     const slug = hit[1] ?? "";
     const rel = hit[2] ?? "";
     if (!slug || !rel) continue;
+    // I9: a package is untrusted input, and these strings become path segments
+    // below in `writeAgentDir`. Enforce the slug whitelist and refuse `..`
+    // segments here — the zip-slip equivalent of the traversal gate the skill
+    // API applies to installs. Rejected entries are named, never quietly dropped.
+    if (!SKILL_SLUG_PATTERN.test(slug)) {
+      warnings.push({
+        code: "skill-slug-invalid",
+        message: `包内技能目录名「${slug}」不合 slug 规范（^[a-z0-9][a-z0-9-]{0,63}$），未落地：Pi 也不会承认这种名字`,
+      });
+      continue;
+    }
+    if (rel.split("/").some((segment) => segment === ".." || segment === "")) {
+      warnings.push({
+        code: "skill-path-escaped",
+        message: `技能「${slug}」的文件「${rel}」含越界路径片段，未落地`,
+      });
+      continue;
+    }
     const bucket = skillFiles[slug] ?? (skillFiles[slug] = {});
     bucket[rel] = decoder.decode(bytes);
   }
@@ -710,6 +725,31 @@ export function parseTemplatePackage(source: ZipSource, options: ParseOptions = 
     });
   }
 
+  // I9 / the "看得见但不会生效" case, reported at parse time: a skill whose
+  // SKILL.md lacks a `description` (or has no SKILL.md at all) is skipped by Pi —
+  // measured against the installed binary, not just inferred from docs. Landing it
+  // silently would ship a persona that looks equipped and is not, so each one is
+  // named here, per agent. Same `judgeSkillFiles` the listing endpoint uses, so the
+  // import report and a later GET can never disagree. The skill is still landed:
+  // AC8.1 exists so the user can see it and fix it.
+  for (const agent of agents) {
+    for (const slug of agent.skillSlugs) {
+      const bucket = skillFiles[slug];
+      if (!bucket) continue; // `skill-files-missing` already covers that case
+      const judgement = judgeSkillFiles(slug, bucket);
+      if (judgement.loadable) continue;
+      warnings.push({
+        code: `skill-not-loadable-${judgement.verdict}`,
+        message: judgement.verdict === "missing-description"
+          ? `技能「${slug}」缺 frontmatter description：会落盘，但按 Pi 规则不会被加载（看得见，不生效）`
+          : judgement.verdict === "no-frontmatter"
+            ? `技能「${slug}」的 SKILL.md 没有 frontmatter：会落盘，但 Pi 不会加载它`
+            : `技能「${slug}」的目录内没有 SKILL.md：会落盘，但 Pi 不会加载它`,
+        agentName: agent.name,
+      });
+    }
+  }
+
   // Deliberately not migrated (Q31) — recorded, not swallowed.
   for (const field of ["categories", "cronTasks"] as const) {
     const value = snapshot[field];
@@ -807,8 +847,13 @@ export function planTemplateImport(
 
   const agents: PlannedAgent[] = parsed.agents.map((agent) => {
     const agentDir = join(roomRoot, "agents", sanitizeSegment(agent.templateAgentId, "agent"));
+    // I9: the layout constant is shared with the loader (`PERSONA_SKILLS_DIR`),
+    // because "the importer wrote it here" and "Pi looks there" must be the same
+    // statement. These dirs are NOT discovered by Pi from cwd; they reach the run
+    // through `--skill <dir>` in `runtime-pi` — see its `skills.ts` for the
+    // measured comparison against `.pi/skills/`.
     const skillPaths = agent.skillSlugs.flatMap((slug) =>
-      Object.keys(parsed.skillFiles[slug] ?? {}).map((rel) => `skills/${slug}/${rel}`),
+      Object.keys(parsed.skillFiles[slug] ?? {}).map((rel) => `${PERSONA_SKILLS_DIR}/${slug}/${rel}`),
     );
     return {
       templateAgentId: agent.templateAgentId,
@@ -867,13 +912,13 @@ const writeAgentDir = (plan: PlannedImport, agent: PlannedAgent, marker: object)
   const parsed = plan.parsed;
   const source = parsed.agents.find((a) => a.templateAgentId === agent.templateAgentId);
   if (!source) throw new TemplateImportError("AGENT_INVALID", `计划与解析结果不一致：${agent.input.name}`);
-  mkdirSync(join(agent.agentDir, "skills"), { recursive: true });
+  mkdirSync(join(agent.agentDir, PERSONA_SKILLS_DIR), { recursive: true });
   writeFileSync(join(agent.agentDir, "AGENTS.md"), renderAgentMd(parsed, source));
   for (const slug of agent.skills) {
     const bucket = parsed.skillFiles[slug];
     if (!bucket) continue;
     for (const [rel, text] of Object.entries(bucket)) {
-      const target = join(agent.agentDir, "skills", slug, rel);
+      const target = join(agent.agentDir, PERSONA_SKILLS_DIR, slug, rel);
       mkdirSync(resolve(target, ".."), { recursive: true });
       writeFileSync(target, text, { mode: 0o644 });
     }

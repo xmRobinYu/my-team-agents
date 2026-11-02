@@ -66,6 +66,15 @@ sandbox / workspacePerRun / agentDirPerRun / usageAttribution / costCap），使
   `agentDir`（默认 `~/.pi/agent`，可用 `PI_CODING_AGENT_DIR` 覆盖）承载
   settings/models/auth/AGENTS.md/SYSTEM.md。RPC/JSON/print 模式**无法展示交互式信任
   提示**，因此适配器必须显式传 `--approve`/`--no-approve`。
+- **Pi 的内建工具里没有 `handoff_to`**：1.4.0 的内建只有 `read`/`bash`/`edit`/`write`（加
+  `grep`/`find`/`ls`）。声明式交接因此依赖本仓库自带的 Pi 扩展
+  （`packages/runtime-pi/pi-extensions/handoff-to.js`），经**显式** `--extension <path>` 加载 ——
+  只有显式路径不受 `--no-extensions` 与项目 trust 门控（Q44/D1）。`--extension` 可重复叠加，
+  不是 last-wins。
+- **`<agentDir>/skills/` 不是 Pi 的发现路径**：项目级技能根是 `.pi/skills/`（受 trust 门控）与
+  `.agents/skills/`，`<agent-dir>/skills/` 只属于 `PI_CODING_AGENT_DIR`。
+  人格技能只能通过可重复的 `--skill <dir>` 注入（Q43）。
+  同理 `--session-dir` 决定会话存储位置（Q44/D3）。
 - **dsh**：实测是 cordis 插件/profile 启动器（`~/.dsh/profiles/<name>/cordis.patch.yml`），
   不是编码 Agent 运行时；仅作为 CLI 适配器接入。
 - **claude**：`--output-format stream-json`、`--input-format stream-json`、
@@ -145,14 +154,29 @@ UI 用 `@assistant-ui/react-pi` 的 `usePiRuntime`。`PiClient` 是传输无关�
 内核的 `createPiNodeClient`。详情面板仍读 `/api/tasks/:id`，因为 attempts、usage、
 handoffs、chain 是 PiClient 契约不建模的 P6 证据。
 
+**群聊投影（P8/I7+I8，Q42）**：`ChatRoom` 与 Task 共用同一套 `/api/pi` 路由，命名空间落在
+thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格式不变）。这不是"碰巧不撞"：
+`ExecutionStore` 只产 `task-<uuid>`、`RoomStore` 只产 `room-<uuid>`，`:` 不属于任一字母表，
+`pi-thread-id.ts:threadKind()` 是由字符串本身判定的全函数，不查库。作者身份不能靠
+`PiAgentMessage.role` 表达（契约里 `PiThreadMetadata` 也没有 `kind` 字段），于是 agent/system
+消息走 `role:"custom"` + `customType: room-agent|room-system` + `details{...}` + `display: true`，
+而 `role:"user"` 保持原生（react-pi 靠同文本的 user 条目对账乐观消息）。群 thread 的
+`status` 只看"有没有 Task 在飞"，**不看** `roundCount`/`chain`/`terminated`：流状态约束未来触发，
+不代表当下有无工作。取消只作用于当前在飞的那**一条 chain**：
+`requestCancelChain` 会把该链上所有未进入终态的 Task 判成 `cancelled`，
+所以取消全部 chain 是摧毁尚未发生的工作。删除 thread 是 **tombstone + 取消在飞**，
+不删 P6 行、不删群消息。三栏 UI（`packages/web/src/rooms`）渲染时只信 `details`/`customType`，
+不信 `role`。单 agent thread 只接受第一条消息，
+追问返回 409 `FOLLOW_UP_NOT_SUPPORTED`（多轮由群 thread 承担）。
+
 ## 7. 扩展接口（刻意留白，不生效）
 
 | 接口 | 位置 | 未来填充 |
 |---|---|---|
-| 按 run 的 `agentDir` | `RunSpec.agentDir`、`Project.agentDir` | 多租户隔离；UI 经 `/api/pi` 投影连服务端，不直连 react-pi supervisor，租户隔离由服务端承担 |
+| 按 run 的 `agentDir` | `RunSpec.agentDir`（**已生效**）、`Project.agentDir`（仍留白，无代码读取） | 已生效：`PiAdapter` 把 `RunSpec.agentDir` 用作子进程 cwd，人格目录、`--skill` 注入与 `--session-dir` 都按 run 设置（Q38/Q43/Q44）。仍留白：租户级目录分配与访问控制（P7b）。UI 经 `/api/pi` 投影连服务端，不直连 react-pi supervisor |
 | 职级 | `Member.grade` | 晋升体系 / HR 评审 |
 | 鉴权与委托 | 尚未建模（P7b） | 职能型 / 分身型的前置条件；当前仅本机回环模式 |
-| 技能/工具市场 | 尚未建模 | 先做注册与版本，再做市场 |
+| 技能/工具市场 | 尚未建模 | 单 agent 的清单/安装/卸载已完成（I9/Q43）；市场、版本化与跨 agent 复用仍未建模 |
 
 ## 8. 治理机制
 
@@ -170,7 +194,25 @@ handoffs、chain 是 PiClient 契约不建模的 P6 证据。
 
 1. codex 稳定结构化事件输出未确认 → 归一化按纯文本降级。
 2. 无 eslint → 刻意不提供 `just lint`，避免幻影门禁。
-3. 队列已持久化（SQLite + 租约 + fencing token）；崩溃不丢任务，重试保留历史。
-4. 服务端与 assistant-ui 已接入：`/api/pi` 投影 + `usePiRuntime`，服务端权威。
+3. AC5.2 的"超限后不再处理新触发"**只有 mock 级证明**：
+   真实模型跑里 `maxRounds=1` 时收尾不占轮次、协调者随即终止，
+   而判定顺序 `terminated` 优先，所以真实流中观察到的后续阻断是
+   `【流程守卫·已终止】`，不是 `ROUND_CAP`（`CONTEXT.md` Q44）。
+4. I8 三栏 UI 的浏览器验证**做过**（真实 Chromium + CDP，断言的是渲染后的 DOM），
+   但脚本**未保留在仓库里**，因此 UI 渲染**没有**可重复的检查；
+   `packages/web` 也没有自动化测试（vitest 只收 `packages/**/*.test.ts`）。
+   群 thread 的服务端契约由 `pi-room-client.test.ts`（真实 client + 真实 reducer）证明，
+   UI 渲染本身靠人工核对。
 5. P7b 未做：鉴权、租户隔离、审计；当前仅本机回环，不可暴露到共享环境。
+   persona 会话写入已收窄到 `<agentDir>/.pi/sessions`（Q44/D3），
+   但这只是把文件放近，**不是沙箱**：同机文件系统仍可达，完整隔离属 P7b。
 6. `node:sqlite` 为实验性 API，测试会打印 `ExperimentalWarning`。
+7. 技能：加载机制（`--skill` 注入）与 `/api/rooms/:id/agents/:agentId/skills` 服务面已完成，
+   但 `packages/web` 里**独立的技能管理页面未做**；技能/工具市场仍未建模（§7）。
+8. 单 agent thread 不支持追问：`POST /api/pi/threads/<task>/messages` 只接受第一条消息，
+   之后返回 409 `FOLLOW_UP_NOT_SUPPORTED`；多轮由群 thread 承担（Q42）。
+   这是记录的限制，不是遗漏。
+9. 第 5 项的强制收尾依赖真实模型输出 `[讨论结束]`：**实测不稳定**。首跑 r7 FAIL ——
+   协调者收尾 Task 连续 3 次 Attempt 全失败、没有 `[讨论结束]`、`terminated=false`，
+   探针因此无从验证阻断；单独重跑该项与其后的定稿全量跑（r8）都 PASS。
+   六项 PASS 是 r8 这一次的事实，不能据此宣称该项稳定（`CONTEXT.md` Q44）。

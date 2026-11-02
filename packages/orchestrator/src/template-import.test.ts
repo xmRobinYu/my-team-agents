@@ -466,6 +466,96 @@ describe("importTemplatePackage — agent dirs and atomicity", () => {
     h.store.close();
   });
 
+  /**
+   * I9 defect 1, stated as the invariant that actually matters: the directory the
+   * importer lands skills in is the directory the loader reads. `<agentDir>/skills/`
+   * is deliberately NOT one of Pi's discovery roots (`.pi/skills/` and
+   * `.agents/skills/` are, and `<agent-dir>/skills/` belongs to
+   * `PI_CODING_AGENT_DIR`) — measured against the installed binary — so loading
+   * happens only through `--skill`, which `runtime-pi` derives from this layout.
+   * The cross-package coupling test lives in `packages/server`, where both sides
+   * are dependencies; this pins the layout and the refusal to invent one.
+   */
+  it("lands skills under <agentDir>/skills/<slug>/, not a discovery path", () => {
+    const h = harness("landing");
+    const zip = pack({
+      usages: JSON.stringify([{ agentId: LEAD_ID, slug: "pdf-tools" }]),
+      skills: {
+        "pdf-tools/SKILL.md": "---\nname: pdf-tools\ndescription: Extract text and tables from PDFs.\n---\n\n# pdf-tools\n",
+        "pdf-tools/scripts/extract.sh": "#!/bin/sh\n",
+      },
+    });
+    const planned = planTemplateImport(zip, { projectId: "p", roomsRoot: h.roomsRoot });
+    const planLead = planned.agents.find((a) => a.input.isCoordinator);
+    expect(planLead?.files).toContain("skills/pdf-tools/SKILL.md");
+    expect(planLead?.files).toContain("skills/pdf-tools/scripts/extract.sh");
+
+    const result = h.import(zip);
+    const lead = result.agents.find((a) => a.isCoordinator);
+    const skills = join(lead?.agentDir ?? "", "skills", "pdf-tools");
+    expect(readFileSync(join(skills, "SKILL.md"), "utf8")).toContain("Extract text and tables");
+    expect(existsSync(join(skills, "scripts", "extract.sh"))).toBe(true);
+    // Not silently relocated into a trust-gated discovery dir instead.
+    expect(existsSync(join(lead?.agentDir ?? "", ".pi", "skills"))).toBe(false);
+    expect(existsSync(join(lead?.agentDir ?? "", ".agents", "skills"))).toBe(false);
+    h.store.close();
+  });
+
+  it("warns when a landed skill can never load, and stays quiet when it can", () => {
+    const codes = (zip: ZipSource): string[] => parseTemplatePackage(zip).warnings.map((w) => w.code);
+    const inert = pack({
+      usages: JSON.stringify([{ agentId: LEAD_ID, slug: "nodesc" }]),
+      skills: { "nodesc/SKILL.md": "---\nname: nodesc\nversion: 1.0.0\n---\n\n# nodesc\n" },
+    });
+    expect(codes(inert)).toContain("skill-not-loadable-missing-description");
+
+    const h = harness("inert-import");
+    const result = h.import(inert);
+    // The skill still lands — the user must be able to see and fix it, not
+    // wonder where it went. AC8.1's "visible but inert" case.
+    const lead = result.agents.find((a) => a.isCoordinator);
+    expect(existsSync(join(lead?.agentDir ?? "", "skills", "nodesc", "SKILL.md"))).toBe(true);
+    expect(result.warnings.map((w) => w.code)).toContain("skill-not-loadable-missing-description");
+    expect(
+      result.warnings.find((w) => w.code === "skill-not-loadable-missing-description")?.agentName,
+    ).toBe("齐活林");
+    h.store.close();
+
+    expect(codes(pack({
+      usages: JSON.stringify([{ agentId: LEAD_ID, slug: "pdf-tools" }]),
+      skills: { "pdf-tools/SKILL.md": "---\nname: pdf-tools\ndescription: Reads PDFs.\n---\n" },
+    }))).not.toContain("skill-not-loadable-missing-description");
+  });
+
+  it("refuses a zip-slip skill path and a non-slug directory name", () => {
+    const h = harness("zipslip");
+    const zip = pack({
+      usages: JSON.stringify([
+        { agentId: LEAD_ID, slug: "ok" },
+        { agentId: LEAD_ID, slug: "Bad_Name" },
+      ]),
+      skills: {
+        "ok/SKILL.md": "---\nname: ok\ndescription: Fine.\n---\n",
+        "ok/../../../escaped.md": "ESCAPED",
+        "Bad_Name/SKILL.md": "---\nname: Bad_Name\ndescription: Illegal dir name.\n---\n",
+      },
+    });
+    const parsed = parseTemplatePackage(zip);
+    expect(parsed.warnings.map((w) => w.code)).toContain("skill-path-escaped");
+    expect(parsed.warnings.map((w) => w.code)).toContain("skill-slug-invalid");
+    // the rejected bucket never reaches the plan at all
+    expect(Object.keys(parsed.skillFiles)).toEqual(["ok"]);
+
+    const result = h.import(zip);
+    const lead = result.agents.find((a) => a.isCoordinator) ?? result.agents[0];
+    expect(existsSync(join(lead?.agentDir ?? "", "skills", "ok", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(lead?.agentDir ?? "", "escaped.md"))).toBe(false);
+    expect(existsSync(join(lead?.agentDir ?? "", "skills", "Bad_Name"))).toBe(false);
+    // nothing outside the room tree either
+    expect(existsSync(join(h.roomsRoot, "..", "escaped.md"))).toBe(false);
+    h.store.close();
+  });
+
   it("rolls back the transaction and removes created dirs when the commit fails", () => {
     const h = harness("rollback");
     const zip = pack();
@@ -596,5 +686,60 @@ describe.skipIf(!existsSync(REAL_ZIP))("real package 全栈软件研发-2026-06-
     const architect = result.agents.find((a) => a.name === "高见远");
     expect(readFileSync(join(architect?.agentDir ?? "", "AGENTS.md"), "utf8")).toContain("Software Architect");
     h.store.close();
+  });
+});
+
+/**
+ * A second real package, because `全栈软件研发` ships NO skills at all (verified:
+ * 5 zip entries, none under `skills/`) and so cannot exercise the landing path.
+ * `PPT-演示创作` carries 5 skills / 57 files across 7 agents with overlaps — the
+ * shape that makes "which agent got which skill" a real question.
+ */
+const REAL_SKILLS_ZIP = join(process.cwd(), "ref", "teamagentx-templates", "PPT-演示创作-2026-06-03.zip");
+describe.skipIf(!existsSync(REAL_SKILLS_ZIP))("real package PPT-演示创作-2026-06-03.zip (has skills)", () => {
+  it("lands every referenced skill inside its owning agent's skills dir", () => {
+    const parsed = parseTemplatePackage(REAL_SKILLS_ZIP);
+    expect(Object.keys(parsed.skillFiles).sort()).toEqual([
+      "frontend-slides", "guizang-ppt-skill", "html-ppt", "humanize-ppt", "remotion-video-toolkit",
+    ]);
+
+    const h = harness("real-skills");
+    const result = h.import(REAL_SKILLS_ZIP);
+    expect(result.agents).toHaveLength(7);
+    const report = JSON.parse(readFileSync(join(result.roomRoot, "import-report.json"), "utf8")) as {
+      agents: Array<{ id: string; name: string; skills: string[] }>;
+    };
+    const declared = new Map(report.agents.map((a) => [a.id, a.skills]));
+    expect([...declared.values()].flat().length).toBeGreaterThan(10); // overlaps included
+    // every real skill in this package satisfies Pi's rule, so nothing is inert
+    expect(result.warnings.map((w) => w.code)).not.toContain("skill-not-loadable-missing-description");
+
+    for (const agent of result.agents) {
+      const slugs = declared.get(agent.id) ?? [];
+      for (const slug of slugs) {
+        expect(existsSync(join(agent.agentDir, "skills", slug, "SKILL.md")), `${agent.name}/${slug}`)
+          .toBe(true);
+      }
+      // A skill is never shared by reference: what another agent has must not
+      // appear here, or the persona isolation (Q29) would be fictional.
+      const landed = existsSync(join(agent.agentDir, "skills"))
+        ? readdirSync(join(agent.agentDir, "skills"))
+        : [];
+      expect(new Set(landed)).toEqual(new Set(slugs));
+    }
+    // deep file: the Remotion toolkit ships rules/*.md
+    const video = result.agents.find((a) => (declared.get(a.id) ?? []).includes("remotion-video-toolkit"));
+    expect(existsSync(join(video?.agentDir ?? "", "skills", "remotion-video-toolkit", "rules", "animations.md")))
+      .toBe(true);
+    h.store.close();
+  });
+});
+
+/** `全栈软件研发` carries no skills; assert that too, so the gap is on record. */
+describe.skipIf(!existsSync(REAL_ZIP))("real package 全栈软件研发-2026-06-03.zip (no skills)", () => {
+  it("has an empty skills bucket, so an import there cannot prove skill landing", () => {
+    const parsed = parseTemplatePackage(REAL_ZIP);
+    expect(Object.keys(parsed.skillFiles)).toEqual([]);
+    expect(parsed.agents.every((a) => a.skillSlugs.length === 0)).toBe(true);
   });
 });

@@ -1,0 +1,948 @@
+#!/usr/bin/env node
+/**
+ * PRD §6 验收门禁 —— 多 Agent 群聊（P8 / I10）在**真实模型**下的端到端验收。
+ *
+ * 沿用 `scripts/pi-smoke.sh` 的既定约定：
+ *   - 真实 `pi` 二进制 + `~/.pi/agent/models.json` 里的真实 provider；
+ *   - 默认模型 `airouter/deepseek-v4.1-flash`，用 `PI_SMOKE_MODEL=<provider>/<model>` 覆盖；
+ *   - 隔离工作区（mkdtemp 到 /tmp）：真实 agent 会读写文件，绝不在仓库目录里跑；
+ *   - 退出码 0 仅当六项全部 PASS；任一未通过都如实打印 FAIL/BLOCKED 并给出证据。
+ *
+ * 诚实性规则：
+ *   - 六项一律跑真实服务端（`buildApp` + HTTP）与真实 durable worker（**独立进程**，
+ *     `packages/server/dist/worker.js`），共享同一个 SQLite 文件；`MTA_RUNTIME=mock` 直接拒绝。
+ *   - 每项打印可核对的证据：模型原文片段、DB 行、worker pid/退出码、usage 数字。
+ *   - 真实模型不配合（不肯 @ 人、不肯形成回边）时报 BLOCKED 并贴原始输出；
+ *     绝不降级为 mock、绝不放宽断言、绝不把 mock 级证明写成真实模型通过。
+ *
+ * 模型选择：`全栈软件研发` 包里每个 agent 的 declaredModel 被导入器显式忽略（只记录不
+ * 应用），`room_agents.model` 因此为空，不设的话 pi 会用它自己的默认模型。本脚本把
+ * `PI_SMOKE_MODEL` 写进 `room_agents.model` —— 平台支持的每-agent 模型配置缝
+ * （`postRoomMessage` / `personaFields` 会带到 RunSpec），与 pi-smoke 用环境变量覆盖
+ * 默认模型是同一件事。全程不读取、不打印任何凭据内容。
+ *
+ * 用法：
+ *   node scripts/prd-acceptance.mjs
+ *   PI_SMOKE_MODEL=airouter/deepseek-v4.1-flash MTA_I10_ITEMS=1,6 node scripts/prd-acceptance.mjs
+ *   MTA_I10_KEEP=1 node scripts/prd-acceptance.mjs    # 保留 /tmp 产物用于核对
+ */
+
+import { execFileSync, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+const ROOT = resolve(import.meta.dirname, "..");
+const MODEL = process.env.PI_SMOKE_MODEL || "airouter/deepseek-v4.1-flash";
+const ZIP = join(ROOT, "ref", "teamagentx-templates", "全栈软件研发-2026-06-03.zip");
+const WORKER_ENTRY = join(ROOT, "packages", "server", "dist", "worker.js");
+const ITEM_MS = Number(process.env.MTA_I10_ITEM_MS || 300_000); // 单项硬上限：5 分钟
+const ONLY = (process.env.MTA_I10_ITEMS || "").split(",").map((s) => s.trim()).filter(Boolean);
+const RUNTIME_ENV = process.env.MTA_RUNTIME;
+
+const abort = (msg, hint) => {
+  console.error(`\nABORT: ${msg}${hint ? `\n  ${hint}` : ""}`);
+  process.exit(2);
+};
+
+// --- 前置：必须真实模型，不是 mock ----------------------------------------
+if (RUNTIME_ENV === "mock") abort("MTA_RUNTIME=mock：本脚本只接受真实 runtime");
+delete process.env.MTA_RUNTIME; // 传给 worker 子进程的 env 也不能带 mock
+if (!existsSync(ZIP)) abort(`找不到模板包：${ZIP}`, "ref/ 是 git-ignored 的只读参考树。");
+if (!existsSync(WORKER_ENTRY)) abort(`找不到真实 worker：${WORKER_ENTRY}`, "先跑 just build。");
+try {
+  execFileSync("pi", ["--version"], { stdio: "pipe", timeout: 20_000 });
+} catch {
+  abort("pi 二进制不可用", "npm i -g --ignore-scripts @earendil-works/pi-coding-agent");
+}
+if (!existsSync(join(process.env.HOME || "", ".pi", "agent", "models.json"))) {
+  abort("缺少 provider 配置 ~/.pi/agent/models.json");
+}
+
+const { ExecutionStore, RoomStore, createDurableWorker, buildRoomPrompt, resolveMentions } =
+  await import(join(ROOT, "packages/orchestrator/dist/index.js"));
+const { buildApp } = await import(join(ROOT, "packages/server/dist/app.js"));
+const { runtimeFor } = await import(join(ROOT, "packages/server/dist/runtime.js"));
+
+// --- 隔离工作区 + 一个共享 SQLite ----------------------------------------
+const WORK = mkdtempSync(join(tmpdir(), "i10-acceptance-"));
+const WS = join(WORK, "workspace");
+const ROOMS = join(WORK, "rooms");
+const DB = join(WORK, "execution.sqlite");
+mkdirSync(WS, { recursive: true });
+mkdirSync(ROOMS, { recursive: true });
+
+const store = new ExecutionStore(DB);
+const rooms = new RoomStore(store.db);
+const log = (s = "") => console.log(s);
+const kv = (s) => log(`      ${s}`);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const hex = (n) => randomBytes(n).toString("hex");
+const clip = (s, n = 400) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+const rel = (s) => String(s ?? "").replace(WORK, "<work>").replace(ROOT, "<repo>");
+const TERMINAL = new Set(["succeeded", "failed", "cancelled", "blocked"]);
+
+/**
+ * D3 验收：会话文件到底落在哪儿。
+ *
+ * 每个真实 run 的 cwd 是 workspace 或某个 persona dir，Pi 会把全局 sessions 目录
+ * 按 cwd 编码成一个名字（`/var/…/x` → `--var-…-x--`）。因为 WORK 是随机 mkdtemp，
+ * 这个编码串就是本次运行的唯一指纹：全局目录里只要出现含它的条目，就说明
+ * `--session-dir` 没生效。只列目录名，绝不读文件内容（可能含 prompt 原文）。
+ */
+const GLOBAL_SESSIONS = join(process.env.HOME || "", ".pi", "agent", "sessions");
+const workspaceToken = WORK.split("/").filter(Boolean).at(-1) ?? "";
+const globalSessionEntries = () => {
+  try {
+    return readdirSync(GLOBAL_SESSIONS).filter((d) => workspaceToken && d.includes(workspaceToken));
+  } catch { return []; }
+};
+const personaSessionFiles = (agentDir) => {
+  const dir = join(agentDir, ".pi", "sessions");
+  try {
+    return readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
+  } catch { return []; }
+};
+
+// --- 真进程 worker ---------------------------------------------------------
+const workers = [];
+function spawnWorker(tag) {
+  const logFile = join(WORK, `worker-${tag}.log`);
+  const fd = openSync(logFile, "a");
+  const proc = spawn(process.execPath, [WORKER_ENTRY], {
+    cwd: ROOT,
+    detached: true, // 独立进程组：杀 worker 连它的 pi 子进程一起杀
+    stdio: ["ignore", fd, fd],
+    env: { ...process.env, MTA_DB_PATH: DB },
+  });
+  const rec = { tag, pid: proc.pid, logFile, proc, exit: null };
+  proc.on("exit", (code, signal) => { rec.exit = { code, signal }; });
+  workers.push(rec);
+  return rec;
+}
+function killWorker(rec, signal = "SIGKILL") {
+  if (!rec?.pid) return "no-pid";
+  try { process.kill(-rec.pid, signal); return `SIGKILL 进程组 -${rec.pid}`; }
+  catch { try { process.kill(rec.pid, signal); return `SIGKILL pid ${rec.pid}`; } catch { return "已经死了"; } }
+}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const tail = (file, n = 600) => { try { return clip(readFileSync(file, "utf8").slice(-n), n); } catch { return "(无日志)"; } };
+
+async function waitFor(fn, timeoutMs, interval = 400) {
+  const end = Date.now() + timeoutMs;
+  for (;;) {
+    const v = fn();
+    if (v) return v;
+    if (Date.now() >= end) return null;
+    await sleep(interval);
+  }
+}
+
+// --- 读证据的小工具 --------------------------------------------------------
+const roomTasks = (roomId) => store.listTasks(2000).filter((t) => t.groupId === roomId);
+const agentName = (id) => rooms.getAgent(id)?.name ?? id;
+const taskLine = (t) => `task=${t.id.slice(0, 13)} member=${agentName(t.memberId)} status=${t.status} depth=${t.depth}`
+  + ` attempts=${t.batchAttempts} parent=${t.parentTaskId ? agentName(t.parentTaskId) : "-"}`
+  + ` idem=${t.idempotencyKey ?? "-"} agentDir=${rel(t.agentDir)}`;
+const msgsOf = (roomId, kind, agentId) => rooms.listMessages(roomId)
+  .filter((m) => m.authorKind === kind && (!agentId || m.authorAgentId === agentId));
+const sysMsgs = (roomId, needle) => rooms.listMessages(roomId)
+  .filter((m) => m.authorKind === "system" && m.content.includes(needle));
+const dumpTasks = (ev, roomId) => {
+  const ts = roomTasks(roomId);
+  ev.push(`tasks 表里本群的行（共 ${ts.length}）：`);
+  for (const t of ts) ev.push(`  · ${taskLine(t)}`);
+};
+const dumpStream = (ev, roomId) => {
+  ev.push(`room_messages 全流（可逐行核对作者与内容）：`);
+  for (const m of rooms.listMessages(roomId)) {
+    const who = m.authorKind === "agent" ? agentName(m.authorAgentId) : m.authorKind;
+    ev.push(`  · [seq ${m.seq}] ${who}${m.taskId ? `(task=${m.taskId.slice(0, 11)})` : ""}: ${clip(m.content, 300)}`);
+  }
+};
+const historySection = (taskId) => {
+  const p = store.getTask(taskId)?.prompt ?? "";
+  const i = p.indexOf("# 群聊记录");
+  return i < 0 ? "(注入的 prompt 里没有「# 群聊记录」段)" : p.slice(i, i + 600).split("\n").join(" ⏎ ");
+};
+
+/**
+ * 某个 Task 里模型真实说了什么。成功时是群里的回复；失败时 Q39 规定"失败不发言"，
+ * 模型原文只留在 tasks.error（structured.summary）与 events 里 —— 阴性对照常常正是
+ * 以"拒绝编造"的形式失败的，只看 room_messages 会把这条最有价值的证据丢掉。
+ */
+const modelText = (taskId) => {
+  if (!taskId) return "";
+  const t = store.getTask(taskId);
+  const spoken = t?.groupId ? rooms.getMessageByTask(t.id)?.content : null;
+  const evText = store.getEvents(t.id, 0, 2000).filter((e) => e.event.text).map((e) => e.event.text);
+  return [spoken, t?.result?.summary, t?.error, evText.at(-1)].filter(Boolean).join(" ⇢ ");
+};
+/** 某个 Task 里模型真实调用过哪些工具（用于证明它有没有绕过"不要用工具"）。 */
+const toolCallsOf = (taskId) => {
+  if (!taskId) return [];
+  return store.getEvents(taskId, 0, 2000)
+    .filter((e) => e.event.type === "tool_execution_start" && e.event.toolName)
+    .map((e) => `${e.event.toolName}${e.event.args ? `(${clip(JSON.stringify(e.event.args), 120)})` : ""}`);
+};
+/** 提醒模型遵守平台结构化契约：只有 outcome=success 的结构化结果才会被发回群里。 */
+const SAY = `你的最终结构化结果必须用 outcome="success"，并把你要在群里说的话原样放进 summary（失败不会有人看到你的话）。`;
+
+/** 群安静 = 本群所有 Task 终态，且任务集合连续 quietMs 不变（子 Task 在同事务入队）。 */
+async function settleRoom(roomId, timeoutMs, quietMs = 3000) {
+  const end = Date.now() + timeoutMs;
+  let lastKey = null;
+  let stableSince = Date.now();
+  for (;;) {
+    const tasks = roomTasks(roomId);
+    const key = tasks.map((t) => `${t.id}:${t.status}:${t.batchAttempts}`).join("|");
+    const idle = tasks.length > 0 && tasks.every((t) => TERMINAL.has(t.status));
+    if (idle && key === lastKey && Date.now() - stableSince >= quietMs) return tasks;
+    if (key !== lastKey) { lastKey = key; stableSince = Date.now(); }
+    if (Date.now() >= end) return tasks;
+    await sleep(400);
+  }
+}
+
+// --- 真实服务端 ------------------------------------------------------------
+async function startServer() {
+  // 只为 /api/tasks/:id/cancel 这条 seam 提供 worker.requestCancel（与
+  // packages/server/src/server.ts 的接线等价）；真正执行 Task 的是独立进程 worker。
+  const seam = createDurableWorker(store, { adapterFor: runtimeFor, rooms });
+  const app = await buildApp({
+    store, worker: seam, rooms,
+    roomsRoot: ROOMS,
+    defaultProjectId: "i10-acceptance",
+    defaultWorkspacePath: WS,
+    defaultTenantId: "i10",
+  });
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  return { app, base: `http://127.0.0.1:${app.server.address().port}` };
+}
+
+async function post(base, roomId, content) {
+  const res = await fetch(`${base}/api/rooms/${roomId}/messages`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content, workspacePath: WS }),
+  });
+  return { status: res.status, body: await res.json() };
+}
+
+/** 真实导入一个新群（POST /api/rooms/import 走真实 zip 解析），并配置每-agent 模型。 */
+async function importRoom(base, projectId) {
+  const res = await fetch(`${base}/api/rooms/import`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ path: ZIP, projectId }),
+  });
+  const body = await res.json();
+  if (res.status !== 201) return { error: `HTTP ${res.status} ${clip(JSON.stringify(body), 300)}` };
+  store.db.prepare("UPDATE room_agents SET model = ? WHERE room_id = ?").run(MODEL, body.room.id);
+  return { id: body.room.id, room: rooms.getRoom(body.room.id), agents: rooms.listAgents(body.room.id), import: body };
+}
+const byRole = (h, role) => h.agents.find((a) => a.role === role) ?? null;
+
+// --- 结果记录 --------------------------------------------------------------
+const results = [];
+function record(n, title, status, ev) {
+  results.push({ n, title, status });
+  log(`\n[${n}] ${title}`);
+  log(`    ⇒ ${status}`);
+  for (const e of ev) kv(e);
+}
+const want = (n) => ONLY.length === 0 || ONLY.includes(String(n));
+const failFast = (n, title, why) => { record(n, title, "FAIL", [why]); return null; };
+
+// ===== 1. 导入 5 agent（不需要模型） ======================================
+async function item1(base) {
+  const ev = [];
+  const title = "导入 全栈软件研发 → 含 5 个 agent 的 ChatRoom";
+  const h = await importRoom(base, "i10-item1");
+  if (h.error) return failFast("1", title, `POST /api/rooms/import 失败：${h.error}`);
+  const fetched = await (await fetch(`${base}/api/rooms/${h.id}/agents`)).json();
+  const listed = await (await fetch(`${base}/api/rooms`)).json();
+  ev.push(`POST /api/rooms/import → HTTP 201；room=${h.id} name=${h.room.name} maxRounds=${h.room.maxRounds} rules=${h.room.rules.split("\n").length} 行 Markdown`);
+  ev.push(`GET /api/rooms → ${listed.map((r) => r.name).join(", ")}`);
+  ev.push(`GET /api/rooms/:id/agents → ${fetched.length} 个：`);
+  for (const a of h.agents) {
+    ev.push(`  · ${a.name}（${a.role}）is_coordinator=${a.isCoordinator} agentDir=${rel(a.agentDir)} AGENTS.md=${existsSync(join(a.agentDir, "AGENTS.md")) ? "已落盘" : "缺失"}`);
+  }
+  const coord = h.agents.filter((a) => a.isCoordinator);
+  const onDisk = h.agents.filter((a) => existsSync(join(a.agentDir, "AGENTS.md")));
+  const distinct = new Set(h.agents.map((a) => a.agentDir)).size;
+  ev.push(`协调者：${coord.length === 1 ? `${coord[0].name}（${coord[0].role}）is_coordinator=1` : `count=${coord.length}`}；判定来源=${h.import.coordinator.source}；chat_rooms.coordinator_agent_id=${h.room.coordinatorAgentId}`);
+  ev.push(`独立 agentDir=${distinct}/5；落盘 AGENTS.md=${onDisk.length}/5；写入文件 ${h.import.filesWritten.length} 个；warnings=${h.import.warnings.length}`);
+  ev.push(`事实说明：该包不含任何技能（I9 已断言：zip 5 个条目、无 skills/）。§6 第 1 项只要求 5 个 agent，不要求技能。`);
+  const ok = fetched.length === 5 && h.agents.length === 5 && coord.length === 1
+    && coord[0].id === h.room.coordinatorAgentId && onDisk.length === 5 && distinct === 5;
+  record("1", title, ok ? "PASS" : "FAIL", ev);
+  return h;
+}
+
+// ===== 2. @架构师 + 群上下文（含阴性对照） =================================
+//
+// 第一版在这里被判过 FAIL，两条原因，本版都堵掉：
+//  1) marker 让模型"现编" —— 同一 provider 几乎每次都编出同一个串，正例与阴性对照失去
+//     区分力（实测三次全是 QX7f3a9c2e5b1d）。改成脚本 randomBytes 生成。
+//  2) 阴性对照里架构师翻磁盘把 marker 读了出来（它去读了另一个群的 Pi 会话日志并复述
+//     原值）。所以 (a) 阴性对照**先跑** —— 那一刻 marker 还没进过任何会话文件/DB 行，
+//     磁盘上根本没有可偷看的东西；(b) 题面明确禁止一切读取类工具；(c) 打印每个 Task
+//     的真实工具调用作为证据。
+async function item2(base) {
+  const ev = [];
+  const title = "用户 @架构师 → 以自身身份回复且明显使用群上下文（含阴性对照）";
+  let deadline = Date.now() + ITEM_MS;
+  const left = () => Math.max(1000, deadline - Date.now());
+  const marker = `QX${hex(8)}`;
+  ev.push(`marker=${marker}（脚本 randomBytes 生成的 16 位十六进制；不来自模型、不来自训练语料，跑起来之前不在任何磁盘文件里）`);
+  // D2 已修（PRD §6 第 2 项字面就是「@架构师」这个角色名，不是人名）。断言见下方【正例】段。
+  const q = (token) => `@${token} 只回答一件事：刚才群里许清楚给出的验证码是什么？只回复验证码本身，不要解释。`
+    + `绝对不许使用任何工具 —— 不准 read、不准 bash、不准 ls/find/cat/grep，不准去翻任何会话文件或日志：`
+    + `这道题只许用你本次被注入的群聊上下文来回答，靠翻文件得到的答案算错；上下文里没有就老实说没有。${SAY}`;
+  const ROLE_TOKENS = ["架构师", "产品经理", "QA工程师", "交付总监", "工程师"];
+  const d2Line = (token, agents) => {
+    const hit = resolveMentions(`@${token} 在吗`, agents).targets;
+    return `  · 解析 "@${token}" → ${hit.length ? hit.map((a) => `${a.name}（${a.role}）`).join(" | ") : "未命中"}`
+      + `｜唯一命中=${hit.length === 1}${hit.length === 1 ? `｜角色相符=${hit[0].role === token || hit[0].name === token}` : ""}`;
+  };
+
+  // ---- 阴性对照先跑 ----
+  const neg = await importRoom(base, "i10-item2-neg");
+  const negArch = neg.error ? null : byRole(neg, "架构师");
+  let negLeaked = null;
+  if (!negArch) {
+    ev.push(`阴性对照未能建立（${neg.error ?? "缺架构师"}）→ 没有阴性对照的本项不算通过。`);
+  } else {
+    const n1 = await post(base, neg.id, q("架构师"));
+    ev.push(`【阴性对照，先跑】群=${neg.id} HTTP ${n1.status}：这个群里没有任何许清楚的发言，注入历史里不存在 marker`);
+    await settleRoom(neg.id, left());
+    const negTask = roomTasks(neg.id).find((x) => x.memberId === negArch.id);
+    const negMsg = msgsOf(neg.id, "agent", negArch.id).at(-1);
+    negLeaked = [negMsg?.content, modelText(negTask?.id)].filter(Boolean).join(" ").includes(marker);
+    ev.push(`阴性对照注入的群历史（逐字片段）：${clip(historySection(negTask?.id), 460)}`);
+    ev.push(`阴性对照架构师进群回复：${clip(negMsg?.content, 320) || "（无回复）"}`);
+    ev.push(`阴性对照模型原始输出（status=${negTask?.status} attempts=${negTask?.batchAttempts}）：${clip(modelText(negTask?.id), 460) || "（空）"}`);
+    ev.push(`阴性对照真实工具调用：${toolCallsOf(negTask?.id).length ? toolCallsOf(negTask?.id).join(" ; ") : "（无 —— 没有翻磁盘）"}`);
+    ev.push(`阴性对照是否说出 marker=${negLeaked}（必须 false）`);
+  }
+
+  // ---- 正例：先把含 marker 的话放进群里（真实模型复述），再 @架构师 ----
+  const h = await importRoom(base, "i10-item2-pos");
+  if (h.error) return failFast("2", title, [...ev, `导入失败：${h.error}`]);
+  const pm = byRole(h, "产品经理"), arch = byRole(h, "架构师");
+  if (!pm || !arch) return failFast("2", title, [...ev, `群里缺 产品经理/架构师：${h.agents.map((a) => a.role).join(",")}`]);
+  ev.push(`【正例】群=${h.id}；${pm.name}（产品经理）先发言，随后 ${arch.name}（架构师）被 @`);
+  // ---- D2 断言：五个角色各自唯一命中，且名字优先于角色 ----
+  ev.push(`【D2】resolveMentions 角色解析（对刚导入的真实 5 agent 名单跑）：`);
+  for (const token of ROLE_TOKENS) ev.push(d2Line(token, h.agents));
+  const d2Ok = ROLE_TOKENS.every((t) => resolveMentions(`@${t} 在吗`, h.agents).targets.length === 1);
+  const archByName = resolveMentions(`@${arch.name} 在吗`, h.agents).targets;
+  ev.push(d2Line(arch.name, h.agents) + `｜名字解析到的正是架构师=${archByName.length === 1 && archByName[0].id === arch.id}`);
+  const r1 = await post(base, h.id,
+    `@${pm.name} 群里同步一条公告：本次需求评审的验证码是 ${marker}。请用一行“验证码：<逐字照抄那个串>”确认你看到了它。不要用任何工具。${SAY}`);
+  ev.push(`turn1 HTTP ${r1.status}；tasks=${(r1.body.tasks ?? []).map((t) => t.id.slice(0, 13)).join(",") || "-"}；blocked=${JSON.stringify(r1.body.blocked ?? [])}`);
+  await settleRoom(h.id, left());
+  const pmTask = roomTasks(h.id).find((x) => x.memberId === pm.id);
+  const pmSpoken = msgsOf(h.id, "agent", pm.id).map((m) => m.content).join(" / ");
+  const pmSaid = !!pmSpoken && pmSpoken.includes(marker);
+  ev.push(`${pm.name} 进群的真实回复（这一条才会被注入给架构师）：${clip(pmSpoken, 300) || "（无 —— 模型没成功发言）"}｜群历史里现已含 marker=${pmSaid}`);
+  ev.push(`${pm.name} 真实工具调用：${toolCallsOf(pmTask?.id).length ? toolCallsOf(pmTask?.id).map((t) => t.split("(")[0]).join(",") : "（无）"}`);
+
+  // PRD 字面：@架构师（角色）。D2 修复后应解析到 高见远。
+  const r2 = await post(base, h.id, q("架构师"));
+  ev.push(`turn2 HTTP ${r2.status}；tasks=${(r2.body.tasks ?? []).map((t) => t.id.slice(0, 13)).join(",") || "-"}（只 @ 架构师 → 只建 1 个 Task，AC2.1）`);
+  dumpTasks(ev, h.id);
+  const archTask = roomTasks(h.id).find((t) => t.memberId === arch.id);
+  ev.push(`注入给架构师的群历史（tasks.prompt 逐字片段）：${clip(historySection(archTask?.id), 620)}`);
+  await settleRoom(h.id, left());
+  const archMsg = msgsOf(h.id, "agent", arch.id).at(-1);
+  ev.push(`架构师进群回复：${archMsg ? `[seq ${archMsg.seq}] author_kind=${archMsg.authorKind} author_agent_id=${archMsg.authorAgentId?.slice(0, 13)}（== 架构师 id：${archMsg.authorAgentId === arch.id}）内容=${clip(archMsg.content, 320)}` : "（无 —— 模型没成功发言）"}`);
+  ev.push(`架构师真实工具调用：${toolCallsOf(archTask?.id).length ? toolCallsOf(archTask?.id).join(" ; ") : "（无 —— 只用注入上下文作答，符合题面）"}`);
+  const identityOk = !!archMsg && archMsg.authorKind === "agent" && archMsg.authorAgentId === arch.id;
+  const personaOk = !!archTask && archTask.agentDir === arch.agentDir;
+  ev.push(`身份证据：task.member_id=${archTask?.memberId?.slice(0, 13)}（${agentName(archTask?.memberId ?? "")}）；task.agent_dir=${rel(archTask?.agentDir)} == 架构师自己的 agentDir（Pi 子进程 cwd，Q38）→ ${personaOk}`);
+  const usedContext = !!archMsg && archMsg.content.includes(marker);
+  ev.push(`正例：架构师引用了 marker=${usedContext}`);
+  ev.push(`对照结论：正例（群里有那句话）引用=${usedContext}；阴性对照（群里没有那句话，且先于 marker 落盘运行）说出=${negLeaked}。`
+    + `两者同时成立才证明它靠本次注入的群上下文作答 —— 不是猜的（随机串猜不到），也不是翻磁盘（当时磁盘上没有）。`);
+
+  // ---- D3 断言：会话文件只在 persona 自己的目录里，全局 sessions 里没有本次指纹 ----
+  const globalLeft = globalSessionEntries();
+  const personaFiles = { [arch.name]: personaSessionFiles(arch.agentDir), [pm.name]: personaSessionFiles(pm.agentDir) };
+  const negPersonaFiles = negArch ? personaSessionFiles(negArch.agentDir) : [];
+  ev.push(`D3 隔离核对：全局 ~/.pi/agent/sessions 里含本次 workspace 指纹「${workspaceToken}」的条目=${globalLeft.length}（必须 0）`
+    + `${globalLeft.length ? `：${globalLeft.join(", ")}` : ""}`);
+  for (const [name, files] of Object.entries(personaFiles)) {
+    ev.push(`  · ${name} 自己的 <agentDir>/.pi/sessions 下会话文件=${files.length} 个${files.length ? `（${files.map((f) => f.split("/").slice(-1)[0]).join(", ")}）` : ""}`);
+  }
+  if (negArch) ev.push(`  · 阴性对照群 ${negArch.name} 的 persona 会话文件=${negPersonaFiles.length} 个`);
+  const d3Ok = globalLeft.length === 0
+    && personaFiles[arch.name].length > 0 && personaFiles[pm.name].length > 0
+    && (!negArch || negPersonaFiles.length > 0);
+
+  dumpStream(ev, h.id);
+  const ok = usedContext && identityOk && personaOk && pmSaid && negLeaked === false && d2Ok && d3Ok;
+  record("2", title, ok ? "PASS" : "FAIL", [...ev,
+    `本项断言：D2 五个角色各唯一命中=${d2Ok}；D3 全局零泄漏且 persona 目录内有会话=${d3Ok}`]);
+}
+
+// ===== 3. agent 间自动交接 ================================================
+//
+// §6 第 3 项必须证的是 **handoff_to 主路径**（D1 的唯一端到端证明）。判别点：
+// outbox.source_tool_call_id 是运行时真实 toolCallId（call_00_…），不是次路径合成的
+// mention:<taskId>。
+//
+// 这一版把 D5-b 与 D6 从"只有单测"变成真实模型证据：
+//  · D5-b：注入 prompt 的「# 成员」行现在带 `｜id: agent-…`。所以阶段A **故意不在用户
+//    消息里给 id** —— 模型只能从花名册读。断言：父 prompt 里确实带 id；模型不调 handoff_to
+//    之外的查找工具（若仍出现 bash/read，就是 D5-b 没真正解决，如实报）。
+//  · D6：主路径子 Task 现在也拿到完整群注入。断言：child.prompt 含「# 群聊记录」、含父这条
+//    回复原文、且 workPackage 以「# 交接任务说明」附在最后。
+//  · D5-a：阶段B 让模型往 toMemberIds 里写**名字**，断言平台解析成真实 agent id（三种形式
+//    都接受），而不是像修复前那样把名字当 id 建出一个空转的子 Task。
+//
+// 沿用两个已踩过的坑：用户消息不得出现可解析的目标提及（否则测的是去重）；读证据前必须等
+// 子 Task 进终态。workPackage 要求"只回一句话"，断言的是机制不是实现能力。
+
+async function item3(base) {
+  const ev = [];
+  const title = "agent 间自动交接走 handoff_to 主路径（真实模型，含 D5-b/D6/D5-a）";
+  const deadline = Date.now() + ITEM_MS;
+  const left = () => Math.max(1000, deadline - Date.now());
+  const h = await importRoom(base, "i10-item3");
+  if (h.error) return failFast("3", title, `导入失败：${h.error}`);
+  const arch = byRole(h, "架构师"), eng = byRole(h, "工程师");
+  if (!arch || !eng) return failFast("3", title, `缺 架构师/工程师：${h.agents.map((a) => a.role).join(",")}`);
+  const engId = eng.id, archId = arch.id;
+  // 只算"去磁盘上找东西"的只读发现类工具：D5-b 的断言是模型不必翻文件就能拿到 id。
+  const LOOKUP = new Set(["bash", "read", "ls", "grep", "find"]);
+  ev.push(`群=${h.id}；发起者=${arch.name}（${arch.role}），接收者=${eng.name}（${eng.role}，id=${engId}）`);
+  ev.push(`判定标准：outbox.source_tool_call_id 是真实 toolCallId（^call_）而非 mention:<taskId>；`
+    + `子 Task depth=1、member_id=工程师 id、agent_dir=工程师自己的目录、status=succeeded`);
+
+  const waitChild = (taskId) => waitFor(() => {
+    const t = store.getTask(taskId);
+    return t && TERMINAL.has(t.status) ? t : null;
+  }, left(), 1000);
+
+  const readRun = (parent, label) => {
+    const evs = store.getEvents(parent.id, 0, 5000);
+    const calls = evs.filter((e) => e.event.type === "tool_execution_start");
+    const names = [...new Set(calls.map((c) => c.event.toolName))];
+    const handoffs = calls.filter((e) => e.event.toolName === "handoff_to");
+    const outbox = store.getOutbox(parent.id);
+    ev.push(`${label}：模型调用的工具=[${names.join(", ") || "无"}]；handoff_to ${handoffs.length} 次`);
+    for (const c of handoffs) ev.push(`   · toolCallId=${c.event.toolCallId} args=${clip(JSON.stringify(c.event.args), 320)}`);
+    ev.push(`${label}：outbox=${outbox.length ? outbox.map((o) => `source_tool_call_id=${o.source_tool_call_id} target=${o.target_member_id}(${agentName(String(o.target_member_id))})`).join(" | ") : "无"}`);
+    return { calls, names, handoffs, outbox };
+  };
+
+  let hit = null;
+  const broken = [];
+  let rosterInPrompt = null, noLookup = null;
+  // ---- 阶段 A：主路径证明 —— 用户消息【故意不给 id】，模型只能从注入的花名册读（D5-b） ----
+  for (let attempt = 1; attempt <= 3 && left() > 130_000 && !hit; attempt += 1) {
+    const r = await post(base, h.id,
+      `@${arch.name} 必须用 handoff_to 工具把活儿交接给${eng.name}，不要只在正文里 @。`
+      + `本次不提供任何 id：toMemberIds 请从平台注入给你的成员名单里取${eng.name}对应的 id。`
+      + `不要用 read/bash/ls/grep/find 去翻任何文件或目录来找 id —— 名单就在你的提示词里。`
+      + `reason 写“架构已定，交给工程师确认”。workPackage 只写一句：请回一句话确认收到即可，不要写任何文件、不要使用任何工具。${SAY}`);
+    const created = r.body.tasks ?? [];
+    ev.push(`阶段A（不给 id）尝试 ${attempt}：HTTP ${r.status}；用户建出的 tasks=${created.map((t) => `${t.id.slice(0, 13)}/${agentName(t.memberId)}`).join(",") || "-"}；blocked=${JSON.stringify(r.body.blocked ?? [])}`);
+    if (created.length !== 1 || created[0].memberId !== archId) {
+      ev.push(`阶段A 尝试 ${attempt} 作废：用户消息自己触发了 ${created.length} 个 Task（必须恰好 1 个且是 ${arch.name}）。`);
+      continue;
+    }
+    await settleRoom(h.id, left());
+    const parent = store.getTask(created[0].id);
+    const run = readRun(parent, `阶段A 尝试 ${attempt}`);
+    rosterInPrompt = /｜id: agent-[0-9a-f-]{36}/.test(parent.prompt);
+    const idLines = (parent.prompt.match(/｜id: agent-[0-9a-f-]{36}/g) ?? []).length;
+    ev.push(`阶段A D5-b：注入给${arch.name}的 prompt 里「｜id: agent-…」名单行数=${idLines}（修复前恒为 0）→ 花名册带 id=${rosterInPrompt}`);
+    const lookups = run.names.filter((n) => LOOKUP.has(n));
+    noLookup = lookups.length === 0;
+    ev.push(`阶段A D5-b：除 handoff_to 外是否调过查找/读文件类工具=[${lookups.join(", ") || "无"}] → 不需要翻磁盘=${noLookup}`);
+    if (!run.handoffs.length) {
+      ev.push(`阶段A 尝试 ${attempt}：模型没有调用 handoff_to；原始输出=${clip(modelText(parent.id), 460) || "（空）"}`);
+      continue;
+    }
+    const primary = run.outbox.find((o) => /^call[_-]/.test(String(o.source_tool_call_id)));
+    if (!primary) { ev.push(`阶段A 尝试 ${attempt}：调了 handoff_to 但没有真实 toolCallId 的 outbox 行`); continue; }
+    const child = (await waitChild(String(primary.child_task_id))) ?? store.getTask(String(primary.child_task_id));
+    const dirOk = !!child?.agentDir && child.agentDir === eng.agentDir && child.agentDir !== arch.agentDir;
+    const viable = !!child && child.memberId === engId && dirOk && child.status === "succeeded";
+    if (viable) { hit = { parent, primary, child, dirOk }; break; }
+    broken.push({ phase: "A", srcId: String(primary.source_tool_call_id), child });
+    ev.push(`阶段A 尝试 ${attempt}：派发了子 Task 但没以 ${eng.name} 身份跑成 —— status=${child?.status}、member_id=${child?.memberId}、agent_dir=${child?.agentDir ? rel(child.agentDir) : "(空)"}、error=${clip(child?.error, 220)}`);
+  }
+
+  // ---- 阶段 B：D5-a —— 让模型只写名字，断言平台把名字解析成真实 agent id ----
+  let d5a = null;
+  if (left() > 130_000) {
+    const r = await post(base, h.id,
+      `@${arch.name} 必须用 handoff_to 工具把活儿交接给${eng.name}。`
+      + `本次要求你 toMemberIds 里只写成员名字「${eng.name}」，绝对不要写 id。`
+      + `reason 写“名字形式交接”。workPackage 只写一句：回一句话确认即可，不要写文件、不要使用任何工具。${SAY}`);
+    const created = r.body.tasks ?? [];
+    ev.push(`阶段B（要求只写名字）：HTTP ${r.status}；用户建出的 tasks=${created.map((t) => `${t.id.slice(0, 13)}/${agentName(t.memberId)}`).join(",") || "-"}`);
+    if (created.length === 1 && created[0].memberId === archId) {
+      await settleRoom(h.id, left());
+      const parent = store.getTask(created[0].id);
+      const run = readRun(parent, "阶段B");
+      const primary = run.outbox.find((o) => /^call[_-]/.test(String(o.source_tool_call_id)));
+      const child = primary ? ((await waitChild(String(primary.child_task_id))) ?? store.getTask(String(primary.child_task_id))) : null;
+      const arg0 = run.handoffs.length ? String(run.handoffs.at(-1).event.args?.toMemberIds?.[0] ?? "") : "";
+      const wroteName = arg0 === eng.name;
+      const resolvedToId = !!primary && String(primary.target_member_id) === engId;
+      d5a = { wroteName, resolvedToId, arg0, child };
+      ev.push(`阶段B D5-a：模型写进 toMemberIds 的原文="${arg0 || "(没调用工具)"}"；是否正是名字=${wroteName}`);
+      ev.push(`阶段B D5-a：outbox.target_member_id=${primary ? String(primary.target_member_id) : "-"} 是否被解析成 ${eng.name} 的真实 id=${resolvedToId}`);
+      if (child) ev.push(`阶段B D5-a：子 Task member_id=${child.memberId} status=${child.status} agent_dir=${child.agentDir ? rel(child.agentDir) : "(空)"} error=${clip(child.error, 200)}`);
+      if (!wroteName) ev.push(`阶段B D5-a 未复现：模型没有照要求只写名字（它写了 "${arg0}"），所以这一阶段不构成对名字形式的真实检验，不参与本项判定。`);
+    } else {
+      ev.push(`阶段B 作废：用户消息触发了 ${created.length} 个 Task`);
+    }
+  } else {
+    ev.push(`阶段B 未跑：单项 ${ITEM_MS / 1000}s 预算不足`);
+  }
+
+  dumpTasks(ev, h.id);
+  if (broken.length) {
+    ev.push(`【派发出去但没跑成的主路径交接】${broken.length} 次：`);
+    for (const b of broken) {
+      ev.push(`  · 阶段${b.phase} toolCallId=${b.srcId} → child.member_id=${b.child?.memberId} status=${b.child?.status} agent_dir=${b.child?.agentDir ? rel(b.child.agentDir) : "(空)"} error=${clip(b.child?.error, 220)}`);
+    }
+  }
+
+  // D4 与交接是否成功无关，任何出口都要跑（否则 D4 的结论会随本项结果一起消失）。
+  const d4 = await assertD4(base, h, eng, ev, deadline);
+
+  if (!hit) {
+    const anyPrimary = outboxHasRealCallId(h.id);
+    const parents = roomTasks(h.id).filter((t) => t.memberId === archId);
+    const toolNames = [...new Set(parents.flatMap((p) => store.getEvents(p.id, 0, 5000)
+      .filter((e) => e.event.type === "tool_execution_start").map((e) => e.event.toolName)))];
+    ev.push(`结论口径：${anyPrimary
+      ? "handoff_to 确实被真实模型调用、真实 toolCallId 也确实入了 outbox，但没有任何一次让子 Task 以目标 persona 跑成 → FAIL"
+      : `模型在 ${parents.length} 次尝试内始终没调用 handoff_to（本会话可用工具见下一行）→ BLOCKED`}`);
+    ev.push(`本项里模型调用过的工具：[${toolNames.join(", ") || "无"}]`);
+    for (const p of parents) ev.push(`  · 父 ${p.id.slice(0, 13)}（status=${p.status}）原始输出：${clip(modelText(p.id), 600) || "（空）"}`);
+    dumpStream(ev, h.id);
+    record("3", title, anyPrimary ? "FAIL" : "BLOCKED", ev);
+    return;
+  }
+
+  const { parent, primary, child } = hit;
+  const srcId = String(primary.source_tool_call_id);
+  const isRealCallId = /^call[_-]/.test(srcId) && srcId !== `mention:${parent.id}`;
+  const squash = (s) => String(s ?? "").replace(/\s+/g, "");
+  const parentReplies = [...new Set(msgsOf(h.id, "agent", arch.id).map((m) => m.content))];
+  // D6：主路径子 Task 现在也拿到完整群注入 + workPackage 附在最后
+  const d6Persona = child.prompt.includes("# 角色：");
+  const d6History = child.prompt.includes("# 群聊记录");
+  // workPackage 的文字是模型自己写的，不能要求逐字等于我提示里那句；判据是平台把它作为
+  // 「# 交接任务说明（来自 <派发者>，平台附在群聊注入之后）」接在群注入之后（buildDispatchPrompt）。
+  const d6Work = child.prompt.includes(`# 交接任务说明（来自 ${arch.name}`) && child.prompt.length > 600;
+  const d6ParentReply = parentReplies.some((c) => c.length > 8 && squash(child.prompt).includes(squash(c).slice(-40)));
+  ev.push(`★ 主路径证据：outbox.source_tool_call_id=${srcId}`);
+  ev.push(`  · 是运行时真实 toolCallId（^call_…），不是次路径合成的 mention:<taskId> → ${isRealCallId}`);
+  ev.push(`  · outbox 全行：id=${primary.id} source_attempt_id=${String(primary.source_attempt_id).slice(0, 13)} target=${primary.target_member_id}(${agentName(String(primary.target_member_id))}) reason=${clip(primary.reason, 120)} status=${primary.status}`);
+  ev.push(`  · 子 Task：${taskLine(child)} depth=${child.depth}（父 depth=${parent.depth}）`);
+  ev.push(`  · 人格断言：child.agent_dir=${rel(child.agentDir)} == ${eng.name} 自己的 agentDir（${rel(eng.agentDir)}）且 != 父 agent ${arch.name} 的 ${rel(arch.agentDir)} → ${hit.dirOk}`);
+  ev.push(`  · 执行断言：child.status=${child.status}；attempts=${store.getAttempts(child.id).map((a) => `#${a.sequence}/${a.status}`).join(",")}`);
+  ev.push(`  · 子 agent 进群回复：${clip(msgsOf(h.id, "agent", child.memberId).at(-1)?.content, 300) || "（无）"}`);
+  ev.push(`D6 断言（子 Task 看到完整群上下文，不是裸 workPackage）：含「# 角色：」=${d6Persona}；含「# 群聊记录」=${d6History}；含父这条回复原文=${d6ParentReply}；末尾附 workPackage（「# 交接任务说明」）=${d6Work}`);
+  const histIdx = child.prompt.indexOf("# 群聊记录");
+  ev.push(`  · 子 Task prompt 从「# 群聊记录」起的片段：${histIdx < 0 ? "(无此段)" : clip(child.prompt.slice(histIdx, histIdx + 460), 460)}`);
+  ev.push(`  · 子 Task prompt 末尾 260 字：${clip(child.prompt.slice(-260), 260)}`);
+
+  const d5aOk = d5a === null || !d5a.wroteName ? null : (d5a.resolvedToId && d5a.child?.status === "succeeded");
+  if (d5aOk === false) ev.push(`D5-a 断言失败：模型按要求只写了名字，但平台没有把它解析成真实 id / 子 Task 没跑成（见上面阶段B 行）。`);
+  const ok = isRealCallId && hit.dirOk && child.status === "succeeded" && d4
+    && rosterInPrompt === true && noLookup === true
+    && d6Persona && d6History && d6Work && d6ParentReply
+    && d5aOk !== false;
+  dumpStream(ev, h.id);
+  record("3", title, ok ? "PASS" : "FAIL", [...ev,
+    `断言：主路径真实 toolCallId=${isRealCallId}；目标 persona 跑成=${hit.dirOk && child.status === "succeeded"}；`
+    + `D5-b 花名册带 id=${rosterInPrompt} 且不翻磁盘=${noLookup}；D6 群上下文=${d6Persona && d6History && d6ParentReply}+workPackage=${d6Work}；`
+    + `D5-a 名字形式解析=${d5aOk === null ? "未复现（模型没只写名字）" : d5aOk}；D4 无噪音=${d4}`]);
+}
+
+/** 本群任意父 Task 的 outbox 里是否出现过真实 toolCallId（用来区分 FAIL 与 BLOCKED）。 */
+const outboxHasRealCallId = (roomId) => roomTasks(roomId).some((t) =>
+  store.getOutbox(t.id).some((o) => /^call[_-]/.test(String(o.source_tool_call_id))));
+
+/**
+ * D4：正文里的代码记号（@ts-ignore / @types/node / @media）不该被当成"群里没这个成员"。
+ * 只数由这些记号引起的【提及解析】噪音，别的未解析名字（例如模型自己写的 @用户）不计。
+ */
+async function assertD4(base, h, eng, ev, deadline) {
+  const left = () => Math.max(1000, deadline - Date.now());
+  // a) 用户路径（确定性，不赌模型）：真实提及 + 代码记号必须 201，不能因 @ts-ignore 被拒。
+  const codeMsg = `@${eng.name} 只回复一行，内容原样写成：先给 @ts-ignore 和 @types/node 这两处加豁免，@media 断点保持不动。不要用任何工具。${SAY}`;
+  const d4a = await post(base, h.id, codeMsg);
+  const d4aOk = d4a.status === 201;
+  ev.push(`【D4a】含 @ts-ignore / @types/node / @media 且带一个真实提及的用户消息 → HTTP ${d4a.status}`
+    + `（必须 201；实际 code=${d4a.body.code ?? "-"}，tasks=${(d4a.body.tasks ?? []).length} 个）`);
+  // b) 反证（防止修复过头）：整条消息只有一个真不存在的提及时，必须仍是 400/UNKNOWN_MENTION。
+  //    注意不能混着真实提及写 —— 有任一可解析目标时平台按设计 201（未知的那个忽略）。
+  const d4b = await post(base, h.id, `@根本不存在的人名 单独看下这个需求。`);
+  const d4bOk = d4b.status === 400 && d4b.body.code === "UNKNOWN_MENTION";
+  ev.push(`【D4b 反证】只含真·未知提及的消息 → HTTP ${d4b.status} code=${d4b.body.code ?? "-"} names=${JSON.stringify(d4b.body.names ?? [])}`
+    + `（必须 400/UNKNOWN_MENTION，否则修复过头把未知提及检测关掉了：${d4bOk}）`);
+
+  // c) agent 正文路径：这一条依赖模型是否照抄，只作补充证据，不作为唯一判据。
+  const before = new Set(rooms.listMessages(h.id).filter((m) => m.authorKind === "system").map((m) => m.id));
+  await settleRoom(h.id, left());
+  const reply = msgsOf(h.id, "agent", eng.id).at(-1);
+  const carried = !!reply && /@ts-ignore|@types|@media/.test(reply.content);
+  // D5-a 之后主路径的拒绝换了标签【交接校验】，所以噪音必须同时看两种标签，
+  // 否则代码记号只是换了个标签冒出来，也会被当成"修好了"。
+  const fresh = rooms.listMessages(h.id)
+    .filter((m) => m.authorKind === "system" && !before.has(m.id)
+      && (m.content.includes("【提及解析】") || m.content.includes("【交接校验】")));
+  const codeNoise = fresh.filter((m) => ["@ts-ignore", "@types", "@media"].some((t) => m.content.includes(t)));
+  ev.push(`【D4c】${eng.name} 真实回复：${clip(reply?.content, 220) || "（无）"}｜回复里确实带着代码记号=${carried}`);
+  ev.push(`【D4c】本轮新增【提及解析】/【交接校验】系统消息 ${fresh.length} 条，其中由代码记号引起 ${codeNoise.length} 条（必须 0）`);
+  if (codeNoise.length) ev.push(`【D4c】噪音原文：${codeNoise.map((m) => clip(m.content, 200)).join(" | ")}`);
+  return d4aOk && d4bOk && codeNoise.length === 0;
+}
+// ===== 4. A→B→A 循环被阻断 ================================================
+async function item4(base) {
+  const ev = [];
+  const title = "人为制造 A→B→A，循环被阻断（真实模型）";
+  const deadline = Date.now() + ITEM_MS;
+  const left = () => Math.max(1000, deadline - Date.now());
+  const h = await importRoom(base, "i10-item4");
+  if (h.error) return failFast("4", title, `导入失败：${h.error}`);
+  const a = byRole(h, "架构师"), b = byRole(h, "工程师");
+  if (!a || !b) return failFast("4", title, `缺 架构师/工程师：${h.agents.map((x) => x.role).join(",")}`);
+  store.db.prepare("UPDATE chat_rooms SET rules = rules || ? WHERE id = ?").run(
+    `\n\n## 流程乒乓测试规则（人为制造回边）\n- 你是${a.name}时：每次发言必须在你要发到群里的那句话里 @${b.name} 一次，只说一句话。\n`
+    + `- 你是${b.name}时：收到 ${a.name} 的 @ 后，必须在你要发到群里的那句话里立刻回 @${a.name} 一次，只说一句话，不要再 @ 别人。\n`
+    + `- 所有人：summary 会被原样发回群里，所以 @ 必须写在 summary 里；不许使用工具，不许写文件。\n`, h.id);
+  ev.push(`A=${a.name}（${a.role}）、B=${b.name}（${b.role}）；chat_rooms.max_rounds=${rooms.getRoom(h.id).maxRounds}`);
+  ev.push(`乒乓规则已写进 chat_rooms.rules（会以「# 群规则」注入每次触发的 prompt）`);
+
+  const r1 = await post(base, h.id, `@${a.name} 请按群里的「流程乒乓测试规则」开始，只说一句话。${SAY}`);
+  ev.push(`turn1 HTTP ${r1.status} tasks=${(r1.body.tasks ?? []).map((t) => t.id.slice(0, 13)).join(",") || "-"} blocked=${JSON.stringify(r1.body.blocked ?? [])}`);
+  await settleRoom(h.id, left());
+  let loop = sysMsgs(h.id, "【流程守卫·循环】");
+  let backEdge = !!msgsOf(h.id, "agent", b.id).at(-1)?.content.includes(`@${a.name}`);
+  ev.push(`第一轮：回边=${backEdge}，循环系统消息=${loop.length} 条`);
+
+  if (!backEdge && loop.length === 0 && Date.now() + 120_000 < deadline) {
+    ev.push(`模型没形成回边，再试一次（用户消息会按 AC4.2/AC5.3 重置本轮，这是设计行为）。`);
+    const r2 = await post(base, h.id,
+      `@${a.name} 严格按「流程乒乓测试规则」再来一轮：你这句话里必须 @${b.name}，${b.name} 收到后必须回 @${a.name}。每人只说一句话。${SAY}`);
+    ev.push(`turn2 HTTP ${r2.status}`);
+    await settleRoom(h.id, left());
+    loop = sysMsgs(h.id, "【流程守卫·循环】");
+    backEdge = !!msgsOf(h.id, "agent", b.id).at(-1)?.content.includes(`@${a.name}`);
+    ev.push(`第二轮：回边=${backEdge}，循环系统消息=${loop.length} 条`);
+  }
+
+  dumpTasks(ev, h.id);
+  dumpStream(ev, h.id);
+  const st = rooms.getState(h.id);
+  // 只看最后一个用户轮次（用户消息与其 Task 同一个 now 写入），否则两次尝试会累加计数。
+  const lastUser = rooms.listMessages(h.id).filter((m) => m.authorKind === "user").at(-1);
+  const turn = roomTasks(h.id).filter((t) => t.createdAt >= lastUser.createdAt);
+  const turnMsgs = rooms.listMessages(h.id).filter((m) => m.seq >= lastUser.seq);
+  const aTriggers = turn.filter((t) => t.memberId === a.id).length;
+  const dupInChain = new Set(st.chain).size !== st.chain.length;
+  const bMsg = turnMsgs.filter((m) => m.authorKind === "agent" && m.authorAgentId === b.id).at(-1);
+  backEdge = !!bMsg && bMsg.content.includes(`@${a.name}`);
+  ev.push(`最后一个用户轮次起点：msg seq=${lastUser.seq} created_at=${new Date(lastUser.createdAt).toISOString()}；该轮 Task 数=${turn.length}`);
+  ev.push(`room_state：chain=${JSON.stringify(st.chain)}（${st.chain.map(agentName).join(" → ")}）round_count=${st.roundCount} terminated=${st.terminated}`);
+  ev.push(`【流程守卫·循环】系统消息：${loop.map((m) => `[seq ${m.seq}] ${clip(m.content, 260)}`).join(" | ") || "（无）"}`);
+  ev.push(`chain 中是否有重复 id：${dupInChain}`);
+  ev.push(`本轮 ${a.name} 被建了几个 Task：${aTriggers}（第二次触发不得产生 Task → 必须恰为 1）`);
+  ev.push(`本轮 ${b.name} 进群原文（回边是否成立）：${clip(bMsg?.content, 300) || `（本轮 ${b.name} 没发言）`}`);
+
+  if (!backEdge) {
+    ev.push(`结论：真实模型不肯形成回边（B 没有回 @ A）→ 本项在真实模型下没有跑通。`);
+    ev.push(`A→B→A 的阻断目前只有 mock 级证明（packages/orchestrator/src/room-guards.test.ts 的 AC4.1 用例）；本报告不把它算作真实模型通过。`);
+    record("4", title, "BLOCKED", ev);
+  } else {
+    const ok = loop.length > 0 && !dupInChain && aTriggers === 1;
+    if (!ok) ev.push(`回边已成立但守卫观察结果与断言不符：见上面的 chain 与 Task 计数。`);
+    record("4", title, ok ? "PASS" : "FAIL", ev);
+  }
+}
+
+// ===== 5. 轮次上限 → 协调者强制收尾 =======================================
+async function item5(base) {
+  const ev = [];
+  const title = "达到轮次上限 → Coordinator 强制收尾（收尾不计轮次）+ terminated 后阻断";
+  let deadline = Date.now() + ITEM_MS;
+  const left = () => Math.max(1000, deadline - Date.now());
+  const h = await importRoom(base, "i10-item5");
+  if (h.error) return failFast("5", title, `导入失败：${h.error}`);
+  const pm = byRole(h, "产品经理"), qa = byRole(h, "QA工程师");
+  const coord = h.agents.find((x) => x.isCoordinator);
+  if (!pm || !qa || !coord) return failFast("5", title, `缺 产品经理/QA/协调者：${h.agents.map((x) => `${x.name}/${x.role}/coord=${x.isCoordinator}`).join(",")}`);
+  store.db.prepare("UPDATE chat_rooms SET max_rounds = 1 WHERE id = ?").run(h.id);
+  ev.push(`群=${h.id}；AC5.4 按群配置：UPDATE chat_rooms SET max_rounds=1 → 读回 room.maxRounds=${rooms.getRoom(h.id).maxRounds}`);
+  ev.push(`被触发者=${pm.name}；协调者=${coord.name}（${coord.role}）；终止探针=${qa.name}`);
+
+  // 顺便在真实 HTTP 路径上再证一次 D2：用角色名 @产品经理 触发（不是人名）。
+  const r = await post(base, h.id, `@产品经理 用一句话给这个需求定个验收口径。不要使用任何工具。`);
+  ev.push(`turn1 HTTP ${r.status} tasks=${(r.body.tasks ?? []).map((t) => t.id.slice(0, 13)).join(",") || "-"} blocked=${JSON.stringify(r.body.blocked ?? [])}`);
+  const cap = sysMsgs(h.id, "【流程守卫·轮次上限】");
+  ev.push(`轮次上限系统消息（与本轮 Task 同一事务写入）：${cap.map((m) => `[seq ${m.seq}] ${clip(m.content, 280)}`).join(" | ") || "（无）"}`);
+  const wrapRows = store.listTasks(2000).filter((t) => (t.idempotencyKey ?? "").startsWith(`wrapup:${h.id}`));
+  ev.push(`协调者收尾 Task：${wrapRows.map((t) => `${taskLine(t)} status=${t.status}`).join(" | ") || "（无）"}`);
+  ev.push(`收尾 Task 的 prompt 尾部（平台强制指令，逐字）：${clip((wrapRows[0]?.prompt ?? "").slice(-400), 400)}`);
+  const roundsAtCap = rooms.getState(h.id).roundCount;
+  ev.push(`触发后 room_state.round_count=${roundsAtCap}（产品经理那一轮，1/1 顶到上限）`);
+
+  await settleRoom(h.id, left());
+  const state1 = rooms.getState(h.id);
+  const wrap = wrapRows[0] ? store.getTask(wrapRows[0].id) : null;
+  const coordMsg = msgsOf(h.id, "agent", coord.id).at(-1);
+  dumpTasks(ev, h.id);
+  // 收尾 Task 没跑成时必须说清为什么：模型原始输出、每次 Attempt 的错误、真实工具调用。
+  if (wrap && wrap.status !== "succeeded") {
+    ev.push(`收尾 Task 诊断：status=${wrap.status} attempts=${wrap.batchAttempts} error=${clip(wrap.error, 260)}`);
+    for (const a of store.getAttempts(wrap.id)) ev.push(`  · Attempt#${a.sequence} status=${a.status} fence=${a.fencingToken} error=${clip(a.error, 200)}`);
+    ev.push(`  · 模型真实工具调用：${toolCallsOf(wrap.id).length ? toolCallsOf(wrap.id).join(" ; ") : "（无）"}`);
+    ev.push(`  · 模型原始输出（room_messages/tasks.error/events 任一处）：${clip(modelText(wrap.id), 700) || "（空）"}`);
+    const usage = store.getUsage(wrap.id);
+    ev.push(`  · 该 Task 的 usage：${usage.length ? usage.map((u) => `${u.provider}/${u.model} tokens=${u.totalTokens}`).join(" | ") : "（无 usage 行）"}`);
+  }
+  ev.push(`协调者真实收尾原文（room_messages.author=${coord.name}）：${clip(coordMsg?.content, 400) || "（无回复）"}`);
+  ev.push(`Q40 语义验证（收尾 Task 不占轮次）：收尾前 round_count=${roundsAtCap} → 协调者跑完后 round_count=${state1.roundCount}`);
+  const wrapNotCharged = state1.roundCount === roundsAtCap;
+  const ended = !!coordMsg && coordMsg.content.includes("[讨论结束]");
+  const termSys = sysMsgs(h.id, "【流程守卫·终止】");
+  ev.push(`终止系统消息：${termSys.map((m) => `[seq ${m.seq}] ${clip(m.content, 260)}`).join(" | ") || "（无）"}`);
+
+  const recheck = new RoomStore(DB); // AC6.4：terminated 落盘，新连接读同一文件
+  const persisted = recheck.getState(h.id);
+  recheck.close();
+  ev.push(`新 RoomStore 句柄重读 room_state：terminated=${persisted.terminated} round_count=${persisted.roundCount} chain=${JSON.stringify(persisted.chain)}`);
+
+  // 真实阻断探针：播一个仍在飞的 agent Task（等价于 terminate 之前已排队的交接），
+  // 它的回复要求 @ 别人 → worker 的 planRoomGuards 应按 TERMINATED 拒绝。
+  let probe = "探针未跑";
+  let blockedOk = false;
+  if (!persisted.terminated) {
+    probe = "room 未进入 terminated，无从验证阻断";
+  } else if (Date.now() + 90_000 > deadline) {
+    probe = `单项 ${ITEM_MS / 1000}s 预算不足，探针未跑`;
+  } else {
+    for (let tryNo = 1; tryNo <= 2 && !blockedOk; tryNo += 1) {
+      if (Date.now() + 90_000 > deadline) { probe = `时间预算不足，探针第 ${tryNo} 次未跑`; break; }
+      const hist = rooms.listMessages(h.id);
+      const prompt = `${buildRoomPrompt(rooms.getRoom(h.id), qa, rooms.listAgents(h.id), hist)}`
+        + `\n\n平台补充：请把下面这句话原样作为你的 summary 输出，一个字都别改，也不要使用任何工具：\n已记录，请 @${pm.name} 复核。${SAY}`;
+      const seeded = store.createTask({
+        tenantId: "i10", projectId: "i10-item5", memberId: qa.id, workspacePath: WS,
+        agentDir: qa.agentDir, prompt, groupId: h.id, model: MODEL,
+        idempotencyKey: `i10-5-probe:${h.id}:${hex(4)}`,
+      });
+      ev.push(`探针 ${tryNo}：播入在飞 Task（模拟终止前已排队的交接）${taskLine(seeded)}`);
+      const pmBefore = roomTasks(h.id).filter((t) => t.memberId === pm.id).length;
+      deadline = Math.max(deadline, Date.now() + 90_000);
+      await settleRoom(h.id, left());
+      const termBlocks = sysMsgs(h.id, "【流程守卫·已终止】");
+      const pmAfter = roomTasks(h.id).filter((t) => t.memberId === pm.id).length;
+      const qaTask = roomTasks(h.id).find((t) => t.id === seeded.id);
+      ev.push(`探针 ${tryNo}：${qa.name} 进群原文=${clip(msgsOf(h.id, "agent", qa.id).at(-1)?.content, 300) || "（无）"}；task.status=${qaTask?.status}`);
+      ev.push(`探针 ${tryNo}：已终止系统消息=${termBlocks.map((m) => `[seq ${m.seq}] ${clip(m.content, 260)}`).join(" | ") || "（无）"}`);
+      ev.push(`探针 ${tryNo}：${pm.name} 的 Task 数 ${pmBefore} → ${pmAfter}（新触发被阻断则不变）`);
+      blockedOk = termBlocks.length > 0 && pmAfter === pmBefore;
+      probe = blockedOk
+        ? `真实 worker 在 terminated 之后拒绝了 ${qa.name} 发起的触发（探针 ${tryNo}）`
+        : `探针 ${tryNo} 未观察到阻断（见上面原文/计数）`;
+    }
+  }
+
+  dumpStream(ev, h.id);
+  ev.push(`探针结论：${probe}`);
+  const ok = cap.length > 0 && !!wrap && wrap.status === "succeeded" && wrapNotCharged
+    && ended && persisted.terminated && blockedOk;
+  record("5", title, ok ? "PASS" : "FAIL", ev);
+}
+
+// ===== 6. 杀 Worker 重启，无重复计费 ======================================
+async function item6(base, main) {
+  const ev = [];
+  const title = "杀掉 Worker 进程后重启：未完成 Task 继续执行，无重复计费";
+  const deadline = Date.now() + ITEM_MS;
+  const left = () => Math.max(1000, deadline - Date.now());
+  const h = await importRoom(base, "i10-item6");
+  if (h.error) return failFast("6", title, `导入失败：${h.error}`);
+  const pm = byRole(h, "产品经理");
+  if (!pm) return failFast("6", title, `缺产品经理：${h.agents.map((x) => x.role).join(",")}`);
+  store.db.prepare("UPDATE chat_rooms SET rules = rules || ? WHERE id = ?").run(
+    "\n\n## 崩溃恢复测试规则\n- 被 @ 的成员必须先用写文件工具在工作区依次创建 crash/1.md … crash/3.md 共 3 个文件，"
+    + "每个文件写两三句关于「需求拆解」的要点，全部写完（3 个都写完）之后才在 summary 里汇总这 3 个文件路径，并用 outcome=success。\n", h.id);
+  ev.push(`群=${h.id}；任务设计：让 ${pm.name} 真实调用写文件工具 3 次（persona cwd=${rel(pm.agentDir)}），制造可杀的长任务窗口`);
+
+  const r = await post(base, h.id,
+    `@${pm.name} 严格按群里的「崩溃恢复测试规则」执行：依次创建 3 个文件 crash/1.md、crash/2.md、crash/3.md，`
+    + `每个文件写两三句要点，三个文件全部写完后才在 summary 里汇总它们的路径。请一个一个来，不要跳过写文件，`
+    + `也不要在文件还没写完时就宣布完成。`);
+  const taskId = r.body.tasks?.[0]?.id ?? null;
+  ev.push(`HTTP ${r.status}；目标任务=${taskId}`);
+  if (!taskId) return failFast("6", title, `trigger 没建出 Task：${clip(JSON.stringify(r.body), 200)}`);
+
+  // worker#1 = 前面几项一直在用的那个真进程 worker。
+  const w1 = main;
+  const claimed = await waitFor(() => {
+    const t = store.getTask(taskId);
+    if (!t?.activeAttemptId) return null;
+    const a = store.getAttempt(t.activeAttemptId);
+    if (!a || a.status !== "running") return null;
+    // 等到 usage 行里真的出现了非零 token 再杀：否则"杀前总数"是 0，
+    // 后面"被取代的 Attempt 数字不再增长"这条断言就没有任何区分力。
+    const rows = store.getUsage(taskId).filter((u) => u.attemptId === a.id && u.totalTokens > 0);
+    if (rows.length === 0) return null;
+    return a;
+  }, left(), 500);
+  if (!claimed) {
+    ev.push(`杀之前没等到 running + 非零 usage 的 Attempt：task.status=${store.getTask(taskId).status}；`
+      + `worker#1 pid=${w1.pid} exit=${JSON.stringify(w1.exit)}；usage=${JSON.stringify(store.getUsage(taskId))}`);
+    ev.push(`worker#1 日志尾部：${tail(w1.logFile)}`);
+    record("6", title, "BLOCKED", ev);
+    return;
+  }
+  const a1 = claimed;
+  const psLine = (() => { try { return execFileSync("ps", ["-o", "pid=,ppid=,etime=,command=", "-p", String(w1.pid)], { encoding: "utf8" }); } catch { return "(ps 不可用)"; } })();
+  let kids = [];
+  try { kids = execFileSync("pgrep", ["-P", String(w1.pid)], { encoding: "utf8" }).trim().split("\n").filter(Boolean); } catch { /* 没有子进程 */ }
+  ev.push(`worker#1 = 真独立进程 pid=${w1.pid}，ps: ${clip(psLine, 150)}`);
+  ev.push(`worker#1 的直接子进程：${kids.join(", ") || "（未探到；pi 由 bundle 再派生一层）"}`);
+  ev.push(`杀前：Attempt id=${a1.id.slice(0, 13)} sequence=${a1.sequence} status=${a1.status} fencing=${a1.fencingToken} worker=${clip(a1.workerId, 28)} lease_expires_at=${new Date(a1.leaseExpiresAt).toISOString()}`);
+  const before = store.getUsage(taskId);
+  const totalBefore = before.reduce((s, u) => s + u.totalTokens, 0);
+  const a1Before = before.filter((u) => u.attemptId === a1.id).reduce((s, u) => s + u.totalTokens, 0);
+  ev.push(`杀前 usage 行（getUsage(taskId)）：${before.map((u) => `${u.attemptId.slice(0, 11)}/${u.provider}/${u.model}=tokens ${u.totalTokens} cost ${u.totalCost.toFixed(6)}`).join(" | ") || "（无）"}`);
+  ev.push(`杀前 token 总数 A=${totalBefore}（其中 Attempt#${a1.sequence} = ${a1Before}）`);
+
+  const via = killWorker(w1);
+  const gone = await waitFor(() => (w1.exit ?? (alive(w1.pid) ? null : { synthetic: true })), 10_000, 200);
+  ev.push(`${via} → worker#1 退出记录=${JSON.stringify(gone)}；pid=${w1.pid} 现在存活=${alive(w1.pid)}`);
+  const mid = store.getTask(taskId);
+  ev.push(`杀后立刻读：task.status=${mid.status} active_attempt=${mid.activeAttemptId?.slice(0, 11) ?? "无"} attempts=${store.getAttempts(taskId).map((x) => `#${x.sequence}/${x.status}`).join(",")}`);
+
+  const w2 = spawnWorker(`resume-${hex(3)}`);
+  ev.push(`worker#2 pid=${w2.pid} 重启，同一个 SQLite=${rel(DB)}（租约 30s、心跳 ≤10s 续租；过期后 recoverExpired 才接管，Q37 接管另加 4–6s 退避 —— 等不到不是卡死）`);
+  const orphaned = await waitFor(() => {
+    const a = store.getAttempt(a1.id);
+    return a.status === "orphaned" ? a : null;
+  }, left(), 1000);
+  if (!orphaned) {
+    const t = store.getTask(taskId);
+    ev.push(`等接管超时：task.status=${t.status}；attempts=${store.getAttempts(taskId).map((x) => `#${x.sequence}/${x.status}/lease ${new Date(x.leaseExpiresAt).toISOString()}`).join(",")}`);
+    ev.push(`worker#2 日志尾部：${tail(w2.logFile)}`);
+    record("6", title, "BLOCKED", ev);
+    return;
+  }
+  const afterOrphan = store.getTask(taskId);
+  ev.push(`接管：Attempt#${orphaned.sequence} status=${orphaned.status} error=${clip(orphaned.error, 180)}`);
+  ev.push(`接管后 task.status=${afterOrphan.status} batch_attempts=${afterOrphan.batchAttempts} fencing_token=${afterOrphan.fencingToken}（fencing +1 → 旧 Attempt 的迟到写入会被拒）`);
+  if (afterOrphan.status === "blocked") {
+    ev.push(`接管判定 blocked：被杀时确有未见底的工具调用 → Q18/Q21「未知副作用需人工确认」的真实行为。走真实 API POST /api/tasks/:id/confirm 继续。`);
+    const c = await fetch(`${base}/api/tasks/${taskId}/confirm`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ note: "I10 验收：杀进程实验；工作区重复写入可覆盖，确认继续" }),
+    });
+    ev.push(`confirm → HTTP ${c.status}；task.status=${store.getTask(taskId).status}`);
+  }
+
+  const finished = await waitFor(() => {
+    const t = store.getTask(taskId);
+    return TERMINAL.has(t.status) ? t : null;
+  }, left(), 1000);
+  const final = store.getTask(taskId);
+  const attempts = store.getAttempts(taskId);
+  const usageAll = store.getUsage(taskId);
+  const totalAfter = usageAll.reduce((s, u) => s + u.totalTokens, 0);
+  const a1After = usageAll.filter((u) => u.attemptId === a1.id).reduce((s, u) => s + u.totalTokens, 0);
+  ev.push(`最终：task.status=${final.status}（等待器${finished ? "命中" : "超时"}）`);
+  ev.push(`Attempt 序列：${attempts.map((x) => `#${x.sequence} status=${x.status} fence=${x.fencingToken} worker=${clip(x.workerId, 24)}`).join(" | ")}`);
+  ev.push(`最终 result.summary：${clip(final.result?.summary, 300) || `（无 result；error=${clip(final.error, 200)}）`}`);
+  dumpTasks(ev, h.id);
+  const replyCount = msgsOf(h.id, "agent", pm.id).length;
+  ev.push(`${pm.name} 在群里说了几次（重放不得让它说两遍，Q39 幂等）：${replyCount}；内容=${clip(msgsOf(h.id, "agent", pm.id).at(-1)?.content, 260)}`);
+  ev.push(`杀前/杀后 token 总数：A=${totalBefore} → B=${totalAfter}`);
+  ev.push(`被杀的 Attempt#${a1.sequence}：杀前=${a1Before} → 杀后=${a1After}（迟到写入被 fencing 拒 → 必须不变：${a1After === a1Before}）`);
+  ev.push(`杀后 usage 行：${usageAll.map((u) => `${u.attemptId.slice(0, 11)}/${u.provider}/${u.model}=tokens ${u.totalTokens} cost ${u.totalCost.toFixed(6)}`).join(" | ")}`);
+
+  // 同一 (attempt, provider, model) 上：N 条累计 usage 事件 → 入库必须等于 MAX，而不是求和。
+  const evs = store.getEvents(taskId, 0, 2000);
+  const per = new Map();
+  for (const e of evs) {
+    if (!e.event.usage) continue;
+    const k = `${e.attemptId}|${e.event.provider ?? "unknown"}|${e.event.model ?? "unknown"}`;
+    const cur = per.get(k) ?? { n: 0, sum: 0, max: 0 };
+    cur.n += 1; cur.sum += e.event.usage.totalTokens; cur.max = Math.max(cur.max, e.event.usage.totalTokens);
+    per.set(k, cur);
+  }
+  for (const [k, v] of per) {
+    const stored = usageAll.find((u) => `${u.attemptId}|${u.provider}|${u.model}` === k);
+    ev.push(`去重核对 (attempt,provider,model)=${k.split("|").map((s) => s.slice(0, 11)).join("/")}：带 usage 的事件 ${v.n} 条 → 朴素求和=${v.sum}，MAX=${v.max}，入库=${stored?.totalTokens ?? "无行"}`);
+  }
+  const dedupOk = per.size > 0 && [...per.entries()].every(([k, v]) => {
+    const stored = usageAll.find((u) => `${u.attemptId}|${u.provider}|${u.model}` === k);
+    return !!stored && stored.totalTokens === v.max;
+  });
+  const rowKeys = usageAll.map((u) => `${u.attemptId}|${u.provider}|${u.model}`);
+  const uniqueRows = new Set(rowKeys).size === rowKeys.length;
+  const replayed = attempts.some((x) => x.sequence > a1.sequence && x.status === "completed");
+  ev.push(`口径说明：重放是真实的第二次运行，所以 B ≥ A 属正常；「无重复计费」指的是同一 Attempt 的累计 usage 只记 MAX（${dedupOk}）、`
+    + `被取代的 Attempt 数字不再增长（${a1After === a1Before}）、usage 主键无重复行（${uniqueRows}）、重放没让 agent 在群里说两遍（回复条数=${replyCount}）。`);
+  const ok = final.status === "succeeded" && orphaned.status === "orphaned" && replayed
+    && a1After === a1Before && dedupOk && uniqueRows && replyCount === 1;
+  record("6", title, ok ? "PASS" : "FAIL", ev);
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+log("=== PRD §6 真实模型验收（I10 / P8 群聊） ===");
+log(`model              : ${MODEL}`);
+log(`provider 配置       : ~/.pi/agent/models.json（内容与凭据一律不读取、不打印）`);
+log(`隔离工作区          : ${WORK}`);
+log(`共享 SQLite         : ${rel(DB)}`);
+log(`模板包              : ${rel(ZIP)}`);
+log(`MTA_RUNTIME         : ${RUNTIME_ENV === undefined ? "未设置 → runtimeFor() 走真实 PiAdapter" : RUNTIME_ENV}`);
+log(`单项硬上限          : ${ITEM_MS / 1000}s；串行执行，不并发打爆 provider`);
+log(`本次只跑第几项       : ${ONLY.join(",") || "1-6"}`);
+
+const { base, app } = await startServer();
+log(`真实服务端          : ${base}（buildApp + /api/rooms + /api/tasks + /api/pi）`);
+log(`同库同句柄          : RoomStore.db === ExecutionStore.db → ${rooms.db === store.db}`);
+const MAIN = spawnWorker(`main-${hex(3)}`);
+log(`真实 durable worker : 独立进程 pid=${MAIN.pid}（${rel(WORKER_ENTRY)}，MTA_DB_PATH=${rel(DB)}）`);
+
+const suite = [[1, () => item1(base)], [2, () => item2(base)], [3, () => item3(base)],
+  [4, () => item4(base)], [5, () => item5(base)], [6, () => item6(base, MAIN)]].filter(([n]) => want(n));
+
+for (const [n, fn] of suite) {
+  const t0 = Date.now();
+  log(`\n──────── item ${n} 开始（真实模型 ${MODEL}）────────`);
+  try { await fn(); }
+  catch (err) {
+    const msg = err instanceof Error ? `${err.message} @ ${String(err.stack).split("\n")[1]?.trim() ?? ""}` : String(err);
+    record(String(n), `item ${n}`, "FAIL", [`脚本自身异常（不代表被测系统）：${msg}`]);
+  }
+  log(`──────── item ${n} 结束，用时 ${((Date.now() - t0) / 1000).toFixed(1)}s ────────`);
+}
+
+log("\n=== 汇总（每项结论对应上面的证据）===");
+for (const r of results) log(`  ${r.n}. ${String(r.status).padEnd(7)} ${r.title}`);
+const allPass = results.length === 6 && results.every((r) => r.status === "PASS");
+if (results.length !== 6) log(`  注意：本次只跑了 ${results.length}/6 项 → 退出码非 0（MTA_I10_ITEMS=${process.env.MTA_I10_ITEMS ?? ""}）`);
+
+try { await app.close(); } catch { /* ignore */ }
+for (const w of workers) killWorker(w);
+try { store.close(); } catch { /* ignore */ }
+if (process.env.MTA_I10_KEEP === "1") log(`\n产物保留在 ${WORK}`);
+else rmSync(WORK, { recursive: true, force: true });
+log(`退出码 ${allPass ? 0 : 1}（0 仅当六项全部 PASS）`);
+process.exit(allPass ? 0 : 1);

@@ -43,12 +43,23 @@ function emptyUsage() {
   };
 }
 
-export function taskToThreadMetadata(task: TaskRecord, messageCount = 0): PiThreadMetadata {
+export interface TaskThreadFlags {
+  /** Persisted `PiThreadMetadata.archived`. */
+  archived?: boolean;
+  /** Thread-local rename; falls back to the prompt-derived title. */
+  title?: string | null;
+}
+
+export function taskToThreadMetadata(
+  task: TaskRecord,
+  messageCount = 0,
+  flags: TaskThreadFlags = {},
+): PiThreadMetadata {
   return {
     id: task.id,
-    title: task.prompt.slice(0, 80),
+    title: flags.title?.trim() || task.prompt.slice(0, 80),
     workspacePath: task.workspacePath,
-    archived: false,
+    archived: flags.archived ?? false,
     status: threadStatus(task.status),
     retryActive: task.status === "retry_wait",
     runningRunId: task.activeAttemptId ?? undefined,
@@ -108,11 +119,15 @@ export function taskToMessages(task: TaskRecord, events: readonly TaskEventRow[]
   return messages;
 }
 
-export function taskToSnapshot(task: TaskRecord, events: readonly TaskEventRow[]): PiThreadSnapshot {
+export function taskToSnapshot(
+  task: TaskRecord,
+  events: readonly TaskEventRow[],
+  flags: TaskThreadFlags = {},
+): PiThreadSnapshot {
   const messages = taskToMessages(task, events);
   const lastSeq = events.length > 0 ? events[events.length - 1]!.id : 0;
   return {
-    metadata: taskToThreadMetadata(task, messages.length),
+    metadata: taskToThreadMetadata(task, messages.length, flags),
     messages,
     seq: lastSeq,
     ...(task.error ? { lastError: task.error } : {}),

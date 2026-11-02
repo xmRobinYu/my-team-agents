@@ -25,15 +25,23 @@
 - ✅ 完成 I1 ChatRoom 领域模型与持久化（`2efdd93`）
 - ✅ 完成 I2 团队模板包解析与导入（`0f00560`；真实包 `全栈软件研发` 5 个 agent 导入通过）
 - ✅ 完成 飞书多维表格进度投影（`7d0b501`）
-- 🚧 进行中 I3 @提及触发与人格执行
-- ⬜ 未开始 I4 群历史注入 / I5 agent 间派发与去重 / I6 流程守卫 / I7 `/api/pi` 群聊投影 /
-  I8 UI 三栏布局 / I9 技能管理 UI / I10 真实端到端验证
+- ✅ 完成 I3 @提及触发与人格执行（`328dc6c`）
+- ✅ 完成 I4 群历史注入（`bc0f514`）
+- ✅ 完成 I5 agent 间派发与去重（`durable-worker.ts` + `handoff-intent.ts`，Q41）
+- ✅ 完成 I6 流程守卫：循环 / 轮次上限 / 终止（`2c14dde`）
+- ✅ 完成 I7 `/api/pi` 群聊投影（`pi-room-thread.ts` + `pi-room-routes.ts`，Q42）
+- ✅ 完成 I8 UI 三栏布局（`packages/web/src/rooms` + `components/rooms`，Q42）
+- ✅ 完成 I9 技能加载与服务面（`--skill` 注入 + `/api/rooms/:id/agents/:agentId/skills`，Q43；
+  独立的技能管理页面仍未做，见 `docs/architecture.md` §9）
+- ✅ 完成 I10 真实端到端验证（`scripts/prd-acceptance.mjs`，六项 PASS，Q44）
 
 已验证：`rm -rf packages/*/dist && just check` 退出码 0（`just check` = build → typecheck →
 test → verify-cli → test-guardrails → verify-docs → verify-bitable → test-scripts →
-verify-packages，以 `justfile` 定义为准）；`pnpm test` / `just test-no-build` 在无构建产物下
-退出码 0；react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激活 → SSE → idle，
-底层 Task `succeeded`）；`just pi-smoke` 对真实 Pi 验证 agent_settled 与会话续跑。
+verify-packages，以 `justfile` 定义为准）；`just test-no-build` 在无构建产物下退出码 0，
+465 passed / 5 skipped；react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激活 →
+SSE → idle，底层 Task `succeeded`），群 thread 用真实 `createPiHttpClient` + 真实 reducer 验证；
+`just pi-smoke` 对真实 Pi 验证 agent_settled 与会话续跑；
+`node scripts/prd-acceptance.mjs` 在真实模型下跑通 PRD §6 六项（手动门禁，不入 CI）。
 
 > 飞书网络同步依赖本机 lark-cli Keychain。沙箱/自动化环境读不到系统 Keychain 时，
 > `just sync-docs` 会失败（`verify-docs` 离线映射仍通过），需在有权限的交互终端执行。
@@ -76,12 +84,26 @@ verify-packages，以 `justfile` 定义为准）；`pnpm test` / `just test-no-b
 - ✅ ChatRoom 实体：共享消息流 + 成员 + 规则，与 Group（视图）分离（I1，`2efdd93`）；
 - ✅ 团队模板导入：解析 teamagentx 包（room + agents + skills），一键成群（I2，`0f00560`）；
 - ✅ 人格隔离：每个 agent 独立 agentDir（cwd + skills + AGENTS.md）（I2，`template-import.ts`）；
-- 🚧 auto 接力：`handoff_to` 优先 + `@` 文本次路径，按目标去重（I3/I5）；
-- ⬜ 流程守卫：循环检测、轮次上限（默认 5）、`[讨论结束]` 终止，状态持久化（I6）；
-- ⬜ UI：三栏布局 + 多 agent 头像 + `@` 输入 + 成员面板 + 技能管理（I7–I9）；
-- 验收：真实模型下导入 `全栈软件研发` 包并跑通 @提及、接力、守卫与崩溃恢复。
+- ✅ auto 接力：`handoff_to` 优先 + `@` 文本次路径，按目标去重，去重在流程守卫**之前**
+  （I3/I5，`dedupeByOrigin`；见 `CONTEXT.md` Q41）；
+- ✅ 流程守卫：循环检测、轮次上限（默认 5）、`[讨论结束]` 终止，状态持久化（I6，`2c14dde`）；
+- ✅ UI：三栏布局 + 多 agent 头像 + `@` 输入 + 成员面板；群投影为 Pi thread（I7/I8，Q42）；
+  技能的注入与服务面同批完成（I9，Q43）；
+- ⬜ 技能管理页面：清单/安装/卸载 API 与 `--skill` 注入已完成并有门禁；
+  `packages/web` 里独立的技能管理页面未做（I9 剩余部分，见 `docs/architecture.md` §9）；
+- ✅ 验收：PRD §6 六项在**当前代码**上由 `scripts/prd-acceptance.mjs` 真实模型跑通
+  （退出码 0，209.4s；导入 `全栈软件研发`、@提及带身份回复并使用群上下文、
+  `handoff_to` 主路径自动交接 —— 真实 `toolCallId`、花名册带 id 不翻磁盘、
+  子 Task 走完整群注入、名字形式也被解析，A→B→A 阻断、达上限强制收尾、
+  杀 Worker 重启不重复计费）。**两条保留的局限**：
+  ① AC5.2 的超限阻断仍只有 mock 级证明 —— 真实流里出现的后续阻断是
+  `【流程守卫·已终止】`（Q44）；
+  ② 第 5 项"协调者输出 `[讨论结束]`"在真实模型下**实测不稳定** ——
+  同一份代码首跑 FAIL（收尾 Task 三次 Attempt 全失败、未终止），重跑与定稿跑 PASS；
+  六项 PASS 是 r8 这一次的事实，不能据此宣称该项稳定。
+  该门禁需 pi + provider + 网络，手动执行。
 
-PRD：`docs/prd/multi-agent-group-chat.md`；决策：`CONTEXT.md` Q28–Q35。
+PRD：`docs/prd/multi-agent-group-chat.md`；决策：`CONTEXT.md` Q28–Q44。
 
 ### M4 — 职能型数字员工
 
@@ -113,8 +135,8 @@ PRD：`docs/prd/multi-agent-group-chat.md`；决策：`CONTEXT.md` Q28–Q35。
 |---|---|---|
 | codex 结构化输出未确认 | 事件归一化降级为纯文本 | 记为已知缺口，确认后升级解析 |
 | 队列已持久化 | — | M2 已完成：SQLite + 租约 + fencing token |
-| 本机模式无鉴权 | 不能暴露到共享/团队环境 | P7b 发布门槛：鉴权 + 租户隔离 + 审计 |
-| react-pi `agentDir` 全局单例 | 多租户隔离受阻 | UI 经 `/api/pi` 投影连服务端，不直连 supervisor；租户隔离在服务端处理 |
+| 本机模式无鉴权 | 不能暴露到共享/团队环境 | P7b 发布门槛：鉴权 + 租户隔离 + 审计；persona 会话写入已收窄到 `<agentDir>/.pi/sessions`（Q44/D3），但这是"放近"不是沙箱，完整隔离仍属 P7b |
+| react-pi `agentDir` 全局单例 | 多租户隔离受阻 | UI 经 `/api/pi` 投影连服务端，不直连 supervisor；租户隔离在服务端处理。另：`handoff_to` 依赖本仓库自带的 Pi 扩展（显式 `--extension`），扩展文件缺失是**硬错误**而非静默跳过（Q44/D1） |
 | 文档与实现漂移（参考项目已出现） | 规划失真 | 仓库为唯一事实来源，文档由脚本单向覆盖同步飞书 |
 
 ## 协作约定

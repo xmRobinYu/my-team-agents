@@ -1,0 +1,660 @@
+/* ==========================================================================
+   I8：三栏群聊（会话列表 / 群聊区 / 成员面板）
+   纯 CSS，延续 styles.css 的变量与手写风格；无新依赖、无框架。
+   窄屏降级集中在本段末尾的 @media 里（后定义者优先，覆盖上面的三列网格）。
+   ========================================================================== */
+
+/* --------------------------------------------------------------- avatars --- */
+
+.avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1.5px solid var(--border-strong);
+  background: var(--bg-sunken);
+  color: var(--text-soft);
+  flex-shrink: 0;
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+
+.avatar-sm {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+}
+
+.avatar-glyph {
+  font-size: 13px;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.avatar-sm .avatar-glyph {
+  font-size: 10.5px;
+}
+
+.avatar-more {
+  background: var(--bg-sunken);
+  color: var(--text-muted);
+  font: 600 9.5px/1 var(--mono);
+}
+
+.avatar-stack {
+  display: inline-flex;
+  align-items: center;
+}
+
+.avatar-stack .avatar {
+  margin-left: -6px;
+}
+
+.avatar-stack .avatar:first-child {
+  margin-left: 0;
+}
+
+/* ---------------------------------------------------- conversation list --- */
+
+.conversation-panel .card-sub {
+  white-space: nowrap;
+}
+
+.conversation-scroll {
+  max-height: min(58vh, 520px);
+}
+.conversation-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+/* The empty transcript keeps its own height so a room with no messages yet
+   still shows the composer instead of a collapsed card. */
+.empty-thread {
+  margin: auto;
+  padding: 22px 14px;
+  text-align: center;
+  max-width: 420px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: #fbfcfe;
+}
+.conversation-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.conversation-item-sub {
+  font-size: 10.5px;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+/* Kind badges are the AC9.1 discriminator: a group is never mistaken for a
+   single-agent conversation, and the id prefix is the only server-side signal. */
+.kind-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.kind-badge-room {
+  background: var(--accent-soft);
+  border-color: #b8ccf8;
+  color: var(--accent-strong);
+}
+
+.kind-badge-task {
+  background: var(--bg-sunken);
+  border-color: var(--border-strong);
+  color: var(--text-soft);
+}
+
+/* ------------------------------------------------------------ chat area --- */
+
+.room-card {
+  position: relative;
+}
+
+.room-head {
+  flex-wrap: wrap;
+}
+
+.room-head-main {
+  min-width: 0;
+  flex: 1 1 240px;
+}
+
+.room-head-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.room-viewport {
+  padding: 12px 14px 16px;
+  gap: 14px;
+}
+
+/* One turn: avatar + author header, body bubble. Tones are the author KIND,
+   which is exactly what `role` can no longer tell us after projection. */
+.room-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-width: min(78%, 720px);
+  align-self: flex-start;
+}
+
+.room-msg-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.room-msg-author {
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.room-msg-role {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--bg-sunken);
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.room-msg-time {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.room-msg-body {
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+  background: #fff;
+  font-size: 13px;
+  line-height: 1.62;
+  box-shadow: var(--shadow-sm);
+}
+
+.room-msg-body p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.room-msg-task {
+  margin-top: 6px;
+  font-size: 10px;
+}
+
+.room-msg-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* user: the operator's own words — never an agent's avatar, never a colour. */
+.room-msg-user {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.room-msg-user .room-msg-body {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  border-radius: 12px;
+  border-bottom-right-radius: 4px;
+}
+
+/* system: a platform notice. Full width, dashed, no face, no bubble colour —
+   it must not read as somebody speaking (Q40). */
+.room-msg-system {
+  align-self: stretch;
+  max-width: 100%;
+}
+
+.room-msg-system .room-msg-meta {
+  color: var(--text-soft);
+}
+
+.room-msg-system .room-msg-body {
+  border-style: dashed;
+  border-color: #d9c48f;
+  background: #fffdf4;
+  color: #56421a;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  box-shadow: none;
+}
+
+.room-msg-system-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 11px;
+}
+
+/* unknown: the identity could not be read. Neutral, and it says so. */
+.room-msg-unknown .room-msg-body {
+  border-style: dotted;
+  background: #fbfbfd;
+  color: var(--text-soft);
+}
+
+/* ------------------------------------------------------------- composer --- */
+
+.room-composer {
+  position: relative;
+  border-top: 1px solid var(--border);
+  padding: 10px 12px 12px;
+  background: #fbfcfe;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.room-composer-input {
+  min-height: 66px;
+  line-height: 1.55;
+}
+
+.room-composer-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(43, 95, 217, 0.14);
+}
+
+.room-composer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.room-composer-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.room-composer-feedback {
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  border: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.room-composer-warn {
+  border-color: #edd09b;
+  background: var(--warning-soft);
+  color: #6b4700;
+}
+
+.room-composer-danger {
+  border-color: #f3bcb7;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* the `@` popover: anchored above the field, never overflowing the card */
+.mention-popover {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(100% - 4px);
+  z-index: 20;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: #fff;
+  box-shadow: var(--shadow-md);
+}
+
+.mention-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px 7px;
+  border-bottom: 1px dashed var(--border);
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--text-soft);
+}
+
+.mention-head .muted {
+  font-weight: 400;
+  font-size: 10.5px;
+}
+
+.mention-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.mention-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  text-align: left;
+  font-size: 12.5px;
+}
+
+.mention-option:hover,
+.mention-option-active {
+  background: var(--accent-soft);
+}
+
+.mention-option:disabled,
+.mention-option-dup {
+  cursor: not-allowed;
+  opacity: 0.72;
+  background: var(--danger-soft);
+}
+
+.mention-name {
+  font-weight: 650;
+}
+
+.mention-role,
+.mention-glyph {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.mention-empty {
+  padding: 10px 8px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+/* ------------------------------------------------------------ members --- */
+
+.member-panel .card-head {
+  align-items: center;
+}
+
+.member-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: min(44vh, 420px);
+  overflow-y: auto;
+}
+
+.member-item {
+  min-width: 0;
+}
+
+.member-trigger {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: #fcfdff;
+  text-align: left;
+}
+
+.member-trigger:hover {
+  background: #f5f8ff;
+  border-color: var(--border-strong);
+}
+
+.member-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.member-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.member-name {
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.member-role {
+  font-size: 11.5px;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+
+.member-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.member-swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.member-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.room-rules {
+  max-height: 150px;
+  margin-top: 6px;
+}
+
+/* ------------------------------------------------------------- evidence --- */
+
+.evidence-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.thread-alert {
+  padding: 8px 12px 0;
+}
+
+/* ----------------------------------------------------------- responsive ---
+   1) <=1400: 三列等比收窄；
+   2) <=1200: 成员+取证栏换到整行（列表/群聊仍是两列）；
+   3) <=900 : 单列堆叠，左右栏可折叠；折叠后网格只剩群聊一列，绝不横向溢出。
+   `hidden` 属性由 React 控制折叠，CSS 只负责把它从网格中彻底移除。
+   ------------------------------------------------------------------------- */
+
+@media (max-width: 1400px) {
+  .layout {
+    grid-template-columns: minmax(260px, 310px) minmax(380px, 1fr) minmax(330px, 410px);
+  }
+}
+
+.layout-left-collapsed {
+  grid-template-columns: minmax(420px, 1fr) minmax(380px, 470px);
+}
+
+.layout-right-collapsed {
+  grid-template-columns: minmax(280px, 340px) minmax(420px, 1fr);
+}
+
+.layout-left-collapsed.layout-right-collapsed {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.col-left[hidden],
+.col-right[hidden] {
+  display: none !important;
+}
+
+@media (max-width: 1200px) {
+  .layout,
+  .layout-left-collapsed,
+  .layout-right-collapsed {
+    grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+    grid-template-areas:
+      "left center"
+      "right right";
+  }
+
+  .layout-left-collapsed,
+  .layout-right-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "center"
+      "right";
+  }
+
+  .col-left {
+    grid-area: left;
+  }
+
+  .col-center {
+    grid-area: center;
+    position: static;
+  }
+
+  .col-right {
+    grid-area: right;
+  }
+
+  .room-card,
+  .thread-card {
+    height: min(76vh, 660px);
+  }
+
+  .room-msg {
+    max-width: 92%;
+  }
+
+  .conversation-scroll,
+  .member-list {
+    max-height: 240px;
+  }
+}
+
+@media (max-width: 900px) {
+  .layout,
+  .layout-left-collapsed,
+  .layout-right-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "left"
+      "center"
+      "right";
+  }
+
+  .room-card,
+  .thread-card {
+    height: auto;
+    min-height: 480px;
+  }
+
+  .room-viewport {
+    max-height: 46vh;
+  }
+
+  .mention-popover {
+    max-height: 200px;
+  }
+
+  .member-list {
+    max-height: 300px;
+  }
+
+  .room-head-badges {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .room-msg,
+  .room-msg-user {
+    max-width: 100%;
+    align-self: stretch;
+  }
+
+  .room-msg-meta {
+    font-size: 10px;
+  }
+
+  .room-composer-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .room-composer-actions .btn {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .topbar-flags {
+    gap: 4px;
+  }
+}
+
+@media print {
+  .room-composer,
+  .mention-popover,
+  .member-panel,
+  .conversation-panel {
+    display: none;
+  }
+}
