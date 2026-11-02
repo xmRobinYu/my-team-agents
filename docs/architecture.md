@@ -194,10 +194,15 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
 
 1. codex 稳定结构化事件输出未确认 → 归一化按纯文本降级。
 2. 无 eslint → 刻意不提供 `just lint`，避免幻影门禁。
-3. AC5.2 的"超限后不再处理新触发"**只有 mock 级证明**：
-   真实模型跑里 `maxRounds=1` 时收尾不占轮次、协调者随即终止，
-   而判定顺序 `terminated` 优先，所以真实流中观察到的后续阻断是
-   `【流程守卫·已终止】`，不是 `ROUND_CAP`（`CONTEXT.md` Q44）。
+3. AC5.2 的"超限后不再处理新触发"**已在真实模型下直接观察到**（`scripts/prd-acceptance.mjs`
+   第 5 项的独立探针）：`【流程守卫·轮次上限】齐活林：本轮已达轮次上限（1/1），不再处理新的
+   agent 触发`，目标 Task 数为 0。这条探针必须同时满足两个条件才能看到 `ROUND_CAP`，
+   否则会先撞上别的分支 —— 判定顺序是 `terminated → LOOP → ROUND_CAP`（`room-guards.ts:39`）：
+   - **群必须未被终止**：`maxRounds=1` 时收尾不占轮次、协调者随即输出 `[讨论结束]`，`terminated`
+     优先于轮次上限，所以默认构造看到的永远是 `【流程守卫·已终止】`。探针把群的
+     `coordinator_agent_id` 置空（同时验证 Q40 的无协调者回退），`terminated` 因此不会变真。
+   - **目标必须在链外**：目标若已在链内，先命中 `LOOP`，`ROUND_CAP` 轮不到。
+   域外事实：这不是"多写一条断言"，而是原先那条限制的成因本身被证伪了。
 4. I8 三栏 UI 的浏览器验证**做过**（真实 Chromium + CDP，断言的是渲染后的 DOM），
    但脚本**未保留在仓库里**，因此 UI 渲染**没有**可重复的检查；
    `packages/web` 也没有自动化测试（vitest 只收 `packages/**/*.test.ts`）。
