@@ -233,4 +233,12 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
    且判定前先给平台自动重试留出窗口（`retry_wait` 不是终态）。断言条款一个没减。
    另注：worker 队列**串行**（`runOnce` 一次只领一个），于是一次挂住的运行会饿死后续
    所有群的任务 —— 它们全部停在 `queued`，在消息流里看起来与"守卫没生效"一模一样。
-   这是记录的限制，不是遗漏（`CONTEXT.md` Q44）。
+   这是记录的限制，不是遗漏（`CONTEXT.md` Q44）。刻意**不改并发**：并发要同时处理租约
+   续期与 provider 限流，是独立决定；改判定分层已经足够把故障与被测行为分开。
+   现在验收脚本进场先跑 **provider 预检**（一次极小的真实调用），provider 不应答就以
+   退出码 2 结束，而不是让六项各烧满预算换一墙 BLOCKED（`CONTEXT.md` Q45）。
+10. **全局 CLI 靠绝对路径解析，不靠 PATH**。`lark-cli` 与 `pi` 装在装它们时那个 node
+    版本的全局 bin 下，shell 换版本后 PATH 就不含它；原先两处都因此误判 —— 同步脚本报
+    "not found, install it"（其实是 PATH 错配），`pi-smoke.sh` 更直接
+    `SKIP ... exit 0`（门禁没跑却算通过，违背本文件对它的说明）。现在统一走
+    `scripts/resolve-bin.mjs`，缺失一律非零退出。`CONTEXT.md` Q45。

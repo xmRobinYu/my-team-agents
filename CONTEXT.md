@@ -760,6 +760,41 @@ state that lives in SQLite.
   `pnpm vitest run packages/orchestrator packages/server` 为 Test Files 26 passed、
   Tests 395 passed / 2 skipped。
 
+### Q45 — 全局 CLI 的 PATH 错配，与"找不到就跳过"的幻影门禁 (2026-11-04)
+**A**: 需要全局 CLI 的脚本一律经 `scripts/resolve-bin.mjs` 解析**绝对路径**（PATH →
+fnm/nvm/volta/asdf 各版本全局 bin，版本目录按数值降序），并把解析出的目录**前置进
+`process.env.PATH` / `export PATH`**；单二进制覆盖用 `MTA_BIN_<NAME>`。
+`pi-smoke.sh` 的前置缺失改为**非零退出**。验收脚本进场先跑 **provider 预检**
+（一次极小的真实模型调用），预检不过直接退出码 2，不进六项。
+**R**: `spawnSync("lark-cli")` 报 ENOENT，而脚本的错误文案写的是 "install it and run
+`lark-cli auth login`" —— 它把 PATH 错配说成未安装，于是排查从"重装"开始，而重装解决
+不了 PATH。`~/.lark-cli/logs/auth-*.log` 里 cmdline 一直是
+`.../fnm/node-versions/v22.22.1/installation/lib/node_modules/@larksuite/cli/bin/lark-cli`
+（10-30 至 11-03 都在正常写日志），这就是"装了但当前 shell 看不见"的直接证据。
+- **同一个根因命中两个二进制**：`lark-cli`（飞书同步）与 `pi`（真实模型验收）都装在
+  装它们时那个 node 版本（v22.22.1）的全局 bin，而当前 shell 是 v26。`pi` 那条更严重：
+  `pi-smoke.sh` 原来是 `command -v pi || { echo SKIP; exit 0; }` —— 门禁没跑却报通过，
+  而 `AGENTS.md` 明写 "Without these the smoke exits nonzero"。**代码违背文档**，
+  且正是 Enforcement Index 反对的幻影门禁形状。
+- **绝不做 `feishu-cli` 回退**：它是另一个工具（v1.29，`doc`/`bitable` 子命令），
+  与脚本用的 `docs +update` / `base +table-list` 简写语法命令面不兼容；回退只会把
+  "PATH 里没有"换成一条更费解的 "unknown command"。
+- **keychain 的真实状态与先前记录不同**：`~/.lark-cli/config.json` 的
+  `appSecret.source` 仍是 `keychain`，而 `config keychain-downgrade` 写了
+  `master.key.file` 却**没有翻转这个 source**（实测：把文件移走，报错一字不变）。
+  且 `master.key.file`(10-30) 比两个 `.enc`(10-18/10-29)**更新** —— 降级时生成了新主密钥，
+  旧密文用已丢失的旧密钥加密，不可解。user token 已于 2026-05-31 过期。
+  实测本 shell **能**读写系统钥匙串（`config init` 成功落 keychain、
+  `security add-generic-password` 成功），所以先前"沙箱封锁钥匙串"的说法是错的：
+  真相是那个特定条目被删了。飞书同步因此仍需一次真实授权，不是环境问题。
+- **预检的动机是省下整轮误诊**：provider 挂起时六项各烧满单项预算（每项 5 分钟），
+  最后产出一墙 BLOCKED，而"provider 无响应"与"产品缺陷"在那一墙里长得一模一样 ——
+  Q44 记录了我因此错两次。预检把这件事压到 ~2 分钟，且退出码 2 与产品结论（0/1）分开。
+  预检只在本次确实要跑需要模型的项时执行：`MTA_I10_ITEMS=1`（导入验收）不该被
+  provider 状态绑架；`MTA_I10_SKIP_PREFLIGHT=1` 可跳过。
+- 取舍：解析顺序里 PATH 优先于版本目录，所以正常安装不受影响；版本目录按数值降序，
+  避免 `v9` 在字典序上赢过 `v26`。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

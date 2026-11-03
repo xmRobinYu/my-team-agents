@@ -110,6 +110,20 @@ has neither.
 
 ## Important Development Notes
 
+- **Global CLIs are resolved by absolute path, not PATH.** `lark-cli` and `pi` are
+  installed under whichever Node version ran `npm i -g`, so a shell on a different
+  fnm version has a PATH without them. Scripts must call `scripts/resolve-bin.mjs`
+  (`findBin(name)` / `node scripts/resolve-bin.mjs <bin>`) and prepend the resolved
+  directory to PATH so child processes — the worker, and PiAdapter spawning a bare
+  `pi` — see it too. Override one binary with `MTA_BIN_<NAME>`. Never fall back to
+  `feishu-cli`: it is a different tool with an incompatible command surface.
+  A missing prerequisite exits nonzero; `SKIP ... exit 0` is a phantom gate.
+- **`scripts/prd-acceptance.mjs` preflights the provider** (one tiny real model call,
+  `MTA_I10_PREFLIGHT_MS`, skippable with `MTA_I10_SKIP_PREFLIGHT=1`) and exits **2**
+  when it will not answer, before the six items burn their budgets. Exit codes:
+  0 = six PASS, 1 = any FAIL/BLOCKED/incomplete run, 2 = prerequisite broken
+  (pi, provider config, or a hung provider) — 2 is never a product verdict.
+
 - **Rule-file changes need `RULE_CHANGE_REASON`.** It is read from the
   environment, so an `export`ed value persists across later commits and silently
   disables the check. Verify with `env -u RULE_CHANGE_REASON` when testing.

@@ -31,13 +31,16 @@ import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
+
+import { findBin } from "./resolve-bin.mjs";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const MODEL = process.env.PI_SMOKE_MODEL || "airouter/deepseek-v4.1-flash";
 const ZIP = join(ROOT, "ref", "teamagentx-templates", "全栈软件研发-2026-06-03.zip");
 const WORKER_ENTRY = join(ROOT, "packages", "server", "dist", "worker.js");
 const ITEM_MS = Number(process.env.MTA_I10_ITEM_MS || 300_000); // 单项硬上限：5 分钟
+const PREFLIGHT_MS = Number(process.env.MTA_I10_PREFLIGHT_MS || 180_000); // 预检硬上限：3 分钟
 const ONLY = (process.env.MTA_I10_ITEMS || "").split(",").map((s) => s.trim()).filter(Boolean);
 const RUNTIME_ENV = process.env.MTA_RUNTIME;
 
@@ -51,10 +54,22 @@ if (RUNTIME_ENV === "mock") abort("MTA_RUNTIME=mock：本脚本只接受真实 r
 delete process.env.MTA_RUNTIME; // 传给 worker 子进程的 env 也不能带 mock
 if (!existsSync(ZIP)) abort(`找不到模板包：${ZIP}`, "ref/ 是 git-ignored 的只读参考树。");
 if (!existsSync(WORKER_ENTRY)) abort(`找不到真实 worker：${WORKER_ENTRY}`, "先跑 just build。");
-try {
-  execFileSync("pi", ["--version"], { stdio: "pipe", timeout: 20_000 });
-} catch {
+// pi 和 lark-cli 一样：装在装它时那个 node 版本的全局 bin 里。当前 shell 若是别的
+// node 版本（fnm 下很常见），PATH 就不含该目录，于是 `pi` 报"不可用"，而真实原因不是
+// 没装。这里按绝对路径解析，并把它的目录**前置进 PATH** —— 必须改 PATH 而不是只改
+// 本脚本，因为真正 spawn `pi` 的是独立进程的 worker（PiAdapter 用裸 "pi"），
+// 它继承的是 process.env。
+const PI_BIN = findBin("pi");
+if (!PI_BIN) {
   abort("pi 二进制不可用", "npm i -g --ignore-scripts @earendil-works/pi-coding-agent");
+}
+process.env.PATH = `${dirname(PI_BIN)}${delimiter}${process.env.PATH ?? ""}`;
+try {
+  execFileSync(PI_BIN, ["--version"], { stdio: "pipe", timeout: 20_000 });
+} catch (err) {
+  // 这里不能用 clip()：它定义在下面，const 在 TDZ 里，catch 会抛 ReferenceError 而不是干净退出。
+  abort(`pi 无法执行（${PI_BIN}）：${String(err?.message ?? err).slice(0, 160)}`,
+    "npm i -g --ignore-scripts @earendil-works/pi-coding-agent");
 }
 if (!existsSync(join(process.env.HOME || "", ".pi", "agent", "models.json"))) {
   abort("缺少 provider 配置 ~/.pi/agent/models.json");
@@ -186,6 +201,68 @@ const toolCallsOf = (taskId) => {
     .filter((e) => e.event.type === "tool_execution_start" && e.event.toolName)
     .map((e) => `${e.event.toolName}${e.event.args ? `(${clip(JSON.stringify(e.event.args), 120)})` : ""}`);
 };
+/**
+ * 无事件超时（stall watchdog：`durable-worker.ts` 的 `no events for <ms>ms`）是
+ * **provider 挂起**的形状，不是模型「不肯说话」的形状。
+ *
+ * 提到模块作用域是因为两处误诊都源于没把它单独拎出来：
+ *   - r7 的 `status=failed attempts=3` 被我读成"协调者没输出 [讨论结束]"，
+ *     实际是三次 Attempt 各撞一次无事件超时 —— 协调者根本没拿到模型响应；
+ *   - 之后我又把一次饿死读成"预算耗尽"。
+ * 判定分层（FAIL 只留给守卫真的漏放）依赖这个区分，所以每个 item 都必须用同一个。
+ */
+const hungWithoutEvents = (taskId) => taskId
+  ? store.getAttempts(taskId).some((a) => (a.error ?? "").includes("no events for"))
+  : false;
+
+/** 一个 Task 最后一次 Attempt 的错误 —— BLOCKED 的原因必须具名，不能只说"没观察到"。 */
+const lastAttemptError = (taskId) => {
+  if (!taskId) return "";
+  const attempts = store.getAttempts(taskId);
+  const failed = attempts.filter((a) => a.error);
+  return clip((failed.at(-1) ?? attempts.at(-1))?.error ?? "", 160);
+};
+
+/**
+ * 「该看到的证据没看到」的分诊：把基础设施故障、队列饿死、模型不配合和守卫真的
+ * 漏放分开，每个都给具名原因。
+ *
+ * 这个函数存在的理由是两次真实误诊：同一个"没观察到"，我先归因成"模型不肯收尾"，
+ * 又归因成"预算耗尽"，两次都错（真因分别是 provider 无事件超时、串行队列饿死）。
+ * 混成一句"未命中"就会持续产出这种结论，所以判定必须按形状分派，而不是按结果猜。
+ *
+ * 返回 kind：
+ *   hung    provider 无事件超时（stall watchdog）—— 与产品行为无关
+ *   starved 任务停在 queued：worker 被别的在飞 Task 占住，或预算不足没领取
+ *   silent  任务成功但没产出可判定的回复 —— 模型不配合指令
+ *   failed  任务终态是 failed/cancelled/blocked，带上最后一次 Attempt 的错误
+ *   null    任务确实成功且有回复：这里没有"未观察到"要解释
+ */
+const triageUnobserved = (taskId, { hasReply } = {}) => {
+  if (!taskId) return { kind: "absent", why: "没有对应的 Task 可查" };
+  const task = store.getTask(taskId);
+  if (!task) return { kind: "absent", why: "Task 行不存在" };
+  if (hungWithoutEvents(taskId)) {
+    return { kind: "hung", why: `Attempt 撞了无事件超时（provider 挂起）：${lastAttemptError(taskId) || "no events"}` };
+  }
+  if (task.status === "queued" || task.status === "retry_wait") {
+    const inFlight = store.listTasks(2000).filter((t) => t.status === "running");
+    const hung = inFlight.filter((t) => hungWithoutEvents(t.id)).length;
+    return {
+      kind: "starved",
+      why: inFlight.length > 0
+        ? `停在 ${task.status}，而 worker 被 ${inFlight.length} 个在飞 Task 占住（队列串行，一次只领一个）`
+          + `${hung ? `，其中 ${hung} 个已撞无事件超时` : ""} —— 与守卫无关`
+        : `停在 ${task.status} 而 worker 空闲：单项预算不足或未被领取`,
+    };
+  }
+  if (task.status !== "succeeded") {
+    return { kind: "failed", why: `终态=${task.status}：${lastAttemptError(taskId) || "（无错误记录）"}` };
+  }
+  if (!hasReply) return { kind: "silent", why: "任务成功，但群里没有它的发言（模型未按指令产出 summary）" };
+  return null;
+};
+
 /** 提醒模型遵守平台结构化契约：只有 outcome=success 的结构化结果才会被发回群里。 */
 const SAY = `你的最终结构化结果必须用 outcome="success"，并把你要在群里说的话原样放进 summary（失败不会有人看到你的话）。`;
 
@@ -381,18 +458,20 @@ async function item2(base) {
     && (!negArch || negPersonaFiles.length > 0);
 
   dumpStream(ev, h.id);
-  // 架构师的 Task 若根本没轮到跑（provider 挂起 + 串行队列饿死），这里没有关于行为的
-  // 任何证据 —— 报 FAIL 会把基础设施故障写成被测结论，与 item 5 同一分层规则。
-  // archTask 是 settle 之前读的快照，状态必须重读，否则永远是 queued。
-  const archFinal = archTask ? store.getTask(archTask.id) : null;
-  const neverRan = !archMsg || (archFinal && archFinal.status !== "succeeded");
+  // 分层判定（与 item 5 同一规则）：架构师产出了可判定的回复、而断言与观察不符，
+  // 才是真失败；回复根本没到位就先分诊出原因，报 BLOCKED 而不是 FAIL —— 把
+  // provider 挂起或队列饿死写成被测系统的失败，是这里犯过两次的错。
+  // archTask 是 settle 之前读的快照，所以分诊函数按 id 重读，而不是信这份快照。
+  const archTriage = triageUnobserved(archTask?.id, { hasReply: !!archMsg });
+  const unobservable = !!archTriage;
   const ok = usedContext && identityOk && personaOk && pmSaid && negLeaked === false && d2Ok && d3Ok;
-  record("2", title, ok ? "PASS" : neverRan ? "BLOCKED" : "FAIL", [...ev,
+  record("2", title, ok ? "PASS" : unobservable ? "BLOCKED" : "FAIL", [...ev,
     `本项断言：D2 五个角色各唯一命中=${d2Ok}；D3 全局零泄漏且 persona 目录内有会话=${d3Ok}`,
-    ok ? "" : neverRan
-      ? `本项 BLOCKED 的原因：${arch.name} 的 Task 终态=${archFinal?.status ?? "未知"}、`
-        + `${archMsg ? "发言与断言不符" : "群里没有它的发言"} —— 模型没拿到可判定的响应`
-      : "架构师已产出回复，但断言与观察不符 —— 这是真失败"]);
+    ok ? "" : unobservable
+      ? `本项 BLOCKED 的原因（${archTriage.kind}）：${arch.name} 的 Task ${archTriage.why}`
+      : `架构师已产出回复，但断言与观察不符 —— 真失败：引用群上下文=${usedContext}、`
+        + `身份正确=${identityOk}、persona 正确=${personaOk}、${pm.name} 有回应=${pmSaid}、`
+        + `阴性对照未泄漏=${negLeaked === false}`]);
 }
 
 // ===== 3. agent 间自动交接 ================================================
@@ -442,6 +521,13 @@ async function item3(base) {
     const outbox = store.getOutbox(parent.id);
     ev.push(`${label}：模型调用的工具=[${names.join(", ") || "无"}]；handoff_to ${handoffs.length} 次`);
     for (const c of handoffs) ev.push(`   · toolCallId=${c.event.toolCallId} args=${clip(JSON.stringify(c.event.args), 320)}`);
+    // 非 handoff 的调用同样必须打印参数：D5-b 判的是"模型没去翻磁盘找 id"，只报一个
+    // 工具名（例如 bash）无法区分"翻花名册失败后的兜底查找"和"与本题无关的一次执行"。
+    // 没有 args 的 FAIL 是不可解读的，而不可解读的结论既不能用来定位缺陷，也不能用来
+    // 证明修复 —— 上一轮就因此卡在第 3 项。
+    for (const c of calls.filter((e) => e.event.toolName !== "handoff_to")) {
+      ev.push(`   · 非交接调用 ${c.event.toolName} args=${clip(JSON.stringify(c.event.args ?? {}), 320)}`);
+    }
     ev.push(`${label}：outbox=${outbox.length ? outbox.map((o) => `source_tool_call_id=${o.source_tool_call_id} target=${o.target_member_id}(${agentName(String(o.target_member_id))})`).join(" | ") : "无"}`);
     return { calls, names, handoffs, outbox };
   };
@@ -687,15 +773,6 @@ async function item5(base) {
   const title = "达到轮次上限 → Coordinator 强制收尾（收尾不计轮次）+ terminated 后阻断";
   let deadline = Date.now() + ITEM_MS;
   const left = () => Math.max(1000, deadline - Date.now());
-  /**
-   * 无事件超时（stall watchdog：`durable-worker.ts` 的 `no events for <ms>ms`）是
-   * provider 挂起的形状，不是模型「不肯说话」的形状。此前我把 r7 的
-   * `status=failed attempts=3` 读成"协调者没输出 [讨论结束]"，那其实是三次 Attempt
-   * 各撞一次无事件超时 —— 协调者根本没拿到模型响应。凡要用到它都单独拎出来。
-   */
-  const hungWithoutEvents = (taskId) => taskId
-    ? store.getAttempts(taskId).some((a) => (a.error ?? "").includes("no events for"))
-    : false;
   const h = await importRoom(base, "i10-item5");
   if (h.error) return failFast("5", title, `导入失败：${h.error}`);
   const pm = byRole(h, "产品经理"), qa = byRole(h, "QA工程师");
@@ -1127,8 +1204,81 @@ log(`同库同句柄          : RoomStore.db === ExecutionStore.db → ${rooms.d
 const MAIN = spawnWorker(`main-${hex(3)}`);
 log(`真实 durable worker : 独立进程 pid=${MAIN.pid}（${rel(WORKER_ENTRY)}，MTA_DB_PATH=${rel(DB)}）`);
 
+/**
+ * 统一收尾。预检中止也必须走这里：worker 是 `detached` 独立进程组，直接
+ * `process.exit` 不会杀它，会留下一个绑在临时 SQLite 上的野进程和一堆 /tmp 产物。
+ * （早于 WORK/store 创建的前置检查用 `abort`，那时没有东西要收。）
+ */
+function teardown(code) {
+  for (const w of workers) killWorker(w);
+  try { store.close(); } catch { /* ignore */ }
+  if (process.env.MTA_I10_KEEP === "1") log(`\n产物保留在 ${WORK}`);
+  else rmSync(WORK, { recursive: true, force: true });
+  process.exit(code);
+}
+
+/** 前置条件不满足（含 provider 不应答）：退出码 2，且必须先把 worker 收掉。 */
+function abortInfra(msg, hint) {
+  console.error(`\nABORT: ${msg}${hint ? `\n  ${hint}` : ""}`);
+  teardown(2);
+}
+
+/**
+ * provider 预检 —— "provider 会挂"的务实解法。
+ *
+ * 实测过的代价：provider 挂起时，六项各自烧满单项预算（每项 5 分钟），最后产出一
+ * 墙 BLOCKED，而且"provider 无响应"和"产品缺陷"在那一墙里长得一模一样 —— 我就是
+ * 这样两次误诊过（r7 三次 Attempt 撞无事件超时被我读成"模型不肯收尾"；一次饿死被
+ * 我读成"预算耗尽"）。
+ *
+ * 所以进场先花一轮极小的真实模型调用验证「模型能应答」：preflight 自己的 Task 在
+ * 预算内成功 → 继续六项；撞无事件超时 / 超预算 → 直接以退出码 2 结束（与"pi 缺失"
+ * 同类：前置条件不满足），并写明这是基础设施故障，不是被测系统结论。
+ *
+ * 不把预检塞进 item 1 的原因：item 1（导入）不需要模型，`MTA_I10_ITEMS=1` 单独跑
+ * 导入验收不该被 provider 状态绑架；预检只在本次确实要跑需要模型的项时执行。
+ */
+async function preflightProvider(base) {
+  const budget = PREFLIGHT_MS;
+  const t0 = Date.now();
+  const h = await importRoom(base, "i10-preflight");
+  if (h.error) abortInfra(`预检导入失败：${h.error}`);
+  const agent = h.agents[0];
+  if (!agent) abortInfra("预检群没有可用 agent");
+  const r = await post(base, h.id, `@${agent.name} 只回一句「就绪」，不要使用任何工具。`);
+  if (r.status >= 400) abortInfra(`预检消息被拒：HTTP ${r.status} ${clip(JSON.stringify(r.body), 240)}`);
+  const taskId = (r.body.tasks ?? [])[0]?.id;
+  if (!taskId) abortInfra("预检没有派发出 Task");
+  for (;;) {
+    const task = store.getTask(taskId);
+    const hung = store.getAttempts(taskId).find((a) => (a.error ?? "").includes("no events for"));
+    if (hung) abortInfra(
+      `provider 预检撞无事件超时（Attempt#${hung.sequence}：${clip(hung.error, 160)}）。`
+      + "这是 provider 挂起，不是被测系统行为 —— stall watchdog 在 provider 无响应时中止该 Attempt，六项都不会产生可判定证据。",
+      `恢复 provider 后重跑；想跳过预检用 MTA_I10_SKIP_PREFLIGHT=1（结论会退化成逐项 BLOCKED）。`,
+    );
+    if (task && TERMINAL.has(task.status)) {
+      if (task.status !== "succeeded") abortInfra(`provider 预检失败：Task 终态=${task.status}，error=${clip(task.error, 200)}`);
+      const text = modelText(taskId);
+      log(`provider 预检通过：${agent.name} 在 ${((Date.now() - t0) / 1000).toFixed(1)}s 内应答「${clip(text, 80)}」`);
+      return;
+    }
+    if (Date.now() - t0 > budget) {
+      const a = store.getAttempts(taskId).at(-1);
+      abortInfra(`provider 预检超时：${budget / 1000}s 内无成功响应（task.status=${task?.status ?? "未知"}，最后一次 Attempt=${a?.status ?? "无"} ${clip(a?.error, 160)}）`);
+    }
+    await sleep(1000);
+  }
+}
+
 const suite = [[1, () => item1(base)], [2, () => item2(base)], [3, () => item3(base)],
   [4, () => item4(base)], [5, () => item5(base)], [6, () => item6(base, MAIN)]].filter(([n]) => want(n));
+
+const needsModel = suite.some(([n]) => n !== 1);
+if (needsModel && process.env.MTA_I10_SKIP_PREFLIGHT !== "1") {
+  log("── provider 预检：进场先证一次「真实模型能应答」（MTA_I10_SKIP_PREFLIGHT=1 可跳过）──");
+  await preflightProvider(base);
+}
 
 for (const [n, fn] of suite) {
   const t0 = Date.now();
@@ -1147,9 +1297,5 @@ const allPass = results.length === 6 && results.every((r) => r.status === "PASS"
 if (results.length !== 6) log(`  注意：本次只跑了 ${results.length}/6 项 → 退出码非 0（MTA_I10_ITEMS=${process.env.MTA_I10_ITEMS ?? ""}）`);
 
 try { await app.close(); } catch { /* ignore */ }
-for (const w of workers) killWorker(w);
-try { store.close(); } catch { /* ignore */ }
-if (process.env.MTA_I10_KEEP === "1") log(`\n产物保留在 ${WORK}`);
-else rmSync(WORK, { recursive: true, force: true });
-log(`退出码 ${allPass ? 0 : 1}（0 仅当六项全部 PASS）`);
-process.exit(allPass ? 0 : 1);
+log(`退出码 ${allPass ? 0 : 1}（0 仅当六项全部 PASS；2 表示前置条件不满足，不是产品结论）`);
+teardown(allPass ? 0 : 1);

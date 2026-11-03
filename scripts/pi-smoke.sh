@@ -14,10 +14,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE="$(mktemp -d)"
 trap 'rm -rf "$WORKSPACE"' EXIT
 
-command -v pi >/dev/null || { echo "SKIP: pi binary not installed"; exit 0; }
+# `pi` is installed under whichever Node version ran `npm i -g` at the time, so a
+# shell on a different fnm version has a PATH without it. The old line treated that
+# as "not installed" and exited 0 -- a gate that ran nothing but reported success,
+# which is exactly what AGENTS.md forbids. Resolve the absolute path instead, and
+# fail loudly when it truly is absent.
+PI_BIN="$(node "$ROOT/scripts/resolve-bin.mjs" pi 2>/dev/null || true)"
+if [ -z "$PI_BIN" ]; then
+  echo "FAIL: pi binary not found (PATH plus every version-manager global bin was probed)" >&2
+  echo "      npm i -g --ignore-scripts @earendil-works/pi-coding-agent" >&2
+  exit 1
+fi
+# PiAdapter spawns a bare "pi", and the smoke scripts inherit this environment, so
+# the resolved directory must be on PATH for the child processes too.
+export PATH="$(dirname "$PI_BIN"):$PATH"
 
 MODEL="${PI_SMOKE_MODEL:-airouter/deepseek-v4.1-flash}"
 echo "== pi real smoke =="
+echo "pi:    $PI_BIN"
 echo "model: $MODEL"
 
 # 1) agent_settled completion + usage + event stream

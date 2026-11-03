@@ -284,17 +284,30 @@ User stories covered: 全部
 在**真实模型**下跑通 PRD §6 全部六项。
 
 ### Acceptance criteria
-- [ ] 导入 `全栈软件研发` 包 → 5 agent 的 ChatRoom
-- [ ] @架构师 → 以自身身份回复，明显使用群上下文
-- [ ] agent 间发生一次自动交接
-- [ ] 人为 A→B→A → 循环被阻断
-- [ ] 达轮次上限 → Coordinator 强制收尾
-- [ ] 杀 Worker 重启 → 未完成 Task 继续执行，无重复计费
-- [ ] `just check` 全绿
+- [x] 导入 `全栈软件研发` 包 → 5 agent 的 ChatRoom
+      —— 5/5 独立 agentDir、5/5 落盘 AGENTS.md、恰好 1 个协调者且与 `chat_rooms.coordinator_agent_id` 一致
+- [x] @架构师 → 以自身身份回复，明显使用群上下文
+      —— 含**阴性对照**：注入历史里没有那句公告时答不出、有时答得出（marker 由脚本 CSPRNG 生成，
+      跑起来之前不在任何磁盘文件里）；`author_agent_id` 与 `agent_dir` 均核对为架构师本人
+- [x] agent 间发生一次自动交接
+      —— 走 `handoff_to` **主路径**：`outbox.source_tool_call_id = call_00_…`（运行时真实
+      toolCallId，不是次路径合成的 `mention:<taskId>`），子 Task `depth=1`、persona 目录正确、`succeeded`
+- [x] 人为 A→B→A → 循环被阻断 —— `【流程守卫·循环】` 系统消息落流，且第二次 A 不建 Task
+- [x] 达轮次上限 → Coordinator 强制收尾
+      —— 含 AC5.2 独立探针：`【流程守卫·轮次上限】…不再处理新的 agent 触发`，目标 Task 数 0
+- [x] 杀 Worker 重启 → 未完成 Task 继续执行，无重复计费
+      —— Attempt#1 `orphaned` → Attempt#2 接管；被取代 Attempt 的 token 数不变（fencing 拒迟到写入）；
+      同一 (attempt,provider,model) 入库 = MAX 而非求和；重放没让 agent 在群里说两遍
+- [x] `just check` 全绿 —— 471 passed / 5 skipped，另有 `just test-scripts` 46 passed
 
 ### Validation
-- Command: `just check`、`just pi-smoke`、真实模型端到端脚本
-- Evidence: 命令退出码 0；脚本输出逐项 PASS
+- Command: `just check`、`just pi-smoke`、`node scripts/prd-acceptance.mjs`
+- Evidence: 三者退出码均为 0；验收脚本逐项打印可核对证据（模型原文、DB 行、worker pid、usage 数字）。
+  退出码语义：0 = 六项全 PASS；1 = 任一 FAIL/BLOCKED 或没跑满六项；**2 = 前置条件不满足**
+  （`pi` 不可用、无 provider 配置、provider 预检不应答），2 永远不是被测系统的结论。
+- 本 issue 的前置修复：`pi` 与 `lark-cli` 装在装它们时那个 node 版本的全局 bin 下，
+  shell 换版本后 PATH 不含它 —— 旧 `pi-smoke.sh` 因此 `SKIP ... exit 0`（门禁没跑却算通过）。
+  现在统一走 `scripts/resolve-bin.mjs`，缺失一律非零退出（`CONTEXT.md` Q45）。
 
 ### Notes
 - 真实模型配置已存在：`~/.pi/agent/models.json`（provider `airouter`）

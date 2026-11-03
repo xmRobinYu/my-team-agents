@@ -29,6 +29,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { findBin, missingBinError } from "./resolve-bin.mjs";
 
 import {
   buildSnapshot,
@@ -50,7 +51,10 @@ const PLACEHOLDER = "PENDING_FIRST_PROVISION";
 /* ------------------------------------------------------------------ lark-cli */
 
 function runLark(args) {
-  const res = spawnSync("lark-cli", args, {
+  const bin = findBin("lark-cli");
+  if (!bin) throw missingBinError("lark-cli");
+
+  const res = spawnSync(bin, args, {
     cwd: ROOT,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
@@ -62,9 +66,6 @@ function runLark(args) {
     },
   });
 
-  if (res.error?.code === "ENOENT") {
-    throw new Error("lark-cli not found on PATH — install it and run `lark-cli auth login`");
-  }
   if (res.error) throw new Error(`lark-cli ${args[1] ?? ""} failed: ${res.error.message}`);
 
   // lark-cli leaves stdout empty and writes the failure JSON to stderr, so both
