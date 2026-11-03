@@ -5,7 +5,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-import { isPlaceholder, placeholderOf, provisioningProblem, validate } from "./sync-feishu-docs.mjs";
+import {
+  createdNodeIds,
+  halfProvisionedNodeToken,
+  isPlaceholder,
+  placeholderOf,
+  validate,
+} from "./sync-feishu-docs.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const SCRIPT = join(ROOT, "scripts", "sync-feishu-docs.mjs");
@@ -169,25 +175,66 @@ test("the live manifest validates with zero problems", () => {
   assert.ok(pending.every((p) => manifest.documents.some((d) => d.source === p.source)));
 });
 
-/* ------------------------------------------------------------ sync rejection */
+/* -------------------------------------------------- node provisioning */
 
-test("syncOne refuses a placeholder entry before calling lark-cli", () => {
-  const SPACE = "7701231058624187646";
-  const msg = provisioningProblem(
-    entry("docs/prd/multi-agent-group-chat.md", "PENDING_FIRST_SYNC", "PENDING_FIRST_SYNC"),
-    SPACE,
+test("createdNodeIds reads the wiki node's two tokens out of every response shape", () => {
+  // A docx wiki node answers with node_token (the wiki entry) and obj_token (the
+  // document that docs +update wants). The CLI nests that under data.node, data,
+  // or the top level depending on the call, so guessing one shape would make
+  // provisioning fail on a successful create.
+  const shapes = [
+    { ok: true, data: { node: { node_token: "N1", obj_token: "D1" } } },
+    { ok: true, node: { node_token: "N2", obj_token: "D2" } },
+    { ok: true, data: { node_token: "N3", obj_token: "D3" } },
+    { ok: true, data: { deep: { nested: { node_token: "N4", obj_token: "D4" } } } },
+  ];
+  for (const [i, res] of shapes.entries()) {
+    const ids = createdNodeIds(res);
+    assert.equal(ids.nodeToken, `N${i + 1}`, `shape ${i} node_token`);
+    assert.equal(ids.documentId, `D${i + 1}`, `shape ${i} obj_token`);
+  }
+});
+
+test("createdNodeIds falls back to document_id and refuses when neither token exists", () => {
+  assert.deepEqual(
+    createdNodeIds({ ok: true, data: { node: { node_token: "N", document_id: "D" } } }),
+    { nodeToken: "N", documentId: "D" },
   );
-  assert.ok(msg);
-  assert.match(msg, /^docs\/prd\/multi-agent-group-chat\.md 的飞书节点尚未开通（node_token=PENDING_FIRST_SYNC）；/);
-  assert.match(msg, /wiki space 7701231058624187646 创建节点/);
-  assert.match(msg, /写回 docs\/feishu-sync\.json，再重跑 just sync-docs$/);
-  // Nothing in the message looks like an auth error, so credential failures stay
-  // distinguishable from "not provisioned yet" in the `just sync-docs` log.
-  assert.doesNotMatch(msg, /auth|keychain|credential|token expired/i);
+  // Returning null (not a half-filled object) is what makes ensureNode say
+  // "created but no ids" instead of writing an empty document_id into the manifest.
+  assert.equal(createdNodeIds({ ok: true, data: { node: { title: "x" } } }), null);
+  assert.equal(createdNodeIds({}), null);
+});
 
-  const missing = provisioningProblem(entry("docs/prd/multi-agent-group-chat-issues.md"), SPACE);
-  assert.equal(missing, null, "real ids must not be refused");
-  assert.equal(provisioningProblem({ source: "AGENTS.md" }, SPACE), null);
+test("every pending manifest entry carries a title, or provisioning cannot name the node", () => {
+  // ensureNode creates the node from `node` (the Feishu title). An entry added with
+  // a placeholder id and no title would fail at sync time with a message about a
+  // missing title — this catches it offline, in the gate that actually runs in CI.
+  // Deliberately no assertion that pending entries EXIST: provisioning is supposed
+  // to drain them, so requiring a non-empty set would fail the day the sync works.
+  const manifest = JSON.parse(readFileSync(join(ROOT, "docs", "feishu-sync.json"), "utf8"));
+  for (const d of manifest.documents) {
+    if (!placeholderOf(d)) continue;
+    assert.ok(
+      typeof d.node === "string" && d.node.trim().length > 0,
+      `${d.source} is pending but has no node title to create`,
+    );
+  }
+});
+
+test("a half-provisioned entry is recognised instead of re-created", () => {
+  // The dangerous state ensureNode's write-back can leave behind: the wiki node
+  // physically exists, only document_id is still a placeholder. Treating that as
+  // "not provisioned" would build a second node for the same document.
+  assert.equal(
+    halfProvisionedNodeToken({ node_token: "GVw5wkAyfibD8pkUJaxcuZWCnUe", document_id: "PENDING_FIRST_SYNC" }),
+    "GVw5wkAyfibD8pkUJaxcuZWCnUe",
+  );
+  // Fully pending must fall through to create; fully ready must not provision at all.
+  assert.equal(halfProvisionedNodeToken({ node_token: "PENDING_FIRST_SYNC", document_id: "PENDING_FIRST_SYNC" }), null);
+  assert.equal(halfProvisionedNodeToken({ node_token: "N", document_id: "D" }), null);
+  assert.equal(halfProvisionedNodeToken({ document_id: "D" }), null);
+  assert.equal(halfProvisionedNodeToken({ node_token: "", document_id: "D" }), null);
 });
 
 test("--check exits 0 and states ready/pending separately", () => {
@@ -198,11 +245,15 @@ test("--check exits 0 and states ready/pending separately", () => {
   assert.equal(res.status, 0, res.stderr);
   const out = res.stdout;
   const listed = out.split("\n").filter((l) => /^  (docs\/|AGENTS\.md|CONTEXT\.md)/.test(l) && !/->/.test(l));
-  // The header must not lie about coverage: every listed source is accounted for,
-  // split into provisioned and pending, whatever the manifest currently holds.
-  const m = /feishu sync mapping OK: (\d+) documents \((\d+) ready, (\d+) pending provisioning\)/.exec(out);
-  assert.ok(m, `unexpected --check header:\n${out}`);
-  const [, total, ready, pend] = m.map(Number);
+  // Both header shapes must satisfy the same invariant. The parenthetical only
+  // appears while something is still pending, and provisioning drains it — so a
+  // regex that demanded it would fail the day the sync finally works.
+  const split = /feishu sync mapping OK: (\d+) documents \((\d+) ready, (\d+) pending provisioning\)/.exec(out);
+  const plain = /feishu sync mapping OK: (\d+) documents, space/.exec(out);
+  assert.ok(split || plain, `unexpected --check header:\n${out}`);
+  const total = Number((split ?? plain)[1]);
+  const pend = split ? Number(split[3]) : 0;
+  const ready = split ? Number(split[2]) : total;
   assert.equal(ready + pend, total, "ready + pending must equal the document count");
   assert.equal(total, listed.length, "every managed source must be listed");
   assert.equal(out.split("\n").filter((l) => /^  PENDING /.test(l)).length, pend);

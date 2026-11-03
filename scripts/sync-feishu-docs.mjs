@@ -14,12 +14,13 @@
  * source is registered. The network sync needs a local `lark-cli` user
  * credential, so it deliberately cannot run in CI. Entries whose ids are still
  * placeholders ("pending provisioning") are counted and listed by --check but do
- * NOT fail it: clearing one means creating the Feishu node first, which no CI run
- * can do. They are refused by the sync path instead, with an actionable message.
+ * NOT fail it: clearing one means creating the Feishu node, which no CI run can do
+ * (it has no credential). The sync path creates the node itself and writes the real
+ * ids back into this manifest, so a pending entry is a to-do, not a manual chore.
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { findBin, missingBinError } from "./resolve-bin.mjs";
@@ -142,42 +143,222 @@ function runLark(args) {
 
   if (res.error) throw new Error(`lark-cli ${args[1] ?? ""} failed: ${res.error.message}`);
 
+  // lark-cli leaves stdout empty on a rejected call and writes the failure JSON to
+  // stderr, so both streams must be considered. Reading only stdout turned real
+  // errors into "non-JSON output" -- exactly the indistinguishable-root-cause
+  // problem this script elsewhere claims to avoid. Same handling as
+  // sync-feishu-bitable.mjs, so one API failure reads the same in both logs.
+  const payload = [res.stdout, res.stderr]
+    .map((x) => (x ?? "").trim())
+    .find((x) => x.startsWith("{") || x.startsWith("["));
+
+  let parsed;
   try {
-    return JSON.parse(res.stdout);
+    parsed = JSON.parse(payload ?? "");
   } catch {
     throw new Error(
-      `lark-cli returned non-JSON output (exit ${res.status}):\n` +
-        (res.stdout || res.stderr || "").slice(0, 800),
+      `lark-cli returned no JSON output (exit ${res.status}):\n` +
+        ((res.stderr || res.stdout || "").trim().slice(0, 800) || "(no output)"),
     );
   }
+  if (parsed.ok === false) {
+    const e = parsed.error ?? {};
+    const credential = e.subtype === "storage" || /keychain|token_missing|need_user_authorization/i.test(String(e.message ?? ""));
+    throw new Error(
+      `lark-cli ${args.slice(0, 2).join(" ")} rejected: ${e.message ?? JSON.stringify(e).slice(0, 400)}` +
+        (credential
+          ? ` — no usable user credential for this profile. Run: lark-cli auth login --profile='<profile>' --domain docs,wiki,drive --recommend`
+          : ""),
+    );
+  }
+  return parsed;
 }
 
 /**
- * Why this entry cannot be synced yet, or null when its ids are real.
- * Kept separate from syncOne so it is testable without touching lark-cli.
+ * Extract the ids a created wiki node must give back, or null when the response
+ * carries neither token. Pure so the parse is testable without lark-cli.
+ *
+ * A docx wiki node answers with `node_token` (the wiki entry) and `obj_token`
+ * (the document itself, i.e. what `docs +update --doc` wants). Both are read off
+ * the response shape `sync-feishu-bitable.mjs` already relies on, because two
+ * scripts guessing at the same API in two different ways is how they drift.
  */
-export function provisioningProblem(doc, spaceId) {
+export function createdNodeIds(res) {
+  const node = res?.data?.node ?? res?.node ?? res?.data ?? {};
+  const pick = (key) => {
+    if (node[key]) return node[key];
+    const walk = (v) => {
+      if (v && typeof v === "object") {
+        for (const [k, x] of Object.entries(v)) {
+          if (k === key && typeof x === "string" && x) return x;
+          const hit = walk(x);
+          if (hit) return hit;
+        }
+      }
+      return null;
+    };
+    return walk(res);
+  };
+  const nodeToken = pick("node_token");
+  const documentId = pick("obj_token") ?? pick("document_id");
+  if (!nodeToken && !documentId) return null;
+  return { nodeToken, documentId };
+}
+
+/**
+ * The node_token of an entry whose wiki node already exists but whose document_id
+ * is still a placeholder, else null.
+ *
+ * This state is reachable for real: `ensureNode` writes the node_token before the
+ * body is pushed, precisely so an interrupted run does not create a duplicate node.
+ * Recognising it is what makes that write-back safe rather than half-done.
+ */
+export function halfProvisionedNodeToken(doc) {
+  const node = doc?.node_token;
+  if (typeof node !== "string" || node.length === 0 || isPlaceholder(node)) return null;
+  const document = doc?.document_id;
+  // An empty document_id counts as missing: placeholderOf deliberately does not
+  // treat "" as a placeholder (the `entry missing "document_id"` problem already
+  // reports it), so without this branch the two checks would disagree here.
+  if (typeof document === "string" && document.length > 0 && !isPlaceholder(document)) return null;
+  return node;
+}
+
+/**
+ * Create the missing wiki node and return the manifest entry carrying real ids.
+ *
+ * This used to be a human step -- the script refused a placeholder and told
+ * someone to create the node in Feishu and paste the ids back. That is exactly
+ * the work `wiki +node-create` does, and the bitable sync already provisions its
+ * own Base, so refusing here was an inconsistency, not a safety property: the
+ * placeholder stayed pending until a person happened to have an authorized
+ * terminal, which is the state that never arrived.
+ *
+ * The refusal is still real when creation cannot happen (no user credential, no
+ * title to name the node with) -- the error says which, and never reads like a
+ * keychain problem.
+ */
+function ensureNode(doc, spaceId, identity) {
   const ph = placeholderOf(doc);
-  if (!ph) return null;
-  return (
-    `${doc.source} 的飞书节点尚未开通（${ph.key}=${ph.value}）；` +
-    `请先在 wiki space ${spaceId} 创建节点，` +
-    `把真实 node_token/document_id 写回 docs/feishu-sync.json，再重跑 just sync-docs`
+  if (!ph) return doc;
+
+  // Half-provisioned is the dangerous state: a real node_token with a placeholder
+  // document_id means the node EXISTS and a re-run must not create another one.
+  // So resolve from the node we already have instead of falling through to create.
+  const existingNode = halfProvisionedNodeToken(doc);
+  if (existingNode) {
+    console.log(`  node ${existingNode} exists but has no document_id; resolving`);
+    const documentId = resolveDocumentId(existingNode, identity);
+    const next = { ...doc, node_token: existingNode, document_id: documentId };
+    delete next._note;
+    writeManifestEntry(next);
+    return next;
+  }
+
+  const title = (doc.node ?? "").trim();
+  if (!title) {
+    throw new Error(
+      `${doc.source} 的节点尚未开通（${ph.key}=${ph.value}），但 manifest 里没有 node 标题可以建；` +
+        `先给这条目补上标题再重跑 just sync-docs`,
+    );
+  }
+  console.log(`  provisioning wiki node "${title}" under space ${spaceId}`);
+  const res = runLark([
+    "wiki",
+    "+node-create",
+    "--space-id",
+    spaceId,
+    "--obj-type",
+    "docx",
+    "--node-type",
+    "origin",
+    "--title",
+    title,
+    "--as",
+    identity,
+    "--format",
+    "json",
+  ]);
+  if (res.ok === false) {
+    throw new Error(`node create rejected for ${doc.source}: ${JSON.stringify(res).slice(0, 400)}`);
+  }
+  const ids = createdNodeIds(res);
+  if (!ids?.nodeToken) {
+    throw new Error(
+      `node created for ${doc.source} but the response carries no node_token: ` +
+        JSON.stringify(res).slice(0, 400),
+    );
+  }
+  // Persist the node_token **immediately**, before anything else can fail, and
+  // before the body is pushed. A manifest that still says PENDING after a node was
+  // physically created makes the next run build a second node for the same
+  // document; a duplicate is worse than a node one revision behind, and only the
+  // duplicate is hard to undo.
+  const staged = { ...doc, node_token: ids.nodeToken, document_id: ids.documentId ?? "" };
+  delete staged._note;
+  writeManifestEntry(staged);
+  if (ids.documentId) return staged;
+  const documentId = resolveDocumentId(ids.nodeToken, identity);
+  const next = { ...staged, document_id: documentId };
+  writeManifestEntry(next);
+  return next;
+}
+
+/** Read the docx `obj_token` of a wiki node that was created but not described. */
+function resolveDocumentId(nodeToken, identity) {
+  const res = runLark([
+    "wiki",
+    "+node-get",
+    "--node-token",
+    nodeToken,
+    "--as",
+    identity,
+    "--format",
+    "json",
+  ]);
+  const ids = createdNodeIds(res);
+  if (!ids?.documentId) {
+    throw new Error(
+      `wiki node ${nodeToken} exists but its document_id could not be resolved from +node-get: ` +
+        JSON.stringify(res).slice(0, 400) +
+        ` — 节点已建好，把它的 obj_token 填进 docs/feishu-sync.json 的 document_id 再重跑`,
+    );
+  }
+  return ids.documentId;
+}
+
+/** Replace one entry in docs/feishu-sync.json, preserving the file's shape. */
+function writeManifestEntry(entry) {
+  const manifest = readJson(MANIFEST);
+  const next = {
+    ...manifest,
+    documents: (manifest.documents ?? []).map((d) => (d.source === entry.source ? entry : d)),
+  };
+  const header = readFileSync(MANIFEST, "utf8");
+  writeFileSync(
+    MANIFEST,
+    `${JSON.stringify(next, null, 2)}${header.endsWith("\n") ? "\n" : ""}`,
+    "utf8",
+  );
+  console.log(
+    `  node_token=${entry.node_token} document_id=${entry.document_id} (written back to docs/feishu-sync.json — commit it)`,
   );
 }
 
-function syncOne(doc, spaceId) {
-  // Refuse a placeholder before touching lark-cli. Letting it through would make the
-  // CLI fail on an id matching no document, and the message reads like an auth /
-  // Keychain problem — the two root causes would be indistinguishable in the log.
-  const pending = provisioningProblem(doc, spaceId);
-  if (pending) throw new Error(pending);
+function syncOne(doc, spaceId, identity) {
+  // Provision first, then write. A placeholder id would otherwise make the CLI fail
+  // on a document that matches nothing, and that error reads like an auth problem —
+  // the two root causes have to stay distinguishable in the log.
+  // Everything below must read the ids off `resolved`: for a pending entry `doc`
+  // still carries the placeholder, and pushing markdown to a placeholder document id
+  // is exactly the indistinguishable failure this function exists to avoid.
+  const resolved = ensureNode(doc, spaceId, identity);
 
   const update = runLark([
     "docs",
     "+update",
     "--doc",
-    doc.document_id,
+    resolved.document_id,
     "--command",
     "overwrite",
     "--doc-format",
@@ -207,7 +388,7 @@ function syncOne(doc, spaceId) {
       "docs",
       "+fetch",
       "--doc",
-      doc.document_id,
+      resolved.document_id,
       "--scope",
       "keyword",
       "--keyword",
@@ -273,8 +454,8 @@ function main() {
   let failed = 0;
   for (const doc of targets) {
     try {
-      const rev = syncOne(doc, manifest.space_id);
-      console.log(`synced ${doc.source} -> ${doc.node} (revision ${rev})`);
+      const rev = syncOne(doc, manifest.space_id, manifest.identity ?? "user");
+      console.log(`synced ${doc.source} -> ${doc.node ?? doc.source} (revision ${rev})`);
     } catch (err) {
       failed += 1;
       console.error(`FAILED ${doc.source}: ${err.message}`);

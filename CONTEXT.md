@@ -787,6 +787,23 @@ fnm/nvm/volta/asdf 各版本全局 bin，版本目录按数值降序），并把
   实测本 shell **能**读写系统钥匙串（`config init` 成功落 keychain、
   `security add-generic-password` 成功），所以先前"沙箱封锁钥匙串"的说法是错的：
   真相是那个特定条目被删了。飞书同步因此仍需一次真实授权，不是环境问题。
+- **建节点不再是人工步骤**：`sync-feishu-docs.mjs` 原先遇到占位 ID 就**拒绝**并要人去飞书
+  建节点、把 token 抄回 manifest —— 而 `sync-feishu-bitable.mjs` 早就用
+  `wiki +node-create` 自己开通 Base 并回写配置。同一个仓库里两套约定，docs 那套还把
+  "没人正好带着授权终端"当成设计前提，于是 3 个 PRD 节点一直 pending。现在 docs 脚本也
+  自己建（标题取 manifest 的 `node` 字段），并**在推送正文之前**回写 ID：若正文失败而
+  manifest 仍是占位，下次重跑会为同一文档建出**第二个节点**，重复比"落后一个版本"更难收拾。
+  拒绝仍然保留在真正拒绝得掉的地方：没有 `node` 标题、或建节点被上游拒绝。
+- **半开通状态必须可恢复**：先写 `node_token` 就意味着可能出现"节点已存在、
+  `document_id` 还是占位"这一半状态。把它当"没开通"会建出重复节点，所以 `ensureNode`
+  先判 `halfProvisionedNodeToken`，命中就走 `wiki +node-get` 解析 `obj_token` 补齐，
+  **绝不**再建。空 `document_id` 也算缺失：`placeholderOf` 刻意不把 `""` 当占位
+  （另有 `entry missing "document_id"` 检查负责报它），两处判据必须一致，否则
+  离线校验与 provision 会对同一条目给出相反结论。
+- 顺带修 `runLark` 的失败解析：lark-cli 被拒时 stdout 为空、失败 JSON 在 **stderr**，
+  docs 脚本只解析 stdout，于是把"未授权"报成 `non-JSON output` —— 正是该文件注释里
+  声称要避免的"两种根因不可区分"。现在与 bitable 脚本同构（两路都看、`ok:false` 提取
+  `error.message`、凭据类失败附一条可执行的 `auth login` 提示）。
 - **预检的动机是省下整轮误诊**：provider 挂起时六项各烧满单项预算（每项 5 分钟），
   最后产出一墙 BLOCKED，而"provider 无响应"与"产品缺陷"在那一墙里长得一模一样 ——
   Q44 记录了我因此错两次。预检把这件事压到 ~2 分钟，且退出码 2 与产品结论（0/1）分开。

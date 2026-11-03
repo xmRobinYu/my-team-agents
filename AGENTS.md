@@ -193,6 +193,14 @@ just sync-docs docs/architecture.md   # sync one doc
 - Mapping lives in `docs/feishu-sync.json` (source -> node_token/document_id).
   A new doc requires a manifest entry before it can sync; `just verify-docs`
   fails if a required source is unmapped or a mapped source is missing.
+- A placeholder id (`PENDING_*`) is a **to-do, not a manual chore**: `just sync-docs`
+  creates the wiki node from the entry's `node` title and writes the real
+  `node_token`/`document_id` back into the manifest, so nothing has to be built in
+  Feishu by hand and pasted back. Ids are written **before** the body is pushed —
+  leaving a placeholder behind would make the next run create a second node for the
+  same document, and a duplicate is harder to undo than a node one revision behind.
+  `just verify-docs` still counts pending entries and still exits 0 on them: creating
+  a node needs a credential, which no CI run has.
 - **The repo is the single source of truth.** Edit the repo, then sync; do not
   edit Feishu copies or record decisions only in Feishu comments.
 - `just sync-docs` is intentionally NOT in CI: it needs the local `lark-cli`
