@@ -812,6 +812,30 @@ fnm/nvm/volta/asdf 各版本全局 bin，版本目录按数值降序），并把
 - 取舍：解析顺序里 PATH 优先于版本目录，所以正常安装不受影响；版本目录按数值降序，
   避免 `v9` 在字典序上赢过 `v26`。
 
+### Q46 — 写后读不一致与"建了但不告诉你 id"，都是没测量就假设响应形状 (2026-11-04)
+**A**: 授权成功后的第一次真实同步暴露两个上游形状假设错误，两个都只在**真调**时可见：
+- `base +table-create` **不返回 `table_id`**。响应是
+  `{"ok":true,"identity":"user","data":{"fields":[...]}}`，只回显输入 schema。
+  现改为建完重读 `+table-list` 按名认领（`adoptCreatedTable`），且**只认领建表前不存在的
+  id**：同名表若在 `before` 里，说明那是别人的表，绝不能挂上去；重名多于一概拒绝。
+- `base +record-batch-create` 返回 ok 之后，紧接着的 `+record-list` **仍可能读到写前快照**。
+  第一次跑 10 条 `项目阶段` 全部写入成功（手工查询可见），脚本的校验读看到 0 条，
+  于是报 `MISMATCH` + `exit 1` —— **正确的同步被报成失败**。现只对"本次确实写过"的
+  校验读做 4 次退避重试（1.5s/3s/4.5s）；无写入不重试，真失败仍失败。
+**R**: 前者若继续抛错，比不报错更糟：表**已经建出来**，每次重试再留一张同名表。
+后者是假失败，且形状极具误导 —— 它看起来和"写入被拒"完全一样，会让人去查权限。
+两次都是把 bitable 脚本的响应形状当成了通用形状去推断：`obj_token == document_id` 这条
+核心假设此前也只是推断，现已用真实 `+node-get` 钉在 `scripts/feishu-docs.test.mjs` 里。
+- **回写 manifest 必须保格式**：`docs/feishu-bitable.json` 的字段定义是手工一行一条排的，
+  `JSON.stringify(config, null, 2)` 把一次**两行**的 provisioning 变更变成 **436 行**
+  的格式噪音，review 时真实变更被淹没。现在只对 `base_token`/`node_token` 做定点替换
+  （`patchProvisionedIds`），语义不变时整文件字节不动；键缺失或出现多次则退回全量重写，
+  不猜。
+- **授权仍是人工步骤，但它只该发生一次**：`offline_access` 已在 app 的 217 个 scope 里，
+  授权一次后靠 refresh token 续期（本次 `refreshExpiresAt` 2026-11-11）。此前 4 次
+  失败不是凭据问题，是 device code 的 **600s 服务端硬窗口**和我发消息-用户读到之间的延迟
+  赛跑；把码直接放进回复并同时挂后台轮询后，93s 完成。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

@@ -635,3 +635,55 @@ export function massRemovalProblem(table, plan, existingCount) {
     `otherwise a section was renamed and the parser found nothing.`
   );
 }
+
+/**
+ * Rewrite only the provisioned ids in a docs/feishu-bitable.json text blob.
+ *
+ * Re-serialising the whole config rewrites formatting the author chose: the field
+ * definitions there are hand-laid-out one-per-line, and JSON.stringify(config,
+ * null, 2) turned a two-line provisioning change into 436 changed lines. Only
+ * base_token/node_token ever change on provisioning, so patch exactly those.
+ *
+ * Returns null when a key is missing or appears more than once - the caller then
+ * falls back to a full re-serialise rather than guessing.
+ */
+export function patchProvisionedIds(text, config) {
+  let out = text;
+  for (const key of ["base_token", "node_token"]) {
+    const value = config[key];
+    if (typeof value !== "string") return null;
+    const re = new RegExp(`("${key}"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`, "g");
+    const hits = out.match(re);
+    if (!hits || hits.length !== 1) return null;
+    out = out.replace(re, `$1${JSON.stringify(value)}`);
+  }
+  return out;
+}
+
+/**
+ * Adopt the id of a table that +table-create just created.
+ *
+ * Measured against the live Base: +table-create answers
+ * {"ok":true,"identity":"user","data":{"fields":[...]}} - it echoes the schema it
+ * was given and carries no table_id at all. Throwing on that would be worse than
+ * useless, because the table IS created: every retry of an aborted run would leave
+ * another same-named table behind. So the caller re-reads +table-list and adopts
+ * the single table bearing that name.
+ *
+ * `before` is the table list captured before the create; a name present there is
+ * not evidence of the new table, so only names absent from it count.
+ */
+export function adoptCreatedTable(before, after, name, response) {
+  const had = new Set(before.filter((t) => t.name === name).map((t) => t.id));
+  const fresh = after.filter((t) => t.name === name && !had.has(t.id));
+  if (fresh.length === 1) return fresh[0].id;
+  if (fresh.length > 1) {
+    throw new Error(
+      `table "${name}" was created but ${fresh.length} new tables now carry that name ` +
+        `(${fresh.map((m) => m.id).join(", ")}); pick one manually before syncing`,
+    );
+  }
+  throw new Error(
+    `table "${name}" was created but does not appear in +table-list: ${JSON.stringify(response).slice(0, 400)}`,
+  );
+}

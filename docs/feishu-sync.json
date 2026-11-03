@@ -48,16 +48,20 @@
     {
       "source": "docs/prd/multi-agent-group-chat.md",
       "node": "PRD：多 Agent 群聊工作台（V1）",
-      "node_token": "PENDING_FIRST_SYNC",
-      "document_id": "PENDING_FIRST_SYNC",
-      "_note": "占位 ID。在可访问 Keychain 的交互终端执行 `just sync-docs` 前，需先创建飞书节点并把真实 node_token/document_id 填回此处；占位值不会命中任何真实文档，同步会报错而非覆盖。"
+      "node_token": "VYpXwjWNvirNT7kn2DEcq6vRnlb",
+      "document_id": "VIRbd7wBRockz9xRiVQcKzTVnrN"
     },
     {
       "source": "docs/prd/multi-agent-group-chat-issues.md",
       "node": "Issue 拆分：多 Agent 群聊工作台（P8）",
-      "node_token": "PENDING_FIRST_SYNC_ISSUES",
-      "document_id": "PENDING_FIRST_SYNC_ISSUES",
-      "_note": "占位 ID，同上。创建飞书节点后需替换 node_token/document_id。"
+      "node_token": "ET9xwL5NDiqCGvkxloucIuCmnze",
+      "document_id": "LjoUdva5hoYIfJxwO7Sc5aNknag"
+    },
+    {
+      "source": "docs/prd/event-ingress.md",
+      "node": "PRD：事件入口与触发路由（P9 提案）",
+      "node_token": "YQruwOm83i4UU9kX1LKcEo5aneM",
+      "document_id": "EylMddNTToOen4xITzycTQomnSd"
     }
   ]
 }

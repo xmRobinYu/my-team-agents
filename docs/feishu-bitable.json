@@ -4,8 +4,8 @@
   "space_id": "7701231058624187646",
   "identity": "user",
   "base_title": "my-team-agents 项目进展",
-  "base_token": "PENDING_FIRST_PROVISION",
-  "node_token": "PENDING_FIRST_PROVISION",
+  "base_token": "HU1ybLaaaaiq0isCrElcZJdgndd",
+  "node_token": "HHziwJ3uyix7OwkFky8chSjgnFh",
   "_pending_note": "Placeholders, same convention as docs/feishu-sync.json. `PENDING_FIRST_PROVISION` means the wiki node does not exist yet. Run `just sync-bitable` from an interactive terminal that can reach the macOS Keychain: the script creates the Bitable node under the wiki space, writes the real node_token/base_token back into this file, then provisions tables and records. A placeholder never matches a real resource, so a sync can only create or fail loudly — it can never overwrite somebody else's Base.",
   "primary_field": "主键",
   "tables": [

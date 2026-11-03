@@ -16,6 +16,8 @@ import {
   validateConfig,
   cellText,
   massRemovalProblem,
+  patchProvisionedIds,
+  adoptCreatedTable,
 } from "./feishu-bitable.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -369,4 +371,45 @@ test("ordinary row removals are not mass removal", () => {
   // Four of five: refuse until the operator confirms with --allow-mass-removal.
   const gutted = planTable(t, all.slice(0, 1), existing);
   assert.match(massRemovalProblem(t, gutted, existing.length), /4\/5/);
+});
+
+test("patchProvisionedIds rewrites only the ids and preserves the author's layout", () => {
+  // docs/feishu-bitable.json lays its field definitions out one-per-line on
+  // purpose. A full JSON.stringify(config, null, 2) turned a two-line provisioning
+  // change into 436 changed lines, so the layout is part of the contract.
+  const text = read("docs/feishu-bitable.json");
+  const config = JSON.parse(text);
+  const patched = patchProvisionedIds(text, { ...config, base_token: "NEWBASE", node_token: "NEWNODE" });
+  assert.ok(patched, "patch must succeed on the real config");
+  assert.deepEqual(JSON.parse(patched), { ...config, base_token: "NEWBASE", node_token: "NEWNODE" });
+
+  // Exactly two lines differ, and nothing is reformatted.
+  const a = text.split("\n");
+  const b = patched.split("\n");
+  assert.equal(a.length, b.length);
+  assert.equal(a.filter((l, i) => l !== b[i]).length, 2);
+
+  // Ordering and everything else survives byte-for-byte.
+  assert.equal(patched.replace(/"NEWBASE"/, `"${config.base_token}"`).replace(/"NEWNODE"/, `"${config.node_token}"`), text);
+
+  // Ambiguous or absent keys are refused, so the caller can fall back instead of
+  // silently writing the wrong one.
+  assert.equal(patchProvisionedIds('{"x":"base_token"}\n', { base_token: "A", node_token: "B" }), null);
+  assert.equal(patchProvisionedIds('{"base_token":"a","base_token":"b"}', { base_token: "A", node_token: "B" }), null);
+});
+
+test("adoptCreatedTable finds the new table given +table-create returns no id", () => {
+  // Real +table-create response: ok:true, data:{fields:[...]}, no table_id anywhere.
+  const response = { ok: true, identity: "user", data: { fields: [{ name: "阶段号", type: "text" }] } };
+  const before = [{ id: "tblOLD", name: "Table" }, { id: "tblX", name: "项目阶段" }];
+  const after = [...before, { id: "tblNEW", name: "项目阶段" }];
+  assert.equal(adoptCreatedTable(before, after, "项目阶段", response), "tblNEW");
+
+  // A same-named table that existed *before* the create is never adopted: that
+  // would attach the sync to someone else's table.
+  assert.throws(() => adoptCreatedTable(before, before, "项目阶段", response), /does not appear/);
+
+  // Two new same-named tables mean an earlier run leaked one; refuse to guess.
+  const dup = [...before, { id: "tblNEW", name: "项目阶段" }, { id: "tblNEW2", name: "项目阶段" }];
+  assert.throws(() => adoptCreatedTable(before, dup, "项目阶段", response), /2 new tables now carry that name/);
 });

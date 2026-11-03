@@ -242,3 +242,20 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
     "not found, install it"（其实是 PATH 错配），`pi-smoke.sh` 更直接
     `SKIP ... exit 0`（门禁没跑却算通过，违背本文件对它的说明）。现在统一走
     `scripts/resolve-bin.mjs`，缺失一律非零退出。`CONTEXT.md` Q45。
+
+11. **Bitable 的写后读不是立即一致的**。`+record-batch-create` 返回 ok 之后，紧接着的
+    `+record-list` 仍可能读到写前的快照。第一次真实同步就撞上了：10 条 `项目阶段` 记录
+    全部写入成功（手工 `+record-list` 能查到），但同步脚本的校验读看到 0 条，于是报
+    `MISMATCH` 并 `exit 1` —— **一次正确的同步被报成失败**。现在只对"本次确实写过"的
+    校验读做有界重试（4 次，1.5s/3s/4.5s 退避）；无写入的运行不重试，真失败仍失败。
+
+12. **`+table-create` 不返回 `table_id`**。实测响应是
+    `{"ok":true,"identity":"user","data":{"fields":[...]}}` —— 只回显建表时给的字段
+    schema，没有任何 id。原先的实现拿不到 id 就抛错，后果比不报错更糟：表**已经建出来了**，
+    每次重试都会再留一张同名表。现在改为建完重读 `+table-list` 按名认领，且只认领
+    "建表前不存在"的那个 id（`adoptCreatedTable`），重名多于一概拒绝而不是猜。
+
+    这两条都不是上游缺陷，是**我们没有先测量就假设了响应形状**。同类的还有一条已在
+    `scripts/feishu-docs.test.mjs` 里钉死：docx wiki 节点的 `obj_token` 是否就是
+    `docs +update --doc` 要的 `document_id` —— 实测相等，但那之前只是从 bitable 脚本
+    的形状推断的。

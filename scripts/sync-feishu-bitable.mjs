@@ -40,6 +40,8 @@ import {
   coerce,
   formatLocalMinute,
   massRemovalProblem,
+  patchProvisionedIds,
+  adoptCreatedTable,
 } from "./feishu-bitable.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -47,6 +49,18 @@ const CONFIG_PATH = join(ROOT, "docs", "feishu-bitable.json");
 const PLAN_PATH = join(ROOT, "docs", "project-plan.md");
 const CONTEXT_PATH = join(ROOT, "CONTEXT.md");
 const PLACEHOLDER = "PENDING_FIRST_PROVISION";
+
+// Base's read path is eventually consistent after a write (see the verification
+// block). Four attempts at 1.5s/3s/4.5s backoff covers the observed lag without
+// turning a real failure into a 10s stall per table.
+const VERIFY_ATTEMPTS = 4;
+const VERIFY_BACKOFF_MS = 1500;
+
+// The sync is a one-shot CLI, so blocking its event loop is fine and keeps the
+// verification loop readable. Atomics.wait is the supported way to do that.
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
 /* ------------------------------------------------------------------ lark-cli */
 
@@ -178,8 +192,22 @@ function ensureNode(config) {
 function writeConfig(config) {
   const header = readFileSync(CONFIG_PATH, "utf8");
   const trailingNewline = header.endsWith("\n");
-  writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}${trailingNewline ? "\n" : ""}`, "utf8");
+  const next = `${JSON.stringify(config, null, 2)}${trailingNewline ? "\n" : ""}`;
+  if (next === header) return;
+
+  // A whole-file re-serialise rewrites formatting the author chose deliberately:
+  // the field definitions in this file are hand-laid-out one-per-line, and
+  // JSON.stringify(config, null, 2) exploded them into 436 changed lines for what
+  // is a two-line change (base_token/node_token). Only the provisioned ids ever
+  // change here, so patch those two keys in place and leave the rest byte-identical.
+  const patched = patchProvisionedIds(header, config);
+  if (patched !== null) {
+    writeFileSync(CONFIG_PATH, patched, "utf8");
+    return;
+  }
+  writeFileSync(CONFIG_PATH, next, "utf8");
 }
+
 
 function listTables(baseToken, identity) {
   const res = runLark(["base", "+table-list", "--base-token", baseToken, "--as", identity, "--format", "json"]);
@@ -188,7 +216,7 @@ function listTables(baseToken, identity) {
     .filter((t) => t.id || t.name);
 }
 
-function createTable(baseToken, identity, table) {
+function createTable(baseToken, identity, table, before) {
   const res = runLark([
     "base",
     "+table-create",
@@ -204,8 +232,10 @@ function createTable(baseToken, identity, table) {
     "json",
   ]);
   const id = pick(res, ["table_id"]);
-  if (!id) throw new Error(`table "${table.name}" created but no table_id returned: ${JSON.stringify(res).slice(0, 400)}`);
-  return id;
+  if (id) return id;
+  // +table-create returns no table_id (measured against the live Base), so adopt
+  // the table by name from a fresh +table-list. See adoptCreatedTable.
+  return adoptCreatedTable(before, listTables(baseToken, identity), table.name, res);
 }
 
 function listFields(baseToken, identity, tableId) {
@@ -438,7 +468,7 @@ try {
     let tableId = existing?.id;
     if (!tableId) {
       console.log(`creating table ${table.name} (${table.fields.length} fields)`);
-      tableId = createTable(baseToken, identity, table);
+      tableId = createTable(baseToken, identity, table, live);
     } else {
       const have = listFields(baseToken, identity, tableId);
       const missing = table.fields.filter((f) => !have.some((h) => h.name === f.name));
@@ -489,9 +519,23 @@ try {
       }
     }
 
-    // Verify the write landed
-    const after = readRecords(baseToken, identity, tableId, tmpDir, `after-${table.key}`);
-    const residual = planTable(table, desired, after);
+    // Verify the write landed. Base's read path is eventually consistent: a batch
+    // create/update answers ok, and an immediately following +record-list can still
+    // return the pre-write snapshot. Measured: the first live run wrote all 10 项目阶段
+    // rows (a manual +record-list then showed them) yet this read saw 0 and reported
+    // MISMATCH + exit 1, so a correct sync looked broken. Re-read a bounded number of
+    // times, and only when something was actually written - a no-op run must not be
+    // retried, and a genuine failure must still fail.
+    const wrote = plan.create.length > 0 || patches.length > 0;
+    const attempts = wrote ? VERIFY_ATTEMPTS : 1;
+    let after = [];
+    let residual;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt > 0) sleepSync(VERIFY_BACKOFF_MS * attempt);
+      after = readRecords(baseToken, identity, tableId, tmpDir, `after-${table.key}-${attempt}`);
+      residual = planTable(table, desired, after);
+      if (residual.create.length === 0 && residual.update.length === 0 && residual.stale.length === 0) break;
+    }
     const status =
       residual.create.length === 0 && residual.update.length === 0 && residual.stale.length === 0
         ? "ok"
