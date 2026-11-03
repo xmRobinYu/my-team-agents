@@ -222,6 +222,41 @@ test("every pending manifest entry carries a title, or provisioning cannot name 
   }
 });
 
+test("createdNodeIds parses the real lark-cli +node-get response shape", () => {
+  // Captured from `lark-cli wiki +node-get --node-token <architecture node> --as bot`
+  // against the live wiki space. The tokens are the real ones already recorded in
+  // docs/feishu-sync.json, which is what proves the premise of ensureNode: a docx
+  // wiki node's `obj_token` IS the `document_id` that `docs +update --doc` wants.
+  // Without this, provisioning would be writing a token of the wrong kind back into
+  // the manifest and every later sync would fail on it.
+  const real = {
+    ok: true,
+    identity: "bot",
+    data: {
+      creator: "ou_92c7cd79651ce045f22c7d8e0950de88",
+      has_child: false,
+      node_token: "GVw5wkAyfibD8pkUJaxcuZWCnUe",
+      node_type: "origin",
+      obj_token: "WxxtdqfdDohIV2xJ0cWc02v2nvb",
+      obj_type: "docx",
+      origin_node_token: "GVw5wkAyfibD8pkUJaxcuZWCnUe",
+      parent_node_token: "",
+      space_id: "7701231058624187646",
+      title: "my-team-agents 架构设计",
+    },
+  };
+  assert.deepEqual(createdNodeIds(real), {
+    nodeToken: "GVw5wkAyfibD8pkUJaxcuZWCnUe",
+    documentId: "WxxtdqfdDohIV2xJ0cWc02v2nvb",
+  });
+
+  // The same tokens the repo already trusts for this document.
+  const manifest = JSON.parse(readFileSync(join(ROOT, "docs", "feishu-sync.json"), "utf8"));
+  const arch = manifest.documents.find((d) => d.source === "docs/architecture.md");
+  assert.equal(real.data.obj_token, arch.document_id, "obj_token must equal document_id");
+  assert.equal(real.data.node_token, arch.node_token);
+});
+
 test("a half-provisioned entry is recognised instead of re-created", () => {
   // The dangerous state ensureNode's write-back can leave behind: the wiki node
   // physically exists, only document_id is still a placeholder. Treating that as
