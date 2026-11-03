@@ -205,6 +205,12 @@ just sync-docs docs/architecture.md   # sync one doc
   edit Feishu copies or record decisions only in Feishu comments.
 - `just sync-docs` is intentionally NOT in CI: it needs the local `lark-cli`
   user credential. The blocking CI surface is the offline mapping check.
+- **Pick the profile explicitly when the default one has no credential.** `lark-cli`
+  reads `LARKSUITE_CLI_PROFILE` from the environment, and the sync scripts pass their
+  environment through, so `LARKSUITE_CLI_PROFILE=<name> just sync-docs` works without
+  touching any default. Do not "fix" this by switching the default profile: the
+  default is the user's own configuration, and a helper that mutates it silently
+  changes which identity every other lark-cli call uses.
 - Any change to a synced document must be accompanied by a `just sync-docs`
   run in the same task; report the command's exit code honestly.
 - Feishu node titles follow each document's first `# ` heading — `overwrite`

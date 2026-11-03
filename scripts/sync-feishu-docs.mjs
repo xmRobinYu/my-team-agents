@@ -164,10 +164,12 @@ function runLark(args) {
   if (parsed.ok === false) {
     const e = parsed.error ?? {};
     const credential = e.subtype === "storage" || /keychain|token_missing|need_user_authorization/i.test(String(e.message ?? ""));
+    const profile = process.env.LARKSUITE_CLI_PROFILE ?? "default";
     throw new Error(
       `lark-cli ${args.slice(0, 2).join(" ")} rejected: ${e.message ?? JSON.stringify(e).slice(0, 400)}` +
         (credential
-          ? ` — no usable user credential for this profile. Run: lark-cli auth login --profile='<profile>' --domain docs,wiki,drive --recommend`
+          ? ` — no usable user credential for profile "${profile}". Run: `
+            + `lark-cli auth login --profile='${profile}' --domain docs,wiki,drive --recommend`
           : ""),
     );
   }
