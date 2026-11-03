@@ -176,20 +176,28 @@ User stories covered: Story 4、5、6、7
 - 终止信号：Coordinator 输出 `[讨论结束]` → terminated，阻断后续触发
 
 ### Acceptance criteria
-- [ ] A→B→A 第二次对 A 的触发被阻断，流中显示系统消息
-- [ ] 用户新消息重置链，A 可再次触发
-- [ ] 合法链路（用户→A→B→Coordinator）不误判
-- [ ] 达上限→ Coordinator 强制收尾；超限后不再处理新触发
-- [ ] 用户新消息重置轮次
-- [ ] `max_rounds` 可按 room 配置
-- [ ] Coordinator 的 `[讨论结束]` → terminated；非 Coordinator 忽略 + warn
-- [ ] terminated 下用户新消息 → 重置
-- [ ] **terminated / round_count / chain 进程重启后仍保持**
-- [ ] 单测覆盖上述每条
+- [x] A→B→A 第二次对 A 的触发被阻断，流中显示系统消息
+      —— `room-guards.test.ts:347`（AC4.1，入口 B）；真实模型另见 `scripts/prd-acceptance.mjs` 第 4 项
+- [x] 用户新消息重置链，A 可再次触发 —— `room-guards.test.ts:251`（AC4.2）
+- [x] 合法链路（用户→A→B→Coordinator）不误判 —— `room-guards.test.ts:182`（AC4.3）
+- [x] 达上限→ Coordinator 强制收尾；超限后不再处理新触发
+      —— `room-guards.test.ts:367`（AC5.1）/ `:386`（AC5.2）；真实模型见第 5 项
+- [x] 用户新消息重置轮次 —— `room-guards.test.ts:284`（AC5.3）
+- [x] `max_rounds` 可按 room 配置 —— 守卫按群读值：`room-guards.test.ts:195`/`:309`（AC5.4）；
+      配置入口 `PATCH /api/rooms/:id {maxRounds}`：`room-routes.test.ts`（写回 + 越界拒绝 + 404）
+- [x] Coordinator 的 `[讨论结束]` → terminated；非 Coordinator 忽略 + warn
+      —— `room-guards.test.ts:223`（AC6.1）/ `:228`（AC6.2）
+- [x] terminated 下用户新消息 → 重置 —— `room-guards.test.ts:296`（AC6.3）
+- [x] **terminated / round_count / chain 进程重启后仍保持**
+      —— `room-guards.test.ts:587`（AC6.4/AC7.1，用新连接重读 SQLite）；
+      真实模型跑里第 5 项也用新 `RoomStore` 句柄重读回 `terminated=true`
+- [x] 单测覆盖上述每条
 
 ### Validation
-- Command: `pnpm test`（`packages/domain/src/handoff.test.ts`）+ 重启进程验证持久化
-- Evidence: 用例通过；重启脚本输出显示状态保持
+- Command: `pnpm vitest run packages/orchestrator/src/room-guards.test.ts packages/server/src/room-routes.test.ts`
+- Evidence: 用例名自带 AC 编号，状态一律经 `RoomStore.getState`（即 SQLite）断言，不是内存对象；
+  持久化由 `room-guards.test.ts` 的 AC6.4/AC7.1 用例用**新连接重读同一库**证明。
+  真实模型端到端另见 `node scripts/prd-acceptance.mjs` 第 4、5 项（手动，需 pi + provider + 网络）。
 
 ### Notes
 - 上游用内存 Map 且接受重启即丢；我们**不继承**此缺陷（Q28/Q29）

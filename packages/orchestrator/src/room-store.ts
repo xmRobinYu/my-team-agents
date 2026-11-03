@@ -247,6 +247,30 @@ export class RoomStore {
     return this.roomFrom(this.one("SELECT * FROM chat_rooms WHERE id = ?", id));
   }
 
+  /**
+   * AC5.4: the round cap is per-ChatRoom configuration, so it needs a write path —
+   * until now `max_rounds` could only be changed by editing the database directly,
+   * which is not something a user story can call "configurable".
+   *
+   * `undefined` means "not provided" and leaves the column alone; the caller is
+   * responsible for validating the value (the route rejects out-of-range numbers
+   * rather than clamping them, because a silently clamped cap would report a
+   * budget the dispatcher does not have).
+   *
+   * Returns null when the room does not exist, so the route can answer 404 without
+   * a second read that could race.
+   */
+  updateRoomSettings(
+    id: string,
+    patch: { maxRounds?: number | undefined },
+  ): ChatRoom | null {
+    if (!this.getRoom(id)) return null;
+    if (patch.maxRounds !== undefined) {
+      this.run("UPDATE chat_rooms SET max_rounds = ? WHERE id = ?", patch.maxRounds, id);
+    }
+    return this.getRoom(id);
+  }
+
   listRooms(): ChatRoom[] {
     return this.all("SELECT * FROM chat_rooms ORDER BY created_at DESC").map((r) => this.roomFrom(r)!);
   }

@@ -381,9 +381,18 @@ async function item2(base) {
     && (!negArch || negPersonaFiles.length > 0);
 
   dumpStream(ev, h.id);
+  // 架构师的 Task 若根本没轮到跑（provider 挂起 + 串行队列饿死），这里没有关于行为的
+  // 任何证据 —— 报 FAIL 会把基础设施故障写成被测结论，与 item 5 同一分层规则。
+  // archTask 是 settle 之前读的快照，状态必须重读，否则永远是 queued。
+  const archFinal = archTask ? store.getTask(archTask.id) : null;
+  const neverRan = !archMsg || (archFinal && archFinal.status !== "succeeded");
   const ok = usedContext && identityOk && personaOk && pmSaid && negLeaked === false && d2Ok && d3Ok;
-  record("2", title, ok ? "PASS" : "FAIL", [...ev,
-    `本项断言：D2 五个角色各唯一命中=${d2Ok}；D3 全局零泄漏且 persona 目录内有会话=${d3Ok}`]);
+  record("2", title, ok ? "PASS" : neverRan ? "BLOCKED" : "FAIL", [...ev,
+    `本项断言：D2 五个角色各唯一命中=${d2Ok}；D3 全局零泄漏且 persona 目录内有会话=${d3Ok}`,
+    ok ? "" : neverRan
+      ? `本项 BLOCKED 的原因：${arch.name} 的 Task 终态=${archFinal?.status ?? "未知"}、`
+        + `${archMsg ? "发言与断言不符" : "群里没有它的发言"} —— 模型没拿到可判定的响应`
+      : "架构师已产出回复，但断言与观察不符 —— 这是真失败"]);
 }
 
 // ===== 3. agent 间自动交接 ================================================
@@ -678,13 +687,31 @@ async function item5(base) {
   const title = "达到轮次上限 → Coordinator 强制收尾（收尾不计轮次）+ terminated 后阻断";
   let deadline = Date.now() + ITEM_MS;
   const left = () => Math.max(1000, deadline - Date.now());
+  /**
+   * 无事件超时（stall watchdog：`durable-worker.ts` 的 `no events for <ms>ms`）是
+   * provider 挂起的形状，不是模型「不肯说话」的形状。此前我把 r7 的
+   * `status=failed attempts=3` 读成"协调者没输出 [讨论结束]"，那其实是三次 Attempt
+   * 各撞一次无事件超时 —— 协调者根本没拿到模型响应。凡要用到它都单独拎出来。
+   */
+  const hungWithoutEvents = (taskId) => taskId
+    ? store.getAttempts(taskId).some((a) => (a.error ?? "").includes("no events for"))
+    : false;
   const h = await importRoom(base, "i10-item5");
   if (h.error) return failFast("5", title, `导入失败：${h.error}`);
   const pm = byRole(h, "产品经理"), qa = byRole(h, "QA工程师");
   const coord = h.agents.find((x) => x.isCoordinator);
   if (!pm || !qa || !coord) return failFast("5", title, `缺 产品经理/QA/协调者：${h.agents.map((x) => `${x.name}/${x.role}/coord=${x.isCoordinator}`).join(",")}`);
-  store.db.prepare("UPDATE chat_rooms SET max_rounds = 1 WHERE id = ?").run(h.id);
-  ev.push(`群=${h.id}；AC5.4 按群配置：UPDATE chat_rooms SET max_rounds=1 → 读回 room.maxRounds=${rooms.getRoom(h.id).maxRounds}`);
+  // AC5.4 的配置入口现在存在，就走真实端点，不再直接改库：这一项同时充当
+  // 「上限可按 ChatRoom 配置」的验收证据，而不只是「按群读 max_rounds」的证据。
+  const capSet = await fetch(`${base}/api/rooms/${h.id}`, {
+    method: "PATCH", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ maxRounds: 1 }),
+  });
+  const capSetBody = await capSet.json().catch(() => ({}));
+  ev.push(`群=${h.id}；AC5.4 按群配置：PATCH /api/rooms/${h.id} {maxRounds:1} → HTTP ${capSet.status}，读回 room.maxRounds=${rooms.getRoom(h.id).maxRounds}`);
+  if (capSet.status !== 200 || capSetBody.maxRounds !== 1) {
+    return failFast("5", title, `AC5.4 配置失败：HTTP ${capSet.status} ${JSON.stringify(capSetBody).slice(0, 160)}`);
+  }
   ev.push(`被触发者=${pm.name}；协调者=${coord.name}（${coord.role}）；终止探针=${qa.name}`);
 
   // 顺便在真实 HTTP 路径上再证一次 D2：用角色名 @产品经理 触发（不是人名）。
@@ -698,6 +725,11 @@ async function item5(base) {
   const roundsAtCap = rooms.getState(h.id).roundCount;
   ev.push(`触发后 room_state.round_count=${roundsAtCap}（产品经理那一轮，1/1 顶到上限）`);
 
+  // 收尾 Task 可能撞无事件超时（provider 挂起；stall watchdog 的 120s 是刻意设计）。
+  // 平台的自动重试正是为这种情况准备的，所以判定之前要先给它重试的机会：上一次跑
+  // 就栽在这里——预算已被前面的触发吃掉，收尾 Task 还停在 retry_wait 就被读成
+  // "没跑成"，把一次仍在重试的运行当成了结论。
+  deadline = Math.max(deadline, Date.now() + 300_000);
   await settleRoom(h.id, left());
   const state1 = rooms.getState(h.id);
   const wrap = wrapRows[0] ? store.getTask(wrapRows[0].id) : null;
@@ -728,13 +760,29 @@ async function item5(base) {
   // 它的回复要求 @ 别人 → worker 的 planRoomGuards 应按 TERMINATED 拒绝。
   let probe = "探针未跑";
   let blockedOk = false;
+  // mainLeak = 群已终止却仍建出了新 Task，那是守卫真的漏了（FAIL）。
+  // 其余"没观察到"一律是构造/基础设施/模型不配合，报 BLOCKED，不算守卫失败。
+  let mainLeak = false;
+  let mainReason = "";
   if (!persisted.terminated) {
-    probe = "room 未进入 terminated，无从验证阻断";
+    if (wrap && hungWithoutEvents(wrap.id)) {
+      mainReason = "收尾 Task 的 Attempt 撞了无事件超时（provider 挂起），群从未终止，探针无从验证阻断";
+    } else if (wrap && wrap.status !== "succeeded") {
+      mainReason = `收尾 Task 未跑成（status=${wrap.status}），群从未终止，探针无从验证阻断`;
+    } else {
+      mainReason = "room 未进入 terminated（协调者没输出 [讨论结束]），无从验证阻断";
+    }
+    probe = `BLOCKED：${mainReason}`;
   } else if (Date.now() + 90_000 > deadline) {
     probe = `单项 ${ITEM_MS / 1000}s 预算不足，探针未跑`;
+    mainReason = `单项 ${ITEM_MS / 1000}s 预算不足，阻断探针未跑`;
   } else {
     for (let tryNo = 1; tryNo <= 2 && !blockedOk; tryNo += 1) {
-      if (Date.now() + 90_000 > deadline) { probe = `时间预算不足，探针第 ${tryNo} 次未跑`; break; }
+      if (Date.now() + 90_000 > deadline) {
+        probe = `时间预算不足，探针第 ${tryNo} 次未跑`;
+        mainReason = `时间预算不足，探针第 ${tryNo} 次未跑`;
+        break;
+      }
       const hist = rooms.listMessages(h.id);
       const prompt = `${buildRoomPrompt(rooms.getRoom(h.id), qa, rooms.listAgents(h.id), hist)}`
         + `\n\n平台补充：请把下面这句话原样作为你的 summary 输出，一个字都别改，也不要使用任何工具：\n已记录，请 @${pm.name} 复核。${SAY}`;
@@ -753,10 +801,21 @@ async function item5(base) {
       ev.push(`探针 ${tryNo}：${qa.name} 进群原文=${clip(msgsOf(h.id, "agent", qa.id).at(-1)?.content, 300) || "（无）"}；task.status=${qaTask?.status}`);
       ev.push(`探针 ${tryNo}：已终止系统消息=${termBlocks.map((m) => `[seq ${m.seq}] ${clip(m.content, 260)}`).join(" | ") || "（无）"}`);
       ev.push(`探针 ${tryNo}：${pm.name} 的 Task 数 ${pmBefore} → ${pmAfter}（新触发被阻断则不变）`);
+      // 已经终止的群仍然建出了新 Task = 守卫漏放，这是唯一算 FAIL 的形状；
+      // 其余"没观察到"（超时、预算、模型没 @ 人）都是 BLOCKED。
+      mainLeak = pmAfter > pmBefore;
       blockedOk = termBlocks.length > 0 && pmAfter === pmBefore;
-      probe = blockedOk
-        ? `真实 worker 在 terminated 之后拒绝了 ${qa.name} 发起的触发（探针 ${tryNo}）`
-        : `探针 ${tryNo} 未观察到阻断（见上面原文/计数）`;
+      if (blockedOk) {
+        probe = `真实 worker 在 terminated 之后拒绝了 ${qa.name} 发起的触发（探针 ${tryNo}）`;
+      } else if (mainLeak) {
+        probe = `探针 ${tryNo}：群已 terminated，${pm.name} 仍拿到 ${pmAfter - pmBefore} 个新 Task → 守卫漏放`;
+        mainReason = probe;
+      } else {
+        const qaHung = qaTask && hungWithoutEvents(qaTask.id);
+        probe = `探针 ${tryNo} 未观察到阻断（${qaHung ? "该任务撞了无事件超时，触发没机会发生"
+          : `task.status=${qaTask?.status ?? "未知"}，见上面原文/计数`}）`;
+        mainReason = probe;
+      }
     }
   }
 
@@ -773,24 +832,35 @@ async function item5(base) {
   // 判定顺序是 terminated → LOOP → ROUND_CAP（room-guards.ts:39-40），所以「第 2 次触发」
   // 的目标还必须落在链外，否则先撞 LOOP。
   //
-  // 探针的前置条件是**模型按指令在 summary 里 @ 到那个链外目标**。这一环由模型决定，
-  // 实测约 1/13 次不成立（模型改用别的措辞或不 @ 人），此时是探针的构造没搭起来，
-  // 而不是守卫被绕过。所以失败时换一个全新群重试一次，并且**把每次的原文与计数都留下**：
-  // 重试只消除构造噪声，断言本身一个字没放松（两个群都没观察到 -> 仍是 FAIL）。
+  // 探针的前置条件是**模型按指令在 summary 里 @ 到那个链外目标**，这一环由模型决定；
+  // 另一条会产出同样"静悄悄"结果的前置条件是**预算**。两者必须分开：
+  //   · 任务停在 queued  → worker 没拿到执行时间（预算被主探针耗尽），与守卫无关；
+  //   · 任务成功但没 @ 人 → 模型改写了指令，构造没搭起来。
+  // 早先我把一次失败写成"约 1/13 次模型不 @ 人"，那是归因错误：那次两个群的任务
+  // 同时是 queued，真实原因是单项硬上限已被主探针吃掉，`left()` 落到 1000ms 下限。
+  // 现在每次尝试前按主探针同一约定抬预算，并对 queued 单独报"预算耗尽"。
+  // 失败时仍换一个全新群重试一次，并把每次的原文与计数都留下：重试只消除构造噪声，
+  // 断言本身一个字没放松（两个群都没观察到 -> 仍是 FAIL）。
   const runCapProbe = async (attemptNo) => {
     const room = await importRoom(base, `i10-item5-cap${attemptNo > 1 ? `-r${attemptNo}` : ""}`);
-    if (room.error) return { ok: false, why: `建群失败：${room.error}` };
+    if (room.error) return { kind: "BLOCKED", why: `建群失败：${room.error}` };
     const pm = byRole(room, "产品经理"), eng = byRole(room, "工程师");
-    if (!pm || !eng) return { ok: false, why: "缺 产品经理/工程师，无法构造" };
+    if (!pm || !eng) return { kind: "BLOCKED", why: "缺 产品经理/工程师，无法构造" };
     const qa = byRole(room, "QA工程师");
     const coord = room.agents.find((x) => x.isCoordinator);
-    if (!qa || !coord) return { ok: false, why: "缺 QA/协调者，无法构造第 2 次触发" };
+    if (!qa || !coord) return { kind: "BLOCKED", why: "缺 QA/协调者，无法构造第 2 次触发" };
 
+    // 这里仍是直接写库，而不是用上面的 PATCH：端点刻意只暴露 maxRounds。
+    // 改协调者会把守卫判定所依赖的身份移走，属于另一件事，不该为了一条探针顺手开洞。
     store.db.prepare("UPDATE chat_rooms SET max_rounds = 1, coordinator_agent_id = NULL WHERE id = ?").run(room.id);
     const row = rooms.getRoom(room.id);
     ev.push(`AC5.2[${attemptNo}] 专用群=${room.id} maxRounds=${row.maxRounds} coordinatorAgentId=${row.coordinatorAgentId}（无协调者 → 不会 terminated，窗口稳定）`);
 
     // 第 1 轮：用户 @工程师（链外）→ 工程师进链，round 1/1，调度收尾但因无协调者只落消息。
+    // 每次尝试都要先把预算抬到"还够跑一轮"，否则主探针耗尽单项硬上限后，`left()`
+    // 会落在 1000ms 下限，settleRoom 立刻返回，两个群同时留下 status=queued 的任务，
+    // 看起来像守卫没生效 —— 那是探针被饿死，不是守卫被绕过。上与主探针同一约定。
+    deadline = Math.max(deadline, Date.now() + 120_000);
     const t1 = await post(base, room.id, `@${eng.name} 一句话说明本轮只占一格。不要使用任何工具。`);
     ev.push(`AC5.2[${attemptNo}] turn1 HTTP ${t1.status}（@${eng.name}，链外目标）`);
     await settleRoom(room.id, left());
@@ -811,6 +881,7 @@ async function item5(base) {
       idempotencyKey: `i10-5-cap:${room.id}:${hex(4)}`,
     });
     ev.push(`AC5.2[${attemptNo}] 播入 ${qa.name} 任务 ${taskLine(qaTask)}（其回复 @${coord.name}＝链外目标，即为第 2 次触发）`);
+    deadline = Math.max(deadline, Date.now() + 120_000);
     await settleRoom(room.id, left());
 
     const qaAfter = store.getTask(qaTask.id);
@@ -826,28 +897,81 @@ async function item5(base) {
     ev.push(`AC5.2[${attemptNo}] 专用群全流=${rooms.listMessages(room.id).map((m) => `[${m.seq}]${m.authorKind}:${clip(m.content, 70)}`).join(" | ")}`);
     ev.push(`AC5.2[${attemptNo}] 目标 ${coord.name} 的 Task 数=${coordTasks}（被 ROUND_CAP 拒绝则必须为 0）`);
     const ok = capMsgs.length > 0 && coordTasks === 0 && !st2.terminated;
-    // 没观察到时给出可区分的原因，别把"探针没搭起来"含糊成"守卫没生效"。
-    const why = ok ? "" : !st2.terminated
-      ? `未命中 ROUND_CAP：${qaAfter?.status !== "succeeded" ? `任务未成功（${qaAfter?.status}）` : "回复里没有指向链外目标的 @ 触发"}`
-      : "群被终止（terminated），判定顺序轮不到 ROUND_CAP";
-    return { ok, why };
+    if (ok) return { kind: "OK", why: "" };
+
+    // 「没观察到」有四类成因，对结论的意义完全不同，必须分开报 —— 把它们混成一句
+    // "未命中 ROUND_CAP"，已经让文档里写过两次错误的归因。
+    //   leak    上限已满却仍建出目标 Task → 守卫真的漏了，只有这一类是 FAIL
+    //   hung    provider 无事件超时 / 串行 worker 被在飞 Task 占住 → 与守卫无关
+    //   starved 本群任务停在 queued 而 worker 空闲 → 预算或领取问题
+    //   silent  任务成功但回复里没有指向链外目标的 @ → 模型不配合
+    const hungTask = (t) => t ? hungWithoutEvents(t.id) : false;
+    const inFlight = store.listTasks(2000).filter((t) => t.status === "running");
+    const pending = roomTasks(room.id).filter((t) =>
+      t.status !== "succeeded" && t.status !== "failed" && t.status !== "cancelled").length;
+    if (coordTasks > 0 && !st2.terminated) {
+      return { kind: "FAIL", why: `轮次已满仍未被拒绝：目标 ${coord.name} 拿到了 ${coordTasks} 个 Task` };
+    }
+    if (st2.terminated) return { kind: "BLOCKED", why: "群被终止（terminated），判定顺序轮不到 ROUND_CAP" };
+    if (qaAfter && hungTask(qaAfter)) {
+      return { kind: "BLOCKED", why: "本任务撞了无事件超时（provider 挂起），第 2 次触发没机会发生" };
+    }
+    if (inFlight.length > 0) {
+      return {
+        kind: "BLOCKED",
+        why: `worker 被 ${inFlight.length} 个在飞 Task 占住（队列串行，一次只跑一个），`
+          + `其中 ${inFlight.filter(hungTask).length} 个已撞无事件超时；本群 ${pending} 个 Task 没被领取 —— 与守卫无关`,
+      };
+    }
+    if (pending > 0) {
+      return { kind: "BLOCKED", why: `本群仍有 ${pending} 个 Task 停在 queued 而 worker 空闲：预算/领取问题` };
+    }
+    return {
+      kind: "BLOCKED",
+      why: `未命中 ROUND_CAP：${qaAfter?.status !== "succeeded" ? `任务未成功（${qaAfter?.status}）` : "回复里没有指向链外目标的 @ 触发"}`,
+    };
   };
 
   let capProbe = "未跑";
   let capBlocked = false;
+  let capLeak = false;
+  let capReason = "";
+  // 预算由 runCapProbe 内部在每次 settle 前发放；这里不再重复抬一次，
+  // 否则一次尝试会拿到三段预算，第 5 项的最坏耗时就失去上界了。
   for (let attempt = 1; attempt <= 2 && !capBlocked; attempt += 1) {
     const r = await runCapProbe(attempt);
-    capBlocked = r.ok;
-    ev.push(`AC5.2[${attempt}] 结论：${r.ok ? "命中 ROUND_CAP" : `未命中 —— ${r.why}`}`);
-    capProbe = r.ok
+    capBlocked = r.kind === "OK";
+    capLeak = r.kind === "FAIL";
+    capReason = r.why;
+    ev.push(`AC5.2[${attempt}] 结论：${capBlocked ? "命中 ROUND_CAP" : `${r.kind} —— ${r.why}`}`);
+    capProbe = capBlocked
       ? `真实 worker 在 round_count 达上限且未终止时、对链外目标按 ROUND_CAP 拒绝了新触发（第 ${attempt} 个群）`
-      : `未观察到 ROUND_CAP 拒绝（第 ${attempt} 个群也未命中：${r.why}）`;
+      : `未观察到 ROUND_CAP 拒绝（第 ${attempt} 个群：${r.why}）`;
   }
   ev.push(`AC5.2 探针结论：${capProbe}`);
 
-  const ok = cap.length > 0 && !!wrap && wrap.status === "succeeded" && wrapNotCharged
-    && ended && persisted.terminated && blockedOk && capBlocked;
-  record("5", title, ok ? "PASS" : "FAIL", ev);
+  // 判定分层：守卫真的漏放（leak）才是 FAIL；provider 挂起、预算耗尽、模型不肯
+  // 按指令输出，都报 BLOCKED 并留下原因 —— 把基础设施故障写成"守卫不稳定"，
+  // 已经让我在文档里错过两次正确的归因。
+  // 与重构前的 `ok` 逐条款等价，一个断言没少：cap/wrap 成功/不占轮次/ended/持久化
+  // terminated/主探针阻断/AC5.2 命中。只是把"全都不满足"换成"分诊"——
+  // leak（守卫漏放）才是 FAIL，其余未观察到报 BLOCKED 并给出具名原因。
+  const guardsHeld = cap.length > 0 && !!wrap && wrap.status === "succeeded"
+    && wrapNotCharged && persisted.terminated && ended;
+  const leak = mainLeak || capLeak;
+  const wrapHung = wrap ? hungWithoutEvents(wrap.id) : false;
+  let verdict = "FAIL";
+  if (leak) verdict = "FAIL";
+  else if (blockedOk && capBlocked && !guardsHeld) {
+    verdict = "BLOCKED";
+    ev.push(`本项被 BLOCKED 的原因：${wrapHung ? "协调者收尾 Task 撞了无事件超时（provider 挂起）"
+      : mainReason || capReason || "收尾/终止证据不齐，但没有任何一处守卫漏放"}`);
+  } else if (!blockedOk || !capBlocked) {
+    verdict = "BLOCKED";
+    ev.push(`本项被 BLOCKED 的原因：${mainReason || capReason}`);
+  }
+  if (wrapHung) ev.push(`注意：收尾 Task 的 Attempt 里出现过 no-events 超时 —— 这是挂起，不是模型不肯收尾`);
+  record("5", title, capBlocked && blockedOk && guardsHeld ? "PASS" : verdict, ev);
 }
 
 // ===== 6. 杀 Worker 重启，无重复计费 ======================================

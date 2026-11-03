@@ -3,6 +3,7 @@
  *
  *   POST /api/rooms/import         import a teamagentx template package
  *   GET  /api/rooms                list ChatRooms
+ *   PATCH /api/rooms/:id           configure the room's round cap (AC5.4)
  *   GET  /api/rooms/:id/agents     the room's agents, coordinator flagged
  *   GET  /api/rooms/:id/messages   the shared message stream
  *   POST /api/rooms/:id/messages   @mention trigger (I3): queue one Task per target
@@ -72,6 +73,20 @@ interface ImportBody {
   /** Report the plan (coordinator decision, ignored fields) without writing. */
   dryRun?: boolean;
 }
+
+interface PatchRoomBody {
+  /** AC5.4: hard cap on agent triggers per user turn. */
+  maxRounds?: number;
+}
+
+/**
+ * Bounds for the configurable round cap. 1 is the smallest value that still allows
+ * a conversation (0 would refuse the first trigger); the upper bound stops a typo
+ * from becoming an unbounded run. Both bounds are enforced by rejection, not by
+ * clamping — see the PATCH handler.
+ */
+const MIN_MAX_ROUNDS = 1;
+const MAX_MAX_ROUNDS = 100;
 
 /** Sample packages are 10–200 KB; the cap leaves room for skill-heavy ones. */
 const MAX_PACKAGE_BYTES = 16 * 1024 * 1024;
@@ -207,6 +222,47 @@ export async function registerRoomRoutes(
     );
 
     scope.get("/api/rooms", async () => store.listRooms());
+
+    /**
+     * AC5.4 — configure the room's round cap from the outside.
+     *
+     * Only `maxRounds` is writable here. The coordinator and the rules text are set
+     * at import time and changing them mid-conversation would move the very identity
+     * the guards key on; a story that later needs it gets its own endpoint.
+     *
+     * Out-of-range input is REJECTED, never clamped: a clamped cap would make the
+     * response report a budget the dispatcher does not actually have, and the whole
+     * point of this endpoint is that the number the user sets is the number enforced.
+     * The lower bound is 1 because a cap of 0 would refuse the first agent trigger,
+     * which is not a conversation; the upper bound keeps a typo from turning into an
+     * unbounded run.
+     */
+    scope.patch<{ Params: { id: string }; Body: PatchRoomBody | undefined }>(
+      "/api/rooms/:id",
+      async (request, reply) => {
+        const body = request.body ?? {};
+        if (body.maxRounds === undefined) {
+          return reply.code(400).send({
+            error: "没有可更新的字段（当前仅支持 maxRounds）",
+            code: "NO_UPDATABLE_FIELD",
+          });
+        }
+        const value = body.maxRounds;
+        if (typeof value !== "number" || !Number.isInteger(value)
+          || value < MIN_MAX_ROUNDS || value > MAX_MAX_ROUNDS) {
+          return reply.code(400).send({
+            error: `maxRounds 必须是 ${MIN_MAX_ROUNDS}–${MAX_MAX_ROUNDS} 之间的整数`,
+            code: "INVALID_MAX_ROUNDS",
+            got: value,
+          });
+        }
+        const updated = store.updateRoomSettings(request.params.id, { maxRounds: value });
+        if (!updated) {
+          return reply.code(404).send({ error: "room not found", code: "ROOM_NOT_FOUND" });
+        }
+        return updated;
+      },
+    );
 
     scope.get<{ Params: { id: string } }>("/api/rooms/:id/agents", async (request, reply) => {
       if (!store.getRoom(request.params.id)) {

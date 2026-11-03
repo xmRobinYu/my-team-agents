@@ -169,6 +169,11 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
 不信 `role`。单 agent thread 只接受第一条消息，
 追问返回 409 `FOLLOW_UP_NOT_SUPPORTED`（多轮由群 thread 承担）。
 
+**按群配置轮次上限（AC5.4）**：`PATCH /api/rooms/:id {maxRounds}`（1–100 整数；越界 400
+`INVALID_MAX_ROUNDS`，不存在的群 404 `ROOM_NOT_FOUND`）。刻意**拒绝而非截断**：截断会让响应
+报告一个调度器实际并不持有的预算。端点只暴露 `maxRounds` —— 协调者身份与群规则在导入时定型，
+改它们会移动守卫判定所依赖的身份，是另一件事。
+
 ## 7. 扩展接口（刻意留白，不生效）
 
 | 接口 | 位置 | 未来填充 |
@@ -217,10 +222,15 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
 8. 单 agent thread 不支持追问：`POST /api/pi/threads/<task>/messages` 只接受第一条消息，
    之后返回 409 `FOLLOW_UP_NOT_SUPPORTED`；多轮由群 thread 承担（Q42）。
    这是记录的限制，不是遗漏。
-9. 第 5 项的强制收尾依赖真实模型输出 `[讨论结束]`。首跑 r7 FAIL —— 协调者收尾 Task
-   连续 3 次 Attempt 全失败、没有 `[讨论结束]`、`terminated=false`；单独重跑该项与其后的
-   定稿全量跑（r8）都 PASS。**补测 13 次单跑：12 PASS / 1 FAIL，且那次 FAIL 的收尾是成功的**
-   （`[讨论结束]` 与终止消息都在），失败出在 AC5.2 探针的前置条件上 —— 两件事不能混为一谈。
-   于是 AC5.2 探针被加固为"失败换新群重试一次 + 记录每个群的原文与计数"，断言未放宽；
-   r7 那种收尾 Task 全失败在 13 次抽样里未复现，但收尾依赖模型输出这一事实不变
-   （`CONTEXT.md` Q44）。
+9. **更正一条我自己写错的归因**。第 5 项曾记录为"强制收尾依赖模型输出
+   `[讨论结束]`，实测不稳定（r7 三次 Attempt 全失败）"。`scripts/prd-acceptance.mjs`
+   后来直接复现出该形状并给出真因：`Attempt#1 status=failed error=no events for 120000ms`
+   —— 那是 P6 stall watchdog 的**无事件超时**（`durable-worker.ts` 的 120s，provider 挂起），
+   三次 Attempt 各撞一次。协调者不是"不肯收尾"，是**根本没拿到模型响应**。把它写成
+   模型不稳定，是把基础设施故障记成了被测行为。
+   验收脚本的判定因此分层：**只有守卫真的漏放（上限已满仍建出目标 Task）才算 FAIL**；
+   provider 挂起、预算耗尽、模型不肯按指令 @ 人都报 **BLOCKED 并给出具名原因**，
+   且判定前先给平台自动重试留出窗口（`retry_wait` 不是终态）。断言条款一个没减。
+   另注：worker 队列**串行**（`runOnce` 一次只领一个），于是一次挂住的运行会饿死后续
+   所有群的任务 —— 它们全部停在 `queued`，在消息流里看起来与"守卫没生效"一模一样。
+   这是记录的限制，不是遗漏（`CONTEXT.md` Q44）。

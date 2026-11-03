@@ -442,6 +442,82 @@ describe("POST /api/rooms/:id/messages (I3 mention trigger)", () => {
   });
 });
 
+describe("PATCH /api/rooms/:id (AC5.4 configurable round cap)", () => {
+  const setup = async (name: string) => {
+    const h = await buildTestApp(name);
+    // Built directly, like the AC5.1 case above: the imported sample package has two
+    // agents and would make a two-mention message resolve only one target, which
+    // would leave the cap untested for the wrong reason.
+    const room = h.rooms.createRoom({ projectId: "my-team-agents", name: "可配置上限", maxRounds: 5 }, 100);
+    const lead = h.rooms.addAgent({
+      roomId: room.id, name: "协调者", prompt: "You coordinate.",
+      agentDir: join(h.base, "persona/lead"), isCoordinator: true,
+    }, 101);
+    h.rooms.addAgent({ roomId: room.id, name: "架构师", prompt: "You design.", agentDir: join(h.base, "persona/arch") }, 102);
+    h.rooms.addAgent({ roomId: room.id, name: "QA", prompt: "You test.", agentDir: join(h.base, "persona/qa") }, 103);
+    return { h, room, lead };
+  };
+
+  it("writes the cap and the guard enforces the number the caller set", async () => {
+    const { h, room, lead } = await setup("cap-patch");
+    expect(h.rooms.getRoom(room.id)?.maxRounds).toBe(5);
+
+    const res = await h.app.inject({
+      method: "PATCH", url: `/api/rooms/${room.id}`, payload: { maxRounds: 2 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as { maxRounds: number }).maxRounds).toBe(2);
+    expect(h.rooms.getRoom(room.id)?.maxRounds).toBe(2);
+
+    /**
+     * The assertion that matters is not that the column changed — it is that the
+     * guard reads it. Two mentions against cap 2 consume the budget exactly, so a
+     * wrap-up is queued and `roundCount` stops at 2. Under the room's original cap
+     * of 5 the same message would have queued no wrap-up at all, which is what makes
+     * this a behavioural test rather than a storage one.
+     */
+    const trigger = await h.app.inject({
+      method: "POST", url: `/api/rooms/${room.id}/messages`,
+      payload: { content: "@架构师 @QA 一起看" },
+    });
+    expect(trigger.statusCode).toBe(201);
+    expect(h.rooms.getState(room.id).roundCount).toBe(2);
+    const wrapUp = h.store.listTasks().find((t) => (t.idempotencyKey ?? "").startsWith("wrapup:"));
+    expect(wrapUp?.memberId).toBe(lead.id);
+    await h.close();
+  });
+
+  it("rejects out-of-range values instead of clamping them", async () => {
+    const { h, room } = await setup("cap-bounds");
+    for (const bad of [0, -1, 101, 3.5, "3"]) {
+      const res = await h.app.inject({
+        method: "PATCH", url: `/api/rooms/${room.id}`, payload: { maxRounds: bad },
+      });
+      expect(res.statusCode, `maxRounds=${JSON.stringify(bad)} rejected`).toBe(400);
+      expect((res.json() as { code: string }).code).toBe("INVALID_MAX_ROUNDS");
+    }
+    // A rejected write must not have moved the stored value.
+    expect(h.rooms.getRoom(room.id)?.maxRounds).toBe(5);
+    await h.close();
+  });
+
+  it("answers 404 for an unknown room and 400 when nothing is updatable", async () => {
+    const { h, room } = await setup("cap-errors");
+    const missing = await h.app.inject({
+      method: "PATCH", url: "/api/rooms/room-does-not-exist", payload: { maxRounds: 3 },
+    });
+    expect(missing.statusCode).toBe(404);
+    expect((missing.json() as { code: string }).code).toBe("ROOM_NOT_FOUND");
+
+    const empty = await h.app.inject({
+      method: "PATCH", url: `/api/rooms/${room.id}`, payload: {},
+    });
+    expect(empty.statusCode).toBe(400);
+    expect((empty.json() as { code: string }).code).toBe("NO_UPDATABLE_FIELD");
+    await h.close();
+  });
+});
+
 describe("room routes do not disturb existing APIs", () => {
   it("keeps /api/tasks and /api/pi working with normal JSON bodies", async () => {
     const h = await buildTestApp("regression");
