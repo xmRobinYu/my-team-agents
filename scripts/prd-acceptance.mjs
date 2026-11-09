@@ -749,6 +749,7 @@ async function item4(base) {
   const dupInChain = new Set(st.chain).size !== st.chain.length;
   const bMsg = turnMsgs.filter((m) => m.authorKind === "agent" && m.authorAgentId === b.id).at(-1);
   backEdge = !!bMsg && bMsg.content.includes(`@${a.name}`);
+  const bTask = turn.filter((t) => t.memberId === b.id).at(-1);
   ev.push(`最后一个用户轮次起点：msg seq=${lastUser.seq} created_at=${new Date(lastUser.createdAt).toISOString()}；该轮 Task 数=${turn.length}`);
   ev.push(`room_state：chain=${JSON.stringify(st.chain)}（${st.chain.map(agentName).join(" → ")}）round_count=${st.roundCount} terminated=${st.terminated}`);
   ev.push(`【流程守卫·循环】系统消息：${loop.map((m) => `[seq ${m.seq}] ${clip(m.content, 260)}`).join(" | ") || "（无）"}`);
@@ -757,7 +758,16 @@ async function item4(base) {
   ev.push(`本轮 ${b.name} 进群原文（回边是否成立）：${clip(bMsg?.content, 300) || `（本轮 ${b.name} 没发言）`}`);
 
   if (!backEdge) {
-    ev.push(`结论：真实模型不肯形成回边（B 没有回 @ A）→ 本项在真实模型下没有跑通。`);
+    // 归因必须先分诊，不能直接写成「模型不肯形成回边」。实测：某次运行里 B 的 Task 是
+    // `status=failed attempts=3` —— 回边根本没机会发生，那是**运行失败**，不是模型不配合。
+    // 把前者写成后者正是 Q44/§9.9 记过的错（provider 无事件超时曾被记成「模型不肯收尾」）。
+    const why = triageUnobserved(bTask?.id, { hasReply: !!bMsg });
+    ev.push(`回边未成立的原因（对 ${b.name} 的 Task ${bTask?.id?.slice(0, 13) ?? "无"} 分诊）：${why.kind} —— ${why.why}`);
+    if (loop.length > 0 && !dupInChain && aTriggers === 1) {
+      ev.push(`注意：本轮确实落了一条 LOOP 阻断，但它是 ${a.name} 在自己那句话里同时 @ 了 ${b.name} 和 `
+        + `@${a.name}（A→A 一跳）被拒，不是 AC4.1 要求的 ${a.name}→${b.name}→${a.name} 回边形状。`);
+    }
+    ev.push(`结论：本项在真实模型下没有跑通（AC4.1 要求的 A→B→A 回边未发生）。`);
     ev.push(`A→B→A 的阻断目前只有 mock 级证明（packages/orchestrator/src/room-guards.test.ts 的 AC4.1 用例）；本报告不把它算作真实模型通过。`);
     record("4", title, "BLOCKED", ev);
   } else {
