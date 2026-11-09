@@ -270,3 +270,14 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
     未要求 UI，故不计未完成，但它是 `packages/web` 缺口的同类，一并记在这里。
     教训：**复选框不是证据**。回答"是否全部完成"必须以实现 + 测试 + 真实运行为准，
     两处如果冲突，先查代码再回答。
+
+14. **默认验收模型会因外部配额而不可用，验收因此必须在预检处停下**。本轮实测：直接调用
+    `pi --model airouter/deepseek-v4.1-flash` 返回
+    `402 {"type":"free_request_quota_exhausted","message":"DeepSeek v4 flash 福利版当前使用人数
+    较多，请稍后再试；或切换模型代号为 deepseek-v4-flash 立即使用"}`。这是配额，不是缺陷。
+    预检在 64s 内把它变成 `ABORT ... 退出码 2`，而不是六项各烧满 300s 换一墙 BLOCKED ——
+    这正是 Q45 想要的区分。provider 建议的 `airouter/deepseek-v4-flash` 6.7s 就绪，可用
+    `PI_SMOKE_MODEL` 覆盖后重跑。
+    另记一条实测缺陷（已修）：外部 `timeout`/Ctrl-C 只杀本进程，detached worker 会活下来并
+    继续持有临时 SQLite（实测留下 18 分钟的野进程 + 整个临时目录）。现在
+    `SIGINT/SIGTERM/SIGHUP` 都走 `teardown(130)`。
