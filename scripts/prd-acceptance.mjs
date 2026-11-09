@@ -1217,6 +1217,18 @@ function teardown(code) {
   process.exit(code);
 }
 
+// An external `timeout`/Ctrl-C kills only THIS process; the worker is detached in
+// its own process group and survives, holding the temp SQLite. Measured: `timeout
+// 1100` on the full six-item run left a live worker (18m elapsed) and its temp dir
+// behind. So a signal must still go through teardown. Registered here because
+// WORK/store/workers exist from this point on.
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    console.error(`\n收到 ${sig}，回收 worker 与临时目录后退出`);
+    teardown(130);
+  });
+}
+
 /** 前置条件不满足（含 provider 不应答）：退出码 2，且必须先把 worker 收掉。 */
 function abortInfra(msg, hint) {
   console.error(`\nABORT: ${msg}${hint ? `\n  ${hint}` : ""}`);
