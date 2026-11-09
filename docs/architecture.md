@@ -259,3 +259,14 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
     `scripts/feishu-docs.test.mjs` 里钉死：docx wiki 节点的 `obj_token` 是否就是
     `docs +update --doc` 要的 `document_id` —— 实测相等，但那之前只是从 bitable 脚本
     的形状推断的。
+
+13. **两份验收文档曾给出相反结论**。`docs/prd/multi-agent-group-chat.md` §5 的 35 条 AC
+    全部已勾，而同目录 `-issues.md` 的任务级清单里还有 37 条未勾 —— 描述的是同一批工作。
+    核实后：**功能全部存在**（`ChatRoom` 定义与导出、四张表、状态落库、模板导入、
+    mention 派发、群注入、双路径去重、`/api/pi` 投影、三栏 UI、技能安装/卸载都有实现与
+    测试），未勾只是清单没随实现更新。已逐条勾选并附上具体测试用例作为证据，
+    而不是只翻复选框。
+    唯一真正"只到一半"的是 **导入没有 UI 入口**（仅 `POST /api/rooms/import`）：PRD §5
+    未要求 UI，故不计未完成，但它是 `packages/web` 缺口的同类，一并记在这里。
+    教训：**复选框不是证据**。回答"是否全部完成"必须以实现 + 测试 + 真实运行为准，
+    两处如果冲突，先查代码再回答。

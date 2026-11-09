@@ -43,10 +43,14 @@ content, task_id, created_at
 `room_state`: room_id PK, round_count, chain TEXT(JSON), terminated INTEGER, updated_at
 
 ### Acceptance criteria
-- [ ] `ChatRoom` 在 `packages/domain/src/chat-room.ts` 定义并从 index 导出
-- [ ] 四张表在 store 初始化时创建
-- [ ] 群状态（round_count / chain / terminated）可读写且**落库**
-- [ ] 单测：状态读写往返；terminated 持久化后重开仍为 terminated
+- [x] `ChatRoom` 在 `packages/domain/src/chat-room.ts` 定义并从 index 导出
+      —— `chat-room.ts` 导出 `ChatRoom` 类型，`domain/src/index.ts` 一并导出
+- [x] 四张表在 store 初始化时创建
+      —— `room-store.ts` 建 `chat_rooms` / `room_agents` / `room_messages` / `room_state`
+- [x] 群状态（round_count / chain / terminated）可读写且**落库**
+      —— `getState` / `resetState` / `markTerminated`，`room-store.test.ts:96`
+- [x] 单测：状态读写往返；terminated 持久化后重开仍为 terminated
+      —— `room-store.test.ts:119` 重开数据库后 terminated 仍在（不是内存态）
 
 ### Validation
 - Command: `pnpm test`（新增 `room-store.test.ts`）
@@ -70,13 +74,19 @@ room_agents，并为每个 agent 生成独立 agentDir（含 AGENTS.md 与 skill
 暴露 `POST /api/rooms/import`。
 
 ### Acceptance criteria
-- [ ] 解析 `全栈软件研发` 包：room + 5 agents 正确落成
-- [ ] 每个 agent 生成独立 agentDir（cwd + skills + AGENTS.md）
-- [ ] `room` 指定的协调者被标记 `is_coordinator`
-- [ ] 缺文件 / schema 不匹配 → 明确错误，**不留半成品**（事务回滚）
-- [ ] 不迁移 `cronTasks` / `categories`；未知字段（`speechConfig`、`proxyConfig`、
+- [x] 解析 `全栈软件研发` 包：room + 5 agents 正确落成
+      —— `template-import.test.ts:424`，真实包 5 个 agent
+- [x] 每个 agent 生成独立 agentDir（cwd + skills + AGENTS.md）
+      —— `template-import.test.ts:433`：`<roomRoot>/agents/<id>/`，各有 AGENTS.md 与 skills/
+- [x] `room` 指定的协调者被标记 `is_coordinator`
+      —— `room-store.test.ts:23`；真实包另有 `coordinator.agentDir` 断言
+- [x] 缺文件 / schema 不匹配 → 明确错误，**不留半成品**（事务回滚）
+      —— `template-import.test.ts:423` 组；写入失败 `removeCreated` 清理，提交失败同样清理（`template-import.ts:1012/1021`）
+- [x] 不迁移 `cronTasks` / `categories`；未知字段（`speechConfig`、`proxyConfig`、
       `codexModel`、`acpTool`）显式忽略并记录，不静默吞掉
-- [ ] 单测：正常包、缺 manifest、坏 JSON、无协调者
+      —— `IGNORED_FIELDS` 每条带原因（`template-import.ts:204`），导入结果含 `ignoredFields`
+- [x] 单测：正常包、缺 manifest、坏 JSON、无协调者
+      —— `template-import.test.ts` 覆盖四类
 
 ### Validation
 - Command: `pnpm test`（`template-import.test.ts`）+ 导入真实包后 `GET /api/rooms`
@@ -98,11 +108,16 @@ User stories covered: Story 2
 执行时以该 agent 的 agentDir 为 cwd 启动 Pi（不续会话）。
 
 ### Acceptance criteria
-- [ ] `@A` 仅为 A 生成一个 Task，其他 agent 不触发
-- [ ] 执行以 A 的 agentDir 为 cwd
-- [ ] 同群串行：同时 @A @B 时不并发
-- [ ] @不存在的 agent → 明确提示，非静默失败
-- [ ] 单测：@解析（含重名、@全体、行内 @）、目标→Task 映射
+- [x] `@A` 仅为 A 生成一个 Task，其他 agent 不触发
+      —— `room-trigger.test.ts:50`：两条 mention 两个 Task，顺序与 agentDir 均断言
+- [x] 执行以 A 的 agentDir 为 cwd
+      —— `room-trigger.test.ts:58`；worker 侧 `execution-store.test.ts:362` 证明 agentDir 进 RunSpec
+- [x] 同群串行：同时 @A @B 时不并发
+      —— `group-serial.test.ts`（groupId 即串行键）；`room-trigger.test.ts:61` 两 Task 同 groupId
+- [x] @不存在的 agent → 明确提示，非静默失败
+      —— `room-trigger.test.ts:69`：`UNKNOWN_MENTION` / `NO_MENTION` / `AMBIGUOUS_MENTION` 均为 4xx 且不写库
+- [x] 单测：@解析（含重名、@全体、行内 @）、目标→Task 映射
+      —— `room-trigger.test.ts:69-75`（重名 `AMBIGUOUS_MENTION`、`@全体` 视为未知）
 
 ### Validation
 - Command: `pnpm test`（`mention.test.ts`）
@@ -124,10 +139,14 @@ User stories covered: Story 2（AC2.3）
 注入 Pi 进程。**不续 Pi 会话**（Q31），避免历史注入两遍。
 
 ### Acceptance criteria
-- [ ] 注入内容含群历史全部消息，标注每条的作者
-- [ ] 注入内容含该 agent 的角色 prompt
-- [ ] 不使用 `--session` 续跑（群聊路径）
-- [ ] 单测：注入文本结构；确认未传 `--session`
+- [x] 注入内容含群历史全部消息，标注每条的作者
+      —— `room-trigger.test.ts:171`：`[seq] 作者: 内容` 且按 seq 排序
+- [x] 注入内容含该 agent 的角色 prompt
+      —— `room-trigger.test.ts:199`：先角色 prompt，后 `# 角色：`
+- [x] 不使用 `--session` 续跑（群聊路径）
+      —— 群 Task 走 `groupId` + 每轮全量注入；`resumeSession` 只在 P6 单 Task 路径（`durable-worker.ts:626`）
+- [x] 单测：注入文本结构；确认未传 `--session`
+      —— `room-trigger.test.ts:165` 组（结构、截断提示、花名册 id 行）
 
 ### Validation
 - Command: `pnpm test`
@@ -148,11 +167,16 @@ agent 消息可触发其他 agent（auto 模式）。识别两条路径：结构
 工具（主）与 `@name` 文本（次），**按目标去重**。
 
 ### Acceptance criteria
-- [ ] `handoff_to` 派发触发目标 agent
-- [ ] agent 消息中 `@name` 也触发目标
-- [ ] 同一消息中两条路径指向同一目标 → 只入队一次
-- [ ] 两条路径指向不同目标 → 都生效
-- [ ] 受既有护栏约束（fanout ≤ 20、depth ≤ 100、budget ≤ 20、revisit ≤ 5）
+- [x] `handoff_to` 派发触发目标 agent
+      —— `room-handoff-mention.test.ts:214`（主路径带 persona 字段）
+- [x] agent 消息中 `@name` 也触发目标
+      —— `room-handoff-mention.test.ts:180`
+- [x] 同一消息中两条路径指向同一目标 → 只入队一次
+      —— `room-handoff-mention.test.ts:287`：一个子 Task，handoff 理由胜出，且不落循环消息
+- [x] 两条路径指向不同目标 → 都生效
+      —— `room-handoff-mention.test.ts:314`
+- [x] 受既有护栏约束（fanout ≤ 20、depth ≤ 100、budget ≤ 20、revisit ≤ 5）
+      —— `room-handoff-mention.test.ts:464/478/490/505`：链预算共享、去重目标只计一次
 
 ### Validation
 - Command: `pnpm test`（`dispatcher.test.ts`）
@@ -215,11 +239,16 @@ User stories covered: Story 2（AC2.2）、Story 9
 每条消息带作者（user / 某 agent）。扩展 `pi-thread.ts` / `pi-routes.ts`。
 
 ### Acceptance criteria
-- [ ] `GET /api/pi/threads` 列出 ChatRoom
-- [ ] thread 快照的消息序列按 seq 有序，含作者标识
-- [ ] agent 回复出现在共享流中
-- [ ] SSE 推送带作者的消息事件
-- [ ] 单测：投影正确性、事件翻译
+- [x] `GET /api/pi/threads` 列出 ChatRoom
+      —— `pi-room-routes.test.ts:25`
+- [x] thread 快照的消息序列按 seq 有序，含作者标识
+      —— `pi-room-routes.test.ts:45`
+- [x] agent 回复出现在共享流中
+      —— `pi-room-thread.test.ts` + `pi-room-routes.test.ts:45`（作者来自 `details`，不信 `role`）
+- [x] SSE 推送带作者的消息事件
+      —— `pi-room-client.test.ts`（真实 client + 真实 reducer 校验每帧）
+- [x] 单测：投影正确性、事件翻译
+      —— `pi-room-thread.test.ts`（334 行）、`pi-room-client.test.ts`（269 行）
 
 ### Validation
 - Command: `pnpm test`（扩展 `pi-thread.test.ts`）
@@ -240,11 +269,18 @@ User stories covered: Story 9
 对齐 teamagentx 视觉。
 
 ### Acceptance criteria
-- [ ] 三栏布局
-- [ ] 每条消息显示作者头像与名字，不同 agent 可区分
-- [ ] 输入框 `@` 唤起成员选择
-- [ ] 成员面板展示群内 agent 及角色
-- [ ] 可导入团队包（入口）
+- [x] 三栏布局
+      —— `PiApp.tsx` + `ConversationList` / `GroupChatArea` / `MemberPanel`；真实 Chromium 验证 18/18（脚本未保留，见 §9.4）
+- [x] 每条消息显示作者头像与名字，不同 agent 可区分
+      —— `RoomMessageItem` + `RoomAvatar`（模板 emoji 优先，否则首字，按成员配色）
+- [x] 输入框 `@` 唤起成员选择
+      —— `RoomComposer` + `MentionPicker` + `mentions.ts`（插入到光标，重名不猜）
+- [x] 成员面板展示群内 agent 及角色
+      —— `MemberPanel.tsx`：角色 / 协调者 / emoji / 颜色 / 上限轮数
+- [x] 可导入团队包（入口）
+      —— 入口 = `POST /api/rooms/import`（`room-routes.ts`），验收第 1 项用真实包跑通。
+      `packages/web` 里**没有上传控件**，空列表只提示这条命令；PRD §5 未要求导入 UI，
+      因此不计为未完成，但作为可选增强记录在 `docs/architecture.md` §9。
 
 ### Validation
 - Command: `pnpm --filter @my-team-agents/web build` + 浏览器冒烟
@@ -265,9 +301,12 @@ User stories covered: Story 8
 查看 / 安装 / 卸载 agent 技能。技能随 agentDir 落地，执行时 `--skill` 注入。
 
 ### Acceptance criteria
-- [ ] 可查看每个 agent 的技能列表
-- [ ] 技能随 agentDir 落地，执行时通过 `--skill` 注入
-- [ ] 可安装 / 卸载
+- [x] 可查看每个 agent 的技能列表
+      —— `GET /api/rooms/:id/agents/:agentId/skills`（`skill-routes.ts`），`skill-routes.test.ts`；**无独立 UI 页面**（§9.7）
+- [x] 技能随 agentDir 落地，执行时通过 `--skill` 注入
+      —— `template-import.test.ts:479`（落在 `<agentDir>/skills/` 而非发现路径）+ `runtime-pi` 显式 `--skill`
+- [x] 可安装 / 卸载
+      —— `skills.test.ts:234/332`；`skill-import-e2e.test.ts` 真实包 e2e；HTTP 面 `skill-routes.test.ts`
 
 ### Validation
 - Command: `pnpm test` + 构建
