@@ -877,6 +877,37 @@ worker 构造 `RunSpec` 时压根不设 `thinking`，于是群声明 `thinkingMo
   "没有声明时不要凭空发明一个档位"，与接线无关。新增测试若撤掉修复还全绿，
   它证明的就不是修复。
 
+### Q48 — 一个坏 agentDir 打死整个 Worker，以及"ENOENT"的两副面孔 (2026-11-11)
+**A**: `runtime-pi` 的 spawn 失败不再杀死进程：`streamEvents` 里新增 `failRun()`，
+同时（1）终止事件流、（2）reject `done`、（3）`done.catch()` 兜底；
+`settle()` 收到 `cwd`，用 `spawnFailureMessage(error, cwd)` 把 ENOENT 分叉成
+"工作目录不存在"或"`pi` 不在 PATH 上"两种具名结论。
+**R**: 端到端验证 `thinkingMode` 时撞出来的。前若干轮每次都停在
+`Error: spawn pi ENOENT`，错误读起来就是"pi 没装"，于是排查方向是 PATH ——
+而真因是我自己脚本里那个 `persona-arch` 目录**从未创建**。实测确认 Node 对
+"cwd 不存在"与"二进制不存在"给出**逐字相同**的 `ENOENT / syscall: "spawn pi" /
+path: "pi"`，所以那条错误在两种成因下无法区分。这正是 Q45 记过的同一类误诊
+（把 PATH 错配说成未安装），只是这次误导的方向换成了 cwd。
+- **为什么必须修**：`PiAdapter.streamEvents` 把 spawn 错误交给 `fail(err)`，
+  而 `fail` 只 reject `streamEvents` 返回的 `done`。**那个 Promise 返回后无人观察**
+  （`start()` 只交出 `events.iterable` 和 `settle()` 两条通道），未处理拒绝在
+  Node ≥15 直接致命 —— 于是一个 `agentDir` 被删掉的 Task 会带走整个 worker 进程，
+  连带**所有群里排队中的任务**。AGENTS.md 对 dispatcher 明写"a runtime that throws
+  on `start()` must degrade to `failed`, never propagate"，而真正违背它的却是
+  runtime 本身。这条不变量此前只在 dispatcher 一层被检查过。
+- **诊断放在错误出口，不做 `start()` 预检**：预检 `existsSync(agentDir)` 会把大量
+  使用合成 `agentDir`（`/persona/arch` 之类）的既有单测全部判失败，等于把一个
+  诊断变成行为变更。放在 `settle()` 的 `error` 监听里，只在真的 ENOENT 时才查
+  一次 cwd，非 ENOENT 原样返回。
+- **事件流必须一起终止**：只挂 `done.catch()` 会让消费者的 `for await` 永远等一个
+  再也不会写字节的子进程 —— 证伪时两种撤法暴露两种不同的失败（撤 `failRun` →
+  测试超时；撤 `done.catch` → 2 条 unhandled rejection），所以这两半都是必需的，
+  不是冗余。
+- **真实端到端取证**（真 API 进程 + 真 worker 进程 + 真模型，同一队列两个任务）：
+  worker 存活、坏任务 `failed` 且错误点名缺失目录、排在后面的健康任务照常执行并
+  真实发言。`thinkingMode` 那条链也同批取证：PATH wrapper 记录到的真实 argv 含
+  `--thinking high`，任务 `succeeded` 且回复落进群流。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

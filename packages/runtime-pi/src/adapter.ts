@@ -196,6 +196,35 @@ function textOf(record: JsonRecord): string | undefined {
   return undefined;
 }
 
+/**
+ * Name the real cause of a failed `spawn("pi", ...)`.
+ *
+ * Node reports a missing working directory with the SAME `ENOENT` /
+ * `syscall: "spawn pi"` / `path: "pi"` it uses for a missing binary -- measured
+ * against the real runtime. That conflation cost a full investigation: the
+ * message reads "pi is not installed", so the obvious response is to reinstall
+ * pi, which cannot fix a deleted persona directory. It is the same class of
+ * misattribution recorded in CONTEXT.md Q45 ("PATH 错配说成未安装").
+ *
+ * `PiAdapter` spawns with `cwd: agentDir ?? workspacePath`, and `agentDir` is
+ * data -- it comes from `room_agents.agent_dir`, which template import writes and
+ * an operator can delete out from under a room. So the cwd is checked here, at
+ * the one point where the error is already in hand, rather than pre-flight in
+ * `start()`: a pre-flight check would reject the synthetic `agentDir` paths that
+ * most adapter tests pass, turning a diagnostic into a behavioural change.
+ */
+export function spawnFailureMessage(error: unknown, cwd: string): string {
+  const base = error instanceof Error ? error.message : String(error);
+  const code = (error as { code?: string } | null)?.code;
+  if (code !== "ENOENT") return base;
+  if (!existsSync(cwd)) {
+    return `${base} -- 但 \`pi\` 本身可执行；真正原因是工作目录不存在：${cwd}`
+      + `（room_agents.agent_dir 指向的 persona 目录已被删除或从未导入）`;
+  }
+  return `${base} -- 工作目录 ${cwd} 存在，所以这是 \`pi\` 不在 PATH 上`
+    + `（不是未安装：见 scripts/resolve-bin.mjs 与 CONTEXT.md Q45）`;
+}
+
 export interface PiAdapterOptions {
   /** Explicit always. Never leave trust to a saved decision in a non-interactive host. */
   approveProjectResources: boolean;
@@ -291,7 +320,8 @@ export class PiAdapter implements RuntimeAdapter {
     // session grouping all key off the working directory (upstream docs/cli.md), so
     // the persona dir can only take effect as cwd. The accepted cost: while an
     // agentDir run is active the agent cannot see the project workspace.
-    const child = spawnFn("pi", args, { cwd: spec.agentDir ?? spec.workspacePath });
+    const cwd = spec.agentDir ?? spec.workspacePath;
+    const child = spawnFn("pi", args, { cwd });
 
     // A holder is used because the settled promise must be created before the
     // parser can call it, and the parser is what sees `agent_settled`.
@@ -309,7 +339,7 @@ export class PiAdapter implements RuntimeAdapter {
       settledHolder.sessionFile = file;
       settledHolder.onSessionFile?.(file);
     });
-    const settled = this.settle(child, spec.runId, settledHolder);
+    const settled = this.settle(child, spec.runId, settledHolder, cwd);
 
     // Kick off the run. `prompt` resolving means accepted, NOT completed
     // (node_modules/@earendil-works/pi-coding-agent/docs/rpc.md).
@@ -417,6 +447,33 @@ export class PiAdapter implements RuntimeAdapter {
       notify();
     };
 
+    /**
+     * A spawn/protocol failure has to do MORE than reject `done`.
+     *
+     * `done` is returned by `streamEvents` and observed by nobody: `start()` hands
+     * out `events.iterable` and `settle()`. Rejecting a promise with no handler is
+     * an unhandled rejection, and Node >= 15 makes that fatal -- so a Task whose
+     * `agentDir` had been deleted took the whole Worker process down with
+     * "Error: spawn pi ENOENT" instead of failing that one run. That violates the
+     * critical path in AGENTS.md ("a runtime that throws on start() must degrade to
+     * failed, never propagate").
+     *
+     * So: end the stream the same way a normal finish does (otherwise the consumer's
+     * `for await` waits forever on a child that will never write), and attach a
+     * no-op handler to `done` so the rejection cannot escalate. The error still
+     * reaches the caller -- `settle()` listens to the same `error` event and resolves
+     * `status: "failed"` with the message, which is what the Worker records.
+     */
+    const failRun = (err: Error): void => {
+      finished = true;
+      notify();
+      fail(err);
+    };
+    done.catch(() => {
+      // Reported through RunResult.error by `settle()`; handled here only so it
+      // cannot escalate into an unhandled rejection.
+    });
+
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       buffer += chunk;
@@ -486,7 +543,7 @@ export class PiAdapter implements RuntimeAdapter {
       }
     });
 
-    child.on("error", (err) => fail(err));
+    child.on("error", (err) => failRun(err));
     child.stdout.on("end", finish);
     child.on("exit", finish);
 
@@ -518,6 +575,7 @@ export class PiAdapter implements RuntimeAdapter {
     child: ChildProcessWithoutNullStreams,
     runId: string,
     holder: { onSettled?: (record: JsonRecord) => void; sessionFile?: string },
+    cwd: string,
   ): Promise<RunResult> {
     return new Promise((resolve) => {
       let settled = false;
@@ -533,7 +591,8 @@ export class PiAdapter implements RuntimeAdapter {
       holder.onSettled = (record: JsonRecord) => {
         finish({ runId, status: record.aborted === true ? "aborted" : "completed" });
       };
-      child.on("error", (error) => finish({ runId, status: "failed", error: error.message }));
+      child.on("error", (error) =>
+        finish({ runId, status: "failed", error: spawnFailureMessage(error, cwd) }));
       child.on("exit", (code, signal) => {
         finish({ runId, status: signal ? "aborted" : "failed",
           error: `Pi exited before agent_settled (${code ?? signal ?? "unknown"})` });

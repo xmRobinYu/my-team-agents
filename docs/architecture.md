@@ -300,3 +300,33 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
       看起来像"守卫没生效"。我本人踩过一次，该次结果作废。
     - `settleRoom` 的安静判据是"本群所有 Task 终态 **且** 任务集合连续 3s 不变"；
       `running` 不是终态，所以它不会提前返回。第一次那个"1.2s 就返回"纯粹是预算没了。
+    - **`missing valid structured result` 的真因是限流，不是模型不肯按格式作答**。
+      同一提示直接调 `pi -p --model airouter/deepseek-v4.1-flash --thinking high`
+      时，provider 回的是
+      `429 {"message":"inference exceeds tpm/rpm limit","code":"RateLimitExceeded.EndpointTPMExceeded"}`。
+      平台把一次被限流的运行记成 `failed attempts=3`，看起来像模型行为问题
+      （我先前就照这个思路误判过一次）。**分辨方法**：日志里若只有
+      `missing valid structured result` 而无 provider 报错，应先用同一模型直接跑一次
+      最小调用取证，再决定这是产品缺陷还是配额。`pi` 的错误不会自动落进
+      `tasks.error`，所以 `tasks.error` 单独不足以归因。
+
+16. **一个坏 `agentDir` 曾打死整个 Worker 进程**（已修，2026-11-11）。
+    `PiAdapter.streamEvents` 把 spawn 失败交给 `fail(err)`，而 `fail` 只 reject
+    `streamEvents` 返回的 `done` —— 那个 Promise **返回后无人观察**（`start()` 只
+    交出 `events.iterable` 与 `settle()`）。未处理拒绝在 Node ≥15 是致命的，于是
+    `agentDir` 被删掉的一个 Task 会带着**所有群里排队中的任务**一起死。
+    AGENTS.md 对 dispatcher 明写 "a runtime that throws on `start()` must degrade to
+    `failed`, never propagate"，而违背它的正是 runtime 自己。
+    现在 `failRun()` 同时终止事件流（否则消费者的 `for await` 会永远等一个再也不会
+    写字节的子进程），并给 `done` 挂兜底 handler；错误仍经 `settle()` 的 `error`
+    监听器进入 `RunResult.error`，由 worker 记成该次运行 `failed`。
+    真实端到端取证（真 API + 真 worker + 真模型，两个任务同一队列）：worker 进程
+    存活、坏任务 `failed`、排在它后面的健康任务照常执行并真实发言。
+    - **顺带修掉一条误导性错误**：Node 对"cwd 不存在"和"二进制不存在"给出**完全相同**的
+      `ENOENT / syscall: "spawn pi" / path: "pi"`（实测）。原先的错误读起来就是
+      "`pi` 没装"，于是排查从重装开始 —— 与 Q45 记过的"PATH 错配说成未安装"同一类
+      误诊，这次也确实让我按错方向追了若干轮。现在 `spawnFailureMessage()` 按
+      `cwd` 是否存在分叉：目录缺失就点名目录并指出 `room_agents.agent_dir`，
+      目录在才说 `pi` 不在 PATH 上。诊断放在**错误出口**而不是 `start()` 预检：
+      预检会拒掉大量单测用的合成 `agentDir`，把一个诊断变成行为变更。
+
