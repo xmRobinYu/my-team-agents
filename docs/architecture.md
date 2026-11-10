@@ -281,3 +281,22 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
     另记一条实测缺陷（已修）：外部 `timeout`/Ctrl-C 只杀本进程，detached worker 会活下来并
     继续持有临时 SQLite（实测留下 18 分钟的野进程 + 整个临时目录）。现在
     `SIGINT/SIGTERM/SIGHUP` 都走 `teardown(130)`。
+
+15. **第 4 项（A→B→A 真实模型回边）仍未在真实模型下观察到，两次实测给出了具名原因**。
+    2026-11-10 两次跑第 4 项，两种不同形状，都不是"守卫漏放"：
+    - 第一次：A 的 Task `status=failed attempts=3`，`error=missing valid structured result
+      (outcome, summary, artifacts, remainingRisks)`，模型的原始输出是它自己的
+      `AGENTS.md` 正文。A 一个字都没进群，回边无从谈起。
+    - 第二次：A 成功发言，但**一句话里同时 @ 了 B 和 @ 自己**，于是被 `LOOP` 拦成
+      A→A 一跳（群里落下 2 条 `【流程守卫·循环】`）；B 的 Task 也 `failed attempts=3`，
+      同一个 `missing valid structured result`。链是 `A → B`，B 从未发言。
+    探针现在把这两种形状分开报（`absent` / `failed` / `A→A 假 LOOP`），并明说
+    "落了一条 LOOP 不等于回边成立"。**A→B→A 的确定性证明仍只有 mock**：
+    `packages/orchestrator/src/room-guards.test.ts:347`（真实 `applyRoomGuards` +
+    真实 store，断言第二跳不建 Task、留系统消息）。
+    实测附带的两个坑，写在这里免得下一个人重踩：
+    - `MTA_I10_ITEM_MS` 的单位是**毫秒**（默认 `300_000`）。按"秒"传 `600` 会让单项
+      预算只剩 0.6s，`settleRoom` 一进场就因超时返回，任务状态还是 `running`，
+      看起来像"守卫没生效"。我本人踩过一次，该次结果作废。
+    - `settleRoom` 的安静判据是"本群所有 Task 终态 **且** 任务集合连续 3s 不变"；
+      `running` 不是终态，所以它不会提前返回。第一次那个"1.2s 就返回"纯粹是预算没了。

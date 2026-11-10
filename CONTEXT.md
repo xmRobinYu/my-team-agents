@@ -779,14 +779,27 @@ fnm/nvm/volta/asdf 各版本全局 bin，版本目录按数值降序），并把
 - **绝不做 `feishu-cli` 回退**：它是另一个工具（v1.29，`doc`/`bitable` 子命令），
   与脚本用的 `docs +update` / `base +table-list` 简写语法命令面不兼容；回退只会把
   "PATH 里没有"换成一条更费解的 "unknown command"。
-- **keychain 的真实状态与先前记录不同**：`~/.lark-cli/config.json` 的
-  `appSecret.source` 仍是 `keychain`，而 `config keychain-downgrade` 写了
-  `master.key.file` 却**没有翻转这个 source**（实测：把文件移走，报错一字不变）。
-  且 `master.key.file`(10-30) 比两个 `.enc`(10-18/10-29)**更新** —— 降级时生成了新主密钥，
-  旧密文用已丢失的旧密钥加密，不可解。user token 已于 2026-05-31 过期。
-  实测本 shell **能**读写系统钥匙串（`config init` 成功落 keychain、
-  `security add-generic-password` 成功），所以先前"沙箱封锁钥匙串"的说法是错的：
-  真相是那个特定条目被删了。飞书同步因此仍需一次真实授权，不是环境问题。
+- **keychain 的真实状态（2026-11-10 更正）**：这里的旧结论 —— "主密钥已丢失、
+  唯一出路是重新授权" —— 是**错的**，它把"活动 profile 坏了"误诊成"整台机器的凭据坏了"。
+  实测（均为只读命令，可复现）：
+  - `lark-cli profile list` 有两个 profile：`cli_aa5e5b0f0238dccf`（`active=true`
+    但 `tokenStatus=error`）与 `mta-sync`（`tokenStatus=valid`）。**坏的是活动的那一个。**
+  - `master.key.file` 在 `~/Library/Application Support/lark-cli/`（32B，非
+    `~/.lark-cli/`），密钥**是好的**：用 AES-256-GCM（nonce 取密文前 12 字节）能解开
+    `appsecret_cli_aa9040474fb8dcbd.enc` 与 `cli_aa9040474fb8dcbd_ou_92c7…enc`；
+    解出的 user token `expiresAt=2026-11-10T02:03:12`、`refreshExpiresAt=2026-11-17T00:03:12`
+    —— **不是**"2026-05-31 过期"。解不开的只有 `cli_aa5e5b…` 那套（旧主密钥加密）。
+  - 因此 `keychain not initialized` 的真实含义是：该 profile 的密文用已不存在的旧主密钥
+    加密，解不开后回落空的钥匙串 —— 不是沙箱封锁，也不是主密钥被删。
+  - `config.json` 的 `appSecret.source` 至今仍是 `keychain`，`keychain-downgrade`
+    确实没翻转它；但 **`credentialSource` 才是运行期实际用的读法**（好 profile 报
+    `"local"`），`source` 只是 appSecret 这一个字段的登记方式，不足以判定"降级没生效"。
+- **修法只需切换活动 profile**：`lark-cli profile use mta-sync`（一次性、可逆，
+  `lark-cli profile use -` 切回）。切换后**不带任何环境变量**实测：
+  `sync-docs` 10/10、`sync-bitable` 7/7、`verify-docs`、`verify-bitable` 全部 exit 0，
+  且 `wiki +node-get` 用该 profile 返回真实节点（`owner=ou_92c7…`）。
+  排查脚本**不需要**改代码：它故意不传 `--profile`，跟着活动 profile 走 —— 这是对的，
+  把 app id 硬编码进仓库反而会让换机器/换 app 时必须改代码。
 - **建节点不再是人工步骤**：`sync-feishu-docs.mjs` 原先遇到占位 ID 就**拒绝**并要人去飞书
   建节点、把 token 抄回 manifest —— 而 `sync-feishu-bitable.mjs` 早就用
   `wiki +node-create` 自己开通 Base 并回写配置。同一个仓库里两套约定，docs 那套还把
