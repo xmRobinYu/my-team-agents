@@ -849,6 +849,34 @@ fnm/nvm/volta/asdf 各版本全局 bin，版本目录按数值降序），并把
   失败不是凭据问题，是 device code 的 **600s 服务端硬窗口**和我发消息-用户读到之间的延迟
   赛跑；把码直接放进回复并同时挂后台轮询后，93s 完成。
 
+### Q47 — `thinkingMode` 的断链：三段都有测试，缝上没有 (2026-11-10)
+**A**: `RoomAgent.thinkingMode` 现在真的进到命令行。`durable-worker` 新增
+`personaThinking(task, memberId)`，在每次运行时按成员 id 从花名册派生
+`RunSpec.thinking`，接入主 `start()` 与 `dispatchInput()` 两处。
+**R**: 这条链的两端当时都已经有测试 —— `thinking_mode` 落库（`room-store.test.ts`）、
+模板迁移（`template-import.test.ts`）、Pi 把 `spec.thinking` 变成 `--thinking`
+（`runtime-pi/src/skills.test.ts` 连 argv 顺序都钉死了）。**唯独中间那段没人测**：
+worker 构造 `RunSpec` 时压根不设 `thinking`，于是群声明 `thinkingMode: "high"`
+静默按适配器默认值跑。两端都绿、行为却是错的，这比任一端漏测更隐蔽 ——
+断言必须落在"worker 交给适配器的 spec"上，因为那才是值消失的地方。
+- **派生，而不是写进 Task**：`tasks` 表没有 `thinking` 列，加列要在这个
+  `node:sqlite` 实验内核上手写 `ALTER TABLE`（Q44 已记两次列补丁的技术债）。
+  派生还顺手解决了另一件事：`dispatchInput` 派出的子 Task 也在 `execute` 里跑，
+  于是子 Task 用的是**自己**的 `thinkingMode`，不是父的 —— 这本来就是正确语义，
+  若把值复制到父 Task 再继承，就会变成"架构师想多深，QA 也被迫想多深"。
+- **取值必须收紧**：`thinking_mode` 是 `TEXT`，值来自模型写的团队模板。
+  `--thinking` 是拼进 argv 的，原样透传等于让模板内容控制一个命令行 token。
+  现在按 Pi 的闭合集合（`off/minimal/low/medium/high/xhigh/max`，见
+  `runtime-core/src/adapter.ts:80`）判定，集合外一律丢弃并保留适配器默认值 ——
+  一个错的推理档位不该把整次执行废掉。
+- **代价写在明处**：编辑 `thinking_mode` 从下一次触发生效（含重试），不是当次。
+  这与人格技能在 spawn 时读取的规则一致，所以"人格作用域的设置按次读"是一条规则，
+  不是两条例外。
+- **证伪过**：撤掉两处接线后，`thinking-mode.test.ts` 的 5 条里有 2 条立刻变红
+  （父档位、子 Task 用自己的档位），其余 3 条按设计仍绿 —— 那 3 条断言的是
+  "没有声明时不要凭空发明一个档位"，与接线无关。新增测试若撤掉修复还全绿，
+  它证明的就不是修复。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

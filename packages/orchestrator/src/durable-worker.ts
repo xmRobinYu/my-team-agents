@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
-import type { CanonicalEvent, RuntimeAdapter } from "@my-team-agents/runtime-core";
+import type { CanonicalEvent, RunSpec, RuntimeAdapter } from "@my-team-agents/runtime-core";
 import { DEFAULT_GUARDRAILS, TERMINATION_MARKER, evaluateHandoff } from "@my-team-agents/domain";
 import type { ChatRoom, RoomAgent } from "@my-team-agents/domain";
 import { ExecutionStore, type AttemptRecord, type TaskRecord, type TaskResult } from "./execution-store.js";
@@ -254,6 +254,43 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
   }
 
   /**
+   * `RoomAgent.thinkingMode` reached the database, the template importer and Pi's
+   * own `--thinking` flag, but never the run: `personaFields` only carried
+   * `agentDir`/`model`, so every run asked for the adapter default. A room that
+   * declares `thinkingMode: "high"` for its reviewer therefore bought nothing.
+   *
+   * Deliberately DERIVED from the roster on every run instead of stored on the
+   * Task, unlike `agentDir`/`model`:
+   *  - it costs no schema migration (`tasks` still wins over a new column only if
+   *    you accept a hand-written `ALTER TABLE` in an experimental `node:sqlite`),
+   *  - a child Task dispatched by an agent (`dispatchInput`) gets the SAME
+   *    treatment as the parent, because `execute` runs for both and reads the row
+   *    for `task.memberId` — the persona that is about to speak, never the parent's.
+   * The cost is honest: editing `thinking_mode` takes effect on the next trigger,
+   * including a retry. That matches how persona skills already work (read at spawn
+   * time), so it is one rule for persona-scoped settings, not two.
+   *
+   * Values are CLAMPED to Pi's documented set. `thinking_mode` is free text
+   * (`TEXT`) and comes from model-authored templates, so passing it through
+   * verbatim would put an attacker/template-controlled string onto a command line.
+   * An unrecognised value is dropped — the run keeps the adapter default rather
+   * than failing, because a bad thinking level must not cost a whole execution.
+   */
+  const THINKING_LEVELS = new Set<NonNullable<RunSpec["thinking"]>>(
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  );
+  function personaThinking(
+    task: TaskRecord,
+    memberId: string,
+  ): { thinking?: NonNullable<RunSpec["thinking"]> } {
+    if (!rooms || !task.groupId) return {};
+    const raw = rooms.getAgent(memberId)?.thinkingMode?.trim().toLowerCase();
+    if (!raw) return {};
+    if (!THINKING_LEVELS.has(raw as NonNullable<RunSpec["thinking"]>)) return {};
+    return { thinking: raw as NonNullable<RunSpec["thinking"]> };
+  }
+
+  /**
    * Idempotency anchor for the `@name` path. There is no tool call, so the id is
    * synthesised — and it must be STABLE across an Attempt replay, because
    * `completeSuccess` dedupes children on `outbox(source_tool_call_id,
@@ -384,6 +421,7 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       // I5/bug-C: a group child must run AS its own persona, not in the parent's
       // workspace with the parent's model.
       ...personaFields(task, entry.memberId),
+      ...personaThinking(task, entry.memberId),
     };
   }
 
@@ -623,6 +661,7 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
         // consumes it; the rest ignore it and keep using workspacePath.
         ...(task.agentDir ? { agentDir: task.agentDir } : {}),
         ...(task.model ? { model: task.model } : {}),
+        ...personaThinking(task, task.memberId),
         ...(resumeSession
           ? { session: {
               sessionId: basename(task.sessionFile!, ".jsonl"),
