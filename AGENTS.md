@@ -103,6 +103,7 @@ and the UI with `pnpm --filter @my-team-agents/web dev`. The server's `dev` scri
 | Tests without any build | all packages | `just test-no-build` | yes |
 | Real Pi end-to-end | runtime-pi + live model | `just pi-smoke` | no (needs pi + network) |
 | Template import evidence | `packages/orchestrator/src/template-import.ts` | `just verify-import` | no (needs local `ref/` zips) |
+| P9 real-process acceptance | auth / budget / tell / parallel / peer | `just p9-smoke` | no (needs build; `peer` needs `ref/AIHOT`) |
 | PRD §6 群聊验收 | orchestrator+server+real model | `node scripts/prd-acceptance.mjs` | no (needs pi + provider + network) |
 
 Every `just …` command above resolves to a real `justfile` target; a row whose
