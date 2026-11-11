@@ -315,25 +315,56 @@ test("primaryKey must be the first declared field", () => {
   );
 });
 
+test("phaseStatus follows the MARKER, not the prose around it", () => {
+  // The bug this pins: `🚧 进行中（P9a…P9e 已做完，剩 P9d）` contains 完成, and the
+  // keyword-only mapper returned 完成 — a phase with unfinished work reported as
+  // done, straight into the tracker. The marker is the declared state; the
+  // parenthetical is commentary.
+  assert.equal(phaseStatus("🚧 进行中（I1–I10 已做完，剩建群入口未接 UI）"), "进行中");
+  assert.equal(phaseStatus("🚧 进行中（P9a/P9b/P9c/P9e 已做完，剩 P9d 执行隔离）"), "进行中");
+  assert.equal(phaseStatus("✅ 完成"), "完成");
+  assert.equal(phaseStatus("⬜ 待启"), "待启");
+  // With NO marker, a row that claims 完成 while also saying 待/剩/未 is
+  // contradictory, and the honest reading of a contradiction is 未标注.
+  assert.equal(phaseStatus("完成（剩 P9d）"), "未标注");
+  assert.equal(phaseStatus("完成"), "完成");
+  assert.equal(phaseStatus("进行中"), "进行中");
+  assert.equal(phaseStatus(""), "未标注");
+});
+
 /* ------------------------------------------------------------- real documents */
 
 test("the live docs parse into the documented shape", () => {
   const real = buildSnapshot(read("docs/project-plan.md"), read("CONTEXT.md"));
-  assert.equal(real.phases.length, 10);
-  assert.deepEqual(
-    real.phases.map((p) => p.key),
-    ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7a", "P7b", "P8"],
-  );
-  assert.equal(real.milestones.length, 6);
-  assert.deepEqual(
-    real.milestones.map((m) => m.key),
-    ["M1", "M2", "M3", "M3.5", "M4", "M5"],
-  );
-  assert.ok(real.items.some((i) => i.key === "M3.5#4"));
-  assert.equal(real.risks.length, 5);
-  assert.equal(real.deferred.length, 5);
-  assert.ok(real.decisions.highest >= 35);
+
+  // Invariants, not a snapshot of this week's prose. An earlier version pinned
+  // `phases.length === 10` and the exact key list, so ADDING A MILESTONE ROW —
+  // the normal thing a plan does — failed the suite. That is a test that fights
+  // the document instead of checking the parser, and it also hid the real risk:
+  // a row the parser cannot read a status for.
+  assert.ok(real.phases.length >= 10, `expected at least the 10 known phases, got ${real.phases.length}`);
+  for (const key of ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7a", "P7b", "P8"]) {
+    assert.ok(real.phases.some((p) => p.key === key), `phase ${key} disappeared from the plan`);
+  }
+  assert.equal(new Set(real.phases.map((p) => p.key)).size, real.phases.length, "duplicate phase key");
+  // The load-bearing one: every row must carry a status, or the tracker silently
+  // shows a phase as unstarted.
   assert.equal(real.phases.filter((p) => p.status === "未标注").length, 0);
+  assert.ok(real.phases.every((p) => p.name.trim() !== ""), "a phase row parsed with an empty name");
+
+  assert.ok(real.milestones.length >= 6);
+  for (const key of ["M1", "M2", "M3", "M3.5", "M4", "M5"]) {
+    assert.ok(real.milestones.some((m) => m.key === key), `milestone ${key} disappeared`);
+  }
+  assert.ok(real.items.some((i) => i.key === "M3.5#4"));
+  assert.ok(real.risks.length >= 5);
+  assert.ok(real.deferred.length >= 5);
+  assert.ok(real.decisions.highest >= 35);
+  // Every milestone row must belong to a milestone the plan actually declares.
+  const declared = new Set(real.milestones.map((m) => m.key));
+  for (const item of real.items) {
+    assert.ok(declared.has(item.key.split("#")[0]), `item ${item.key} has no declared milestone`);
+  }
 });
 
 /* ------------------------------------------------------------- mass removal */

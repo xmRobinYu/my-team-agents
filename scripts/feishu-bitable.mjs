@@ -80,14 +80,35 @@ function sectionTable(md, heading, expectHeader) {
 
 const PHASE_RE = /^(P\d+[a-z]?)\s+(.+)$/;
 
-/** Map a Chinese phase/milestone marker to a fixed select option, preserving honesty. */
+/**
+ * Map a Chinese phase/milestone marker to a fixed select option, preserving honesty.
+ *
+ * The MARKER wins over the prose, in this order, because the prose is where a
+ * status lies: `🚧 进行中（P9a…P9e 已做完，剩 P9d）` contains the word 完成, and the
+ * previous keyword-only version read that as 完成 — a phase with unfinished work
+ * reported as done. `normalize` strips the emoji, so the marker is matched on the
+ * RAW cell before it is normalised away.
+ *
+ * A row with a marker AND contradictory prose still follows the marker: the marker
+ * is the declared state, the parenthetical is commentary. A row with NO marker falls
+ * back to keywords, which is the pre-existing behaviour for the older rows.
+ */
 export function phaseStatus(raw) {
+  const text = String(raw ?? "");
+  if (text.includes("✅")) return "完成";
+  if (text.includes("🚧") || text.includes("🟡")) return "进行中";
+  // ⬜ / ☐ is an UNCHECKED box, not a status: it says "not done" and nothing about
+  // which kind, so `⬜ 下一步` must stay 下一步. Only a bare box with no words means 待启.
+  if ((text.includes("⬜") || text.includes("☐")) && normalize(raw) === "") return "待启";
+
   const t = normalize(raw);
-  if (t.includes("完成") && !t.includes("待")) return "完成";
   if (t.includes("下一步")) return "下一步";
   if (t.includes("待启")) return "待启";
   if (t.includes("进行") || t.includes("开发中")) return "进行中";
-  if (t === "") return "未标注";
+  // Only now is 完成 safe to trust: with no marker present, a row that says
+  // "完成" and also says "待"/"剩"/"未" is contradictory, and the honest reading of
+  // a contradiction is 未标注, not the optimistic branch.
+  if (t.includes("完成") && !/(待|剩|未)/.test(t)) return "完成";
   return "未标注";
 }
 
