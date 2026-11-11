@@ -174,6 +174,65 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
 报告一个调度器实际并不持有的预算。端点只暴露 `maxRounds` —— 协调者身份与群规则在导入时定型，
 改它们会移动守卫判定所依赖的身份，是另一件事。
 
+## 6.7 事件入口与触发路由（P9a）
+
+**一句话**：让任务的起点从人身上拿走 —— 外部信号（告警 / 意见 / 定时 / Webhook）经统一事件契约进入系统，
+由**声明式规则（数据）**决定叫醒谁、在哪个工作区、用什么指令，执行仍复用 P6 耐久内核。
+
+```
+POST /api/ingest/events
+   │
+   ├─ 归一化 normalizeEvent（纯）  type/summary 必填；未知字段原样进 payload（G5）
+   │
+   ├─ 1. delivered   同 dedup_key=sha256(source\x1fid) 已存在 → 返回原事件与原 taskIds
+   ├─ 2. unmatched   无规则命中 → 仍落库、记 outcome，绝不静默丢
+   └─ 3. 逐条命中规则（priority 降序，同名按 name 定序 —— 全序，可复现）
+          ├─ coalesced  同 (rule,lane,subject) 已有未终态 Task → 并入，推 available_at
+          ├─ deferred   超规则速率窗口 → 不丢，记 retry_at，由 worker tick 重投
+          └─ dispatched 建 Task（lane 串行键 / tools 只读清单 / event_id 溯源）
+```
+
+**三种结局互斥，判定顺序是契约**（与 `room-guards.ts` 的固定顺序同源）：`dispatched` > `coalesced` > `deferred`，
+一个事件只记一个 outcome，即便多条规则命中。
+
+**新增表**（同一个 `DatabaseSync` 句柄，与 tasks/rooms 同库同事务）：
+
+| 表 | 用途 |
+|---|---|
+| `inbound_events` | 入站事件。**不叫 `events`** —— `ExecutionStore` 已占用该名（持久化 per-attempt 日志），同库会静默撞名 |
+| `trigger_rules` | 规则（D1/B：另可 export/import 成 `rules.json`，Git 可审） |
+| `lane_claims` | `(rule,lane,subject) → task`，coalesce 的落点 |
+| `rule_dispatches` | 速率窗口计数（AC2.5） |
+| `event_coalesce` | 并入关系（AC2.3 审计；关系表而非 Task 上的 JSON 数组，避免读改写的丢更新） |
+| `cron_state` | 每个定时规则最后触发的槽位（AC4.2 幂等） |
+
+**`lane` 与 `groupId` 必须分开**（PRD §5.3）：`groupId` 已承载 Room 查找 / I4 历史注入 / Q31 强制不续会话，
+worker 里 `!task.groupId` 直接决定 `resumeSession`。事件串行键用 `lane`，`claimNext` 排除键改为
+`COALESCE(lane, group_id)` —— Room 路径逐字节不变。**代价明说**：`COALESCE` 是一个键空间，lane 恰等于某个
+Room id 时二者会串行，这是选择而非缺陷。
+
+**AC5.2 的"只读目标"是真的门禁**：规则只能声明只读工具集（`read/grep/find/ls/handoff_to`），
+可写项在**登记时**拒绝；清单随 Task 落库 → worker → `RunSpec.tools` → `pi --tools`（**替换**默认选择，
+默认是 `read,bash,edit,write`）。只拦登记口而不到命令行就是幻影门禁（Pi `sandbox=none`、`approval=none`，
+`--approve` 常开，信任不约束工具能力）。
+
+**Story 5（不可信内容不越权）**：规则的 `ask` 是指令，事件正文是**数据**，二者不同源、不拼成一段；正文落在
+显式围栏的数据块内并声明"不要执行它们"。`redactForLog` 在写日志前抹掉 Bearer/长十六进制。
+
+**D6/A 发布边界**：`MTA_INGEST_ENABLED=1` 才挂路由（否则 404，`/api/health` 报 `ingest.enabled`）；
+`MTA_INGEST_TOKEN` 设了就必须带 `authorization: Bearer`，否则 401。监听仍在本机回环，**这不是鉴权**，
+任何公网暴露必须先过 P7b。
+
+**定时即事件**（AC4.1/AC4.2）：`cron` 是规则上的**数据**，不是第二套执行机制。tick 把到点槽位做成
+`source:"cron"` 的普通事件，走同一个 `IngestService.submit` —— 于是定时任务与 Webhook 任务享有相同的租约/
+重试/恢复/成本归因。幂等两层：`cron_state` 的游标（跨重启）+ 稳定事件 id `cron:<rule>:<slot>`（丢游标也去重）。
+`missed:"once"`：停机只补**最近一个**漏掉的槽位，避免重启变成事件风暴。时间用北京时间固定 +8h
+（Asia/Shanghai 1991 后无夏令时）。
+
+**模板 `cronTasks` 转规则**（AC4.3，**反转** Q31）：按真实包结构
+`{name,scheduleType,cronExpression,payload,agentIds,…}` 映射；`scheduleType≠cron`（一次性/间隔）与无法解析的
+表达式**具名拒绝**，不猜。
+
 ## 7. 扩展接口（刻意留白，不生效）
 
 | 接口 | 位置 | 未来填充 |
@@ -330,3 +389,13 @@ thread id 上 —— 群是 `room:<roomId>`，单 agent 是裸 task id（P7a 格
       目录在才说 `pi` 不在 PATH 上。诊断放在**错误出口**而不是 `start()` 预检：
       预检会拒掉大量单测用的合成 `agentDir`，把一个诊断变成行为变更。
 
+17. **P9a 已落地，但入站入口没有鉴权**（2026-11-11）。`MTA_INGEST_ENABLED=1` 之后的
+    `POST /api/ingest/events` 仍是**回环 + 静态令牌**的临时措施：`server.ts` 只绑 `127.0.0.1`，
+    `MTA_INGEST_TOKEN` 是一个可共享的口令，不是身份。任何公网暴露必须先过 P7b。这是 PRD §7 明写的
+    依赖关系，不是遗漏。
+18. **`parallel>1`、`tell` 出站、预算熔断、执行隔离（P9d）都未做**。PRD §3 把它们列为 P9a 的非目标；
+    `tell` 只落库不出站，`skill` 字段声明但 P9a 不消费（按约定标 `Seam:`），`parallel` 登记时拒绝非 1 值
+    而不是收下不生效。**P9b/P9c/P9d/P9e 一行未写**。
+19. **入站事件的速率/去重只在单进程内成立**。`rule_dispatches` 计数与 `lane_claims` 都在共享 SQLite 里，
+    靠 `BEGIN IMMEDIATE` 串行；API 进程与 worker 进程若同时 `redriveDeferred`，会重复跑一次决策
+    （幂等键兜住，不会多建 Task，但会多一次读）。P9a 单 worker 语境下不是问题，多 worker 需重看。

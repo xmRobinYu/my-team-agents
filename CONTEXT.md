@@ -908,6 +908,38 @@ path: "pi"`，所以那条错误在两种成因下无法区分。这正是 Q45 �
   真实发言。`thinkingMode` 那条链也同批取证：PATH wrapper 记录到的真实 argv 含
   `--thinking high`，任务 `succeeded` 且回复落进群流。
 
+### Q49 — P9a 事件入口：D1-D6 定案与四条不变量 (2026-11-11)
+**D1/B**: 规则存 `trigger_rules` 表 **且** 可 `GET /rules/export` 成 `rules.json` 单向导入（Git 可审）。**D2/A**:
+`inbound_events` 新表 + `tasks` 加 `lane`/`event_id`/`tools`。**D3/A**: 一规则一目标。**D4/A**: 定时器在**进程内**
+（worker 进程，因为它负责建 Task），`missed:"once"` 幂等。**D5/A**: `lane` 与 `groupId` 分开，`parallel` 只允许 1。
+**D6/A**: 入口默认**关**，`MTA_INGEST_ENABLED=1` 才开。
+
+**R**: 四条踩过的坑，都不是可推断的：
+
+1. **`events` 表名已被占用**。`ExecutionStore` 早就有一张 `events`(持久化 per-attempt 事件日志)，而新表**共用同一个
+   数据库文件**。`CREATE TABLE IF NOT EXISTS events` 会静默 no-op，然后在第一次 INSERT 才炸。新表因此叫
+   `inbound_events`。
+2. **AC5.2 照字面写是"永远无法通过的门禁"**。PRD 说「目标 agent 的可写工具配置在 P9d 隔离落地前拒绝登记」，
+   但 `RoomAgent` 没有工具字段，Pi 默认就是 `read,bash,edit,write` —— 照字面实现会拒绝**每一条**规则。
+   AGENTS.md 明禁这种"无法通过的幻影门禁"。实测 `pi --help` **有 `--tools` 允许清单**，于是把门禁做成真的：
+   规则只能声明只读工具集，`validateRuleInput` 拒绝任何可写项，且这个清单**随 Task 落库、由 worker 传进
+   `RunSpec.tools`、最终成为 `--tools` 参数**。只在登记口拦一下而不到执行，就是幻影门禁。
+3. **`lane` 不能复用 `groupId`**。`groupId` 在 P8 已承载三重语义，且 worker 里 `!task.groupId` 决定
+   `resumeSession`（Q31）——事件任务若拿 `groupId` 当串行键，会连带关掉会话续用、并读一个不存在的 Room。
+   `claimNext` 改成 `COALESCE(lane, group_id)`，**Room 分支逐字节不变**（AC3.3 用现有 group-serial 测证）。
+   代价说清楚：`COALESCE` 是**一个键空间**，所以一个恰好叫 `room-<uuid>` 的 lane 会与该 Room 串行 —— 这是
+   契约不是 bug，测试里钉住了。
+4. **`cronTasks` 由丢弃改为转换（AC4.3 反转 Q31）**。`scheduleType!="cron"`（一次性/间隔）与无法解析的表达式
+   **具名拒绝**，不猜成定时任务；拒绝项进 `cronRefused` 与 warnings，仍然"不静默"。
+
+**迁移账本**：顺手把 P8 补丁的另一半做了 —— `schema_migrations` 表 + `applyMigrations`，替掉 `ExecutionStore`
+构造函数里那段手写 `PRAGMA table_info`。账本本身是新的，所以**每个 `up` 必须幂等**：对账本存在前建的库，
+账本是空的但列可能已在，靠 `addColumnIfMissing` 先看现实再动手。
+
+**证据**：`ingest.test.ts`(9) + `ingest-guards.test.ts`(9) + `ingest-cron.test.ts`(9) + `migrations.test.ts`(7) +
+`server/ingest-routes.test.ts`(8) + `runtime-pi/tools-allowlist.test.ts`(3)；真实服务进程 15/15（真 socket、
+401、`--tools`、注入围栏、重投 200）。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

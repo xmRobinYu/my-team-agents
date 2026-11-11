@@ -14,6 +14,19 @@ size_limits:
   max_file_lines: 800
   max_complexity: 15
 
+# P9a: the first surface where external bytes enter the platform. Before this,
+# "no external input" was guaranteed only by binding the listener to 127.0.0.1
+# plus a verbal boundary (Q23) — no stated limit at all. These are real, enforced
+# thresholds (the PRD asked for exactly this): truncation happens in `normalizeEvent`,
+# the tool allowlist is refused at rule registration AND reaches `pi --tools`, and the
+# entry is opt-in. Everything below is enforced by code, not aspiration.
+ingest_limits:
+  summary_chars: 200
+  detail_chars: 4000
+  writable_tools: forbidden   # AC5.2 — Pi sandbox=none/approval=none, so a writable target is refused until P9d
+  enabled_by_default: false   # D6/A — MTA_INGEST_ENABLED=1 is required
+  requires_token: true        # AC5.3 — when MTA_INGEST_TOKEN is set; not authentication (P7b gate)
+
 enforcement:
   # No phantom enforcement: eslint is NOT installed, so no lint surface is declared.
   typecheck: block
