@@ -940,6 +940,82 @@ path: "pi"`，所以那条错误在两种成因下无法区分。这正是 Q45 �
 `server/ingest-routes.test.ts`(8) + `runtime-pi/tools-allowlist.test.ts`(3)；真实服务进程 15/15（真 socket、
 401、`--tools`、注入围栏、重投 200）。
 
+### Q50 — P9b/P9c/P9e：把"声明了但没强制"的五件事变成可证伪的 (2026-11-12)
+**A**: 五条都改，其中一条**推翻 Q49 的 D5 后半**：
+
+1. **鉴权（取代 Q49 D6 的"令牌可选"）**。旧契约是"没配令牌 => 只绑回环，不鉴权"，
+   于是 `MTA_INGEST_ENABLED=1` 单独就是一个**开放入站端点**，而 `/api/health` 对此
+   一字不提。现在：开了就必须有 ≥24 字符的令牌，否则**关闭并报 reason**；
+   `MTA_INGEST_ALLOW_ANON=1` 是唯一匿名通道，且启动即在 stderr 告警。
+   - **短令牌绝不降级成匿名**：那会把一次误配变成一扇开着且有"有人设过令牌"说辞的门。
+   - 比较走 `timingSafeEqual`；长度不等时与自身比较，使返回值不从响应时序里漏前缀。
+   - POST 路由带 64 KiB `bodyLimit`。`normalizeEvent` 的截断发生在 Fastify **已经把
+     整个 payload 缓冲之后**，所以只有路由级上限才是对**字节**的约束。
+2. **速率/去重计数**：先前报告说它们是进程内的，**说错了** —— 它们在 SQLite
+   （`countDispatchesSince`）。真正的竞态在别处：`redriveDeferred` 先读 `dueRetries()`
+   再**无条件** `clearRetry()`，两个 worker 会各自 redrive 同一事件。幂等键挡住了重复
+   Task，但**输家仍把决策重跑一遍**，看到赢家的 lane claim 后把结局从 `dispatched`
+   改写成 `coalesced`，并顺手推迟了那个刚建好的 Task。改为 `claimRetry`：一条条件
+   UPDATE，在既有 `BEGIN IMMEDIATE` 内，只有一个人看到 `changes=1`。
+3. **`max_file_lines` 以前是"一个没人读的数字"**。新增 `scripts/check-file-size.mjs`，
+   **棘轮**而非大爆炸：既有超标文件按**当前行数**记入 baseline，只能减不能增；新文件
+   超标即失败；文件已降回限额内而 baseline 条目未删也失败（否则豁免会永久化）。
+   选棘轮的理由：要求先拆完四个不相关文件才准提交会阻塞无关工作，而把限额抬到能容纳
+   它们会让这个数字变成假话。已实测**确实会失败**（801 行新文件；baseline 文件涨 1 行），
+   并且它当场逮到我自己在 `durable-worker.ts` 造成的增长（904→959），逼我改成拆分而不是
+   重设 baseline。
+4. **拆分**：`template-import.ts`(1166，动工前已超标) 按它**自己文档里的三段式**切开
+   —— `template-types` / `template-readers` / `template-parse` / `template-import`(425)；
+   公开面不变（旧 import 站点照旧解析，106 个既有测试一字未改地通过）。
+   `durable-worker.ts` 分出 `worker-result.ts` / `worker-notes.ts`，落在 901（baseline 904）。
+5. **P9b/P9c/P9e**：
+   - **`error_kind` 是闭集，且在各调用点显式赋值，绝不从散文里猜**。预算耗尽进
+     `blocked` 而不是 `retry_wait`：重试一个已经花完预算的 Task 只会再花一遍，然后把
+     结果叫作 `failed`，等于把运维设的上限算成 agent 的错。检查放在**解读回复之前**，
+     否则被预算截断的回复会被报成 `result_invalid`。
+   - **`tell` 终于被消费**。单一通道（`MTA_TELL_WEBHOOK`，未配置即沉默）；`tell_log`
+     账本按**通知的身份** `(rule, subject, kind)` 建键，而不是按 Task —— 所以"定过的事
+     不问第二遍"能跨重试、跨进程重启成立。冷却是**另一套机制**：身份与频率是两件事。
+     先认领后发送 => 已送达者永不重发，被拒者可重试。
+   - **`skill` 之所以一直无效，原因比注释写的更深**：事件 Task **不带 `agentDir`**，
+     而 Pi 的 `--skill` 正是从 `agentDir` 推导的 —— 所以任何事件驱动的 runs 从来加载不到
+     任何 persona 技能。现在派发时逐个解析 persona（agentDir/model/可加载技能），登记时
+     拒绝目标并不持有的 slug，prompt 里在**指令语态**点名该技能（绝不放进围栏数据块）。
+   - **`parallel`：推翻 Q49 D5 的"只允许 1"**。PRD 说放开要改内核，确实改了：`claimNext`
+     的谓词从"该键有活 Attempt 就排除"改为"**按 Task 的 `parallel` 计数**"。键空间
+     **没动**，所以 `parallel=1` 与旧的 `NOT EXISTS` 完全等价 —— `group-serial.test.ts`
+     **未经修改即通过**。I3 AC3（一群一并发）是 **Room 模型的不变量**，不是谁都能调的旋钮，
+     因此 `insertTask` 对带 `groupId` 的 Task 一律钳到 1，不指望调用方记得。上限 8：
+     一条无上限的 lane 就是"把整个 worker 池交出去"的原语。
+   - **P9e 读了对端的真实字节**，发现任何单测都抓不到的缺口：`wakeAgent` 发的是
+     `{id,type,subject,summary,detail,link}`，**根本没有 `source`** —— 按 P9a 的实现，
+     文档里那个对端的每一条告警都会吃 400。新增 `MTA_INGEST_SOURCE`；验收脚本用
+     resolve hook 直接跑**上游自己的** `wakeAgent`。
+
+**R**:
+- **`bodyLimit` 不是插件级选项**。Fastify 只在**路由级**读它；挂在 `register()` 上会
+  被静默忽略，测试里表现为"超大 body 照样 200"。
+- **JS 模板字符串里写 SQL 注释不能带反引号**，两次踩中（`tell_log` 建表、`claimNext`
+  谓词）：反引号会终止模板，报错位置还落在后面的行上。
+- **`ruleFrom` 里硬写了 `parallel: 1`**（P9a 的假设留在读取端）。登记返回真实值、
+  重新读取返回 1 —— 同一个规则会不会并发，取决于它有没有被重读过。
+- **测试脚手架自己也会骗人**：探针最初用"每进程峰值"衡量跨进程并发（两个进程各 1，
+  看起来就是 1），又因为 runner 会把 Task 重新排队、而 `claimNext` 按 `created_at`
+  排序，导致后一组 lane 被前一组的残留饿死。改为**每探针独立库 + 全局区间扫描**才测到
+  真相。这类"指标看不见被测对象"的坑，与产品缺陷同样值得记。
+- mock runtime 声明 `usageAttribution: "message"` 却**不产出 usage 事件** —— 与
+  `02d532f` 同一类 bug，并且它让 token 预算在真实模型之外根本无法验证。现已产出。
+
+**证据**：单测 564 passed（总 569，5 个 `MTA_REAL_PI` opt-in skip）；真进程
+19/19（真 HTTP server + 真 worker + 真 webhook 接收端：401/404/413/预算 blocked/
+卡片一次且仅一次）；P9e 11/11（跑上游 `wakeAgent`，含"重发 3 次仍只有 1 个 Task"）；
+并发 3/3 以**两个 OS worker 进程的全局峰值**度量（`parallel=2` 重叠、默认仍为 1、
+`parallel=4` 被进程数封顶）。门禁 `check`/`test-no-build`/`verify-docs`/`verify-bitable`/
+`verify-packages`/`test-guardrails`/`test-scripts`/`verify-file-size`/`verify-import` 全 0。
+
+**仍未做，且不粉饰**：**P9d 执行隔离**（本机有 docker 二进制但 daemon 未运行，任何
+"已隔离"的断言都无法测量，因此不写）；真正的鉴权/租户隔离/审计（P7b）。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

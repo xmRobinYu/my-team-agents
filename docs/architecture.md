@@ -205,6 +205,7 @@ POST /api/ingest/events
 | `rule_dispatches` | 速率窗口计数（AC2.5） |
 | `event_coalesce` | 并入关系（AC2.3 审计；关系表而非 Task 上的 JSON 数组，避免读改写的丢更新） |
 | `cron_state` | 每个定时规则最后触发的槽位（AC4.2 幂等） |
+| `tell_log` | 出站通知的**决策账本**（P9b）。主键是通知的身份 `(rule,subject,kind)`，不是 Task |
 
 **`lane` 与 `groupId` 必须分开**（PRD §5.3）：`groupId` 已承载 Room 查找 / I4 历史注入 / Q31 强制不续会话，
 worker 里 `!task.groupId` 直接决定 `resumeSession`。事件串行键用 `lane`，`claimNext` 排除键改为
@@ -219,8 +220,23 @@ Room id 时二者会串行，这是选择而非缺陷。
 **Story 5（不可信内容不越权）**：规则的 `ask` 是指令，事件正文是**数据**，二者不同源、不拼成一段；正文落在
 显式围栏的数据块内并声明"不要执行它们"。`redactForLog` 在写日志前抹掉 Bearer/长十六进制。
 
-**D6/A 发布边界**：`MTA_INGEST_ENABLED=1` 才挂路由（否则 404，`/api/health` 报 `ingest.enabled`）；
-`MTA_INGEST_TOKEN` 设了就必须带 `authorization: Bearer`，否则 401。监听仍在本机回环，**这不是鉴权**，
+**发布边界（D6/A + P7a 收紧，2026-11-12）**：`MTA_INGEST_ENABLED=1` 才挂路由；**开了就必须带一个
+可用令牌**，否则整块面**关闭**并在 `/api/health` 报 `reason`：
+
+| 配置 | `open` | `reason` | 效果 |
+|---|---|---|---|
+| 未 `ENABLED` | false | `DISABLED` | 路由不存在（404） |
+| `ENABLED=1`，无令牌 | false | `TOKEN_REQUIRED` | **关闭**（旧行为是开放，这是修掉的洞） |
+| `ENABLED=1`，令牌 < 24 字符 | false | `TOKEN_TOO_SHORT` | **关闭**，绝不降级成匿名 |
+| `ENABLED=1` + 令牌 | true | — | 每个请求必须 `authorization: Bearer`，否则 401 |
+| `ENABLED=1` + `ALLOW_ANON=1` | true | — | 唯一匿名通道，启动即在 stderr 告警 |
+
+三条实现细节各自对应一个真实失败模式：令牌比较走 `timingSafeEqual`（长度不等时与自身比较，
+使返回值不从响应时序里漏前缀）；`bodyLimit` 是**路由级**选项，挂在 `register()` 上会被 Fastify
+静默忽略，而 `normalizeEvent` 的截断发生在整个 payload 已被缓冲**之后**，所以只有路由级上限才是
+对**字节**的约束；`enabled` 必须是字面量 `1`，写成 `true` 保持关闭而不是猜。
+
+监听仍只绑 `127.0.0.1`，静态令牌是可共享口令而不是身份 —— **这仍然不是鉴权**，
 任何公网暴露必须先过 P7b。
 
 **定时即事件**（AC4.1/AC4.2）：`cron` 是规则上的**数据**，不是第二套执行机制。tick 把到点槽位做成
@@ -232,6 +248,41 @@ Room id 时二者会串行，这是选择而非缺陷。
 **模板 `cronTasks` 转规则**（AC4.3，**反转** Q31）：按真实包结构
 `{name,scheduleType,cronExpression,payload,agentIds,…}` 映射；`scheduleType≠cron`（一次性/间隔）与无法解析的
 表达式**具名拒绝**，不猜。
+
+**`tell` 出站与决策账本（P9b，2026-11-12）**：Task 进入 `blocked`/`failed` 时，命中规则的 `tell`
+决定是否说出去。三个设计点：
+
+- **单一通道**（`MTA_TELL_WEBHOOK`）。未配置即 `SILENT_CHANNEL` —— 默认值绝不能是一次意外的出站请求。
+- **账本按身份建键** `(rule, subject, kind)`，不是按 Task。所以"定过的事不问第二遍"跨重试、
+  跨进程重启成立；同一个 subject 经两个不同 Task 失败也只说一次。
+- **冷却是另一套机制**：身份回答"说过没有"，频率回答"多久能说一次"，混在一起就会要么漏报要么刷屏。
+- 先认领后发送 = 已送达者**永不**重发、被拒者**可以**重试；中间崩溃丢一条通知是可接受的取舍
+  （漏一次提醒 比 3 点刷屏 便宜）。
+
+**失败分类与预算熔断（P9c）**：`attempts.error_kind` 是**闭集**，在每个调用点**显式赋值**，
+绝不从错误散文里猜（唯一例外是适配器自己产出的字符串，走窄化的 `classifyRuntimeError`，
+认不出就是 `runtime_error` 而不是硬套一个具体原因）。**预算耗尽进 `blocked` 而不是 `failed`**：
+重试一个已经花完预算的 Task 只会再花一遍，然后把结果叫 `failed`，等于把运维设的上限算成 agent 的错。
+检查在**解读回复之前**，否则被预算截断的回复会被报成 `result_invalid`。累计用量取该 Task
+**所有 Attempt** 之和，所以重试不能把计量清零。
+
+**`parallel` 是内核语义，不是新字段（P9c）**：`claimNext` 的谓词从"该键有活 Attempt 就排除"
+改为"**按 Task 的 `parallel` 计数**"。键空间没动（`COALESCE(lane, group_id)`），`parallel=1`
+与旧的 `NOT EXISTS` 完全等价，所以 `group-serial.test.ts` **未经修改即通过**。I3 AC3（一群一并发）
+是 **Room 模型的不变量**，不是可调参数，因此 `insertTask` 对带 `groupId` 的 Task 一律钳到 1，
+写入端与读取端都钳（SQLite 的 INTEGER 亲和性会把 1.5 原样留着，不能指望 schema）。上限 8。
+
+**`skill` 为什么此前一直无效（P9b）**：注释写的是"P9a 声明但不消费"，真正原因更深 —— 事件 Task
+**不带 `agentDir`**，而 Pi 的 `--skill <dir>` 正是从 `agentDir` 推导的，所以任何事件驱动的 run
+从来加载不到任何 persona 技能。现在：派发时逐个解析 persona（`agentDir`/`model`/可加载技能清单），
+登记时**拒绝目标并不持有的 slug**（复用 I9 的 `listAgentSkills`，"在磁盘上"与"Pi 会加载"是两件事），
+prompt 在**指令语态**点名该技能、绝不放进围栏数据块。
+
+**对端事实（P9e）**：`ref/AIHOT` 的 `wakeAgent` 发的是 `{id,type,subject,summary,detail,link}`，
+**没有 `source`**。按 P9a 实现，文档里那个对端的每一条告警都会吃 400。因此入口接受
+`MTA_INGEST_SOURCE` 作为部署级默认来源（body 里显式的 `source` 永远优先）。部署契约的另一半：
+对端用 `authorization: Bearer $WEBHOOK_HUB_KEY`，所以**它的 hub key 就是本平台的
+`MTA_INGEST_TOKEN`** —— 两者配成不同值时每条告警都是 401，这不是假设，是第一次联调实测到的。
 
 ## 7. 扩展接口（刻意留白，不生效）
 
@@ -389,13 +440,29 @@ Room id 时二者会串行，这是选择而非缺陷。
       目录在才说 `pi` 不在 PATH 上。诊断放在**错误出口**而不是 `start()` 预检：
       预检会拒掉大量单测用的合成 `agentDir`，把一个诊断变成行为变更。
 
-17. **P9a 已落地，但入站入口没有鉴权**（2026-11-11）。`MTA_INGEST_ENABLED=1` 之后的
-    `POST /api/ingest/events` 仍是**回环 + 静态令牌**的临时措施：`server.ts` 只绑 `127.0.0.1`，
-    `MTA_INGEST_TOKEN` 是一个可共享的口令，不是身份。任何公网暴露必须先过 P7b。这是 PRD §7 明写的
-    依赖关系，不是遗漏。
-18. **`parallel>1`、`tell` 出站、预算熔断、执行隔离（P9d）都未做**。PRD §3 把它们列为 P9a 的非目标；
-    `tell` 只落库不出站，`skill` 字段声明但 P9a 不消费（按约定标 `Seam:`），`parallel` 登记时拒绝非 1 值
-    而不是收下不生效。**P9b/P9c/P9d/P9e 一行未写**。
-19. **入站事件的速率/去重只在单进程内成立**。`rule_dispatches` 计数与 `lane_claims` 都在共享 SQLite 里，
-    靠 `BEGIN IMMEDIATE` 串行；API 进程与 worker 进程若同时 `redriveDeferred`，会重复跑一次决策
-    （幂等键兜住，不会多建 Task，但会多一次读）。P9a 单 worker 语境下不是问题，多 worker 需重看。
+17. **入站入口仍不是"鉴权"，但"开了却没口令"那个洞已堵**（2026-11-12）。P9a 的契约是
+    "没配令牌 => 只绑回环，不鉴权"，于是 `MTA_INGEST_ENABLED=1` 单独就是一个**开放入站端点**，
+    而 `/api/health` 对此一字不提。现在：开了就必须有 ≥24 字符令牌，否则整块面**关闭**并报
+    `reason=TOKEN_REQUIRED`；短令牌**不降级成匿名**（那会把一次误配变成一扇开着且有"有人设过
+    令牌"说辞的门）；`MTA_INGEST_ALLOW_ANON=1` 是唯一匿名通道且启动即告警。
+    仍然成立的部分：监听只绑 `127.0.0.1`，静态令牌是可共享口令而不是身份。任何公网暴露必须先过
+    P7b —— 这是 PRD §7 明写的依赖关系，不是遗漏。已实测（`just p9-smoke` 的 auth 项，9/9）。
+18. **P9b/P9c/P9e 已落地；P9d 执行隔离一行未写**（2026-11-12）。
+    - 已做：`tell` 出站 + 决策账本（P9b）、`skill` 贯通到 `--skill`（P9b）、`error_kind` +
+      预算熔断（P9c）、`parallel>1`（P9c，改了 `claimNext` 谓词）、对端真实联调（P9e）。
+      `just p9-smoke` 27/27，全部走真进程。
+    - **P9d 未做，且此刻无法在本机验证**：本机有 `docker` 二进制但 **daemon 未运行**
+      （`docker info` 连不上 `~/.docker/run/docker.sock`）。因此 AC5.2 目前的放行条件
+      （"隔离落地"）**仍未满足**，可写工具目标继续**在登记时拒绝** —— 这是真拒绝，
+      不是收下不生效。没有测过隔离，就不写"已隔离"。
+    - 仍未做：`tell` 的**升级对象/分级**只到"blocked 与 failed 两种"，没有 PRD P9b 设想的
+      多级升级链；决策账本没有 UI。
+19. **redrive 的双 worker 竞态已修（2026-11-12）**。先前这条记的是"速率/去重计数是进程内的"，
+    **归因错了**：`rule_dispatches` 计数与 `lane_claims` 一直在共享 SQLite 里。真正的竞态在别处 ——
+    `redriveDeferred` 先 `dueRetries()` 再**无条件** `clearRetry()`，两个 worker 会各自 redrive
+    同一事件。幂等键挡住了重复 Task，但**输家仍把决策重跑一遍**：它看到赢家的 lane claim，
+    于是把结局从 `dispatched` 改写成 `coalesced`，并顺手推迟了那个刚建好的 Task。
+    改为 `claimRetry`：一条条件 UPDATE 就是所有权判定，落在既有 `BEGIN IMMEDIATE` 内，
+    只有一个人看到 `changes=1`（`ingest-guards.test.ts` 用两个连接打一个文件实测）。
+    仍然成立的部分：速率窗口本身没问题，但**多 worker 下 `recoverExpired` 与 stall 处理尚未
+    做过同级别的对抗测试**，P9d/多机部署前需重看。

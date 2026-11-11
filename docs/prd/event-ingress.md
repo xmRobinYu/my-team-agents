@@ -3,8 +3,10 @@
 > 目标：把「任务的起点从人身上拿走」——让外部信号（告警、意见、定时、Webhook）
 > 经统一事件契约进入系统，由声明式规则决定叫醒谁、在哪个工作区、用什么指令，
 > 执行仍复用 P6 耐久内核。
-> 状态：**P9a 已落地**（2026-11-11）。§8 的 D1-D6 已定案，见 `CONTEXT.md` Q49；Story 1–6
-> 的验收标准全部勾选并有测试与真实进程证据。P9b/P9c/P9d/P9e 仍未开始（见 §10）。术语以 `CONTEXT.md` 词汇表为准。
+> 状态：**P9a / P9b / P9c / P9e 已落地**（2026-11-11 与 2026-11-12）。§8 的 D1-D6 已定案
+> （`CONTEXT.md` Q49），P9b/P9c/P9e 的变更与踩坑记在 Q50。Story 1–6 的验收标准全部勾选，
+> 且都有单测与**真实进程**证据（`just p9-smoke`，27 项全绿）。**P9d 执行隔离仍未做**：本机
+> 没有可用的容器 daemon，无法测量，因此不写「已隔离」。术语以 `CONTEXT.md` 词汇表为准。
 > 灵感来源：卡兹克《折腾了整整 1 年，毫无保留地分享一下我这套 Agent 自动化系统》
 > 与 `ref/AIHOT`（MIT，Copyright 2026 数字生命卡兹克）的对端实现。
 > **本 PRD 不搬运两边代码，只采用其契约与语义。**
@@ -274,6 +276,12 @@ complete(attemptId, fencingToken, result | failure)
       租约 / fencing token / ≤3 次自动重试 / 退避（`retryDelay`，Q37）
 - [x] AC3.2 同 `lane` 串行：两个 Worker 并发领取时峰值并发为 1
       （照 `group-serial.test.ts` 的证伪法写）
+      **P9c 补充（2026-11-12）**：`parallel` 现已生效，谓词由「该键有活 Attempt 就排除」
+      改为「按 Task 的 `parallel` 计数」。键空间与默认值未变，所以本条**原文仍然成立**且
+      `group-serial.test.ts` **未经修改即通过**；新增证据是两个真实 worker 进程的全局峰值
+      （`lane-parallel.test.ts` 6 条 + `just p9-smoke` parallel 项：`parallel=2`→2、默认→1、
+      `parallel=4`→2 被进程数封顶）。带 `groupId` 的 Task 由 `insertTask` 一律钳回 1 ——
+      I3 AC3 是 Room 模型的不变量，不是可调参数。
 - [x] AC3.3 **现有 Room 行为不变**：`group-serial.test.ts`、
       `room-trigger.test.ts`、`room-reply.test.ts`、`recovery.test.ts` 全绿且
       未修改断言（lane 改动不得动摇 `COALESCE` 之前的 Room 分支）
@@ -301,6 +309,15 @@ complete(attemptId, fencingToken, result | failure)
       ——`runtime-core/src/adapter.ts:26-28` 声明了这两个取值；适配器又显式传
       `--approve`，因此信任不约束工具能力）
 - [x] AC5.3 入口默认只绑 `127.0.0.1`，令牌写在配置里、不入事件行
+      **P9c 收紧（2026-11-12）**：原契约「没配令牌 => 只绑回环，不鉴权」意味着
+      `MTA_INGEST_ENABLED=1` 单独就是一个**开放入站端点**，而 `/api/health` 对此一字不提。
+      现在开了就必须有 ≥24 字符令牌，否则整块面**关闭**并报 `reason=TOKEN_REQUIRED`；
+      短令牌报 `TOKEN_TOO_SHORT` 且**绝不降级成匿名**（那会把一次误配变成一扇开着且有
+      「有人设过令牌」说辞的门）；`MTA_INGEST_ALLOW_ANON=1` 是唯一匿名通道，启动即在
+      stderr 告警。令牌比较走 `timingSafeEqual`（长度不等时与自身比较，使返回值不从响应
+      时序里漏前缀）；POST 路由带 64 KiB `bodyLimit` —— `normalizeEvent` 的截断发生在
+      Fastify 已把整个 payload 缓冲**之后**，所以只有路由级上限才是对**字节**的约束。
+      本条**没有**变成鉴权：静态令牌是可共享口令，公网暴露仍需 P7b。
 - [x] AC5.4 事件正文进日志前脱敏/截断；不记录密钥（对齐 AIHOT
       「never log payloads or errors: they can contain credentials」的取舍）
 
@@ -316,6 +333,33 @@ complete(attemptId, fencingToken, result | failure)
       派生 Task 数、成功率、token 与成本 —— 文章说的「数据沉淀」，
       数据源就是我们已有的 `usage` 表
 
+### Story 7 — 说出去、算得清、跑得开（P9b/P9c/P9e，2026-11-12）
+
+> 作为值班的人，我希望「这件事已经提醒过一次就别再提醒」；作为平台，我希望
+> 一次失败说得出**是哪一类**失败；作为使用者，我希望文档里那个对端真的能接上。
+
+- [x] AC7.1 `tell=needed` 的规则，其 Task 进入 `blocked`/`failed` 时经**单一**通道发出
+      一张卡片；`tell=silent` 什么都不发（`tell.test.ts`）
+- [x] AC7.2 「定过的事不问第二遍」**可证伪**：账本按通知身份 `(rule,subject,kind)` 建键，
+      因此同一个 subject 经**两个不同 Task** 失败也只发一次；进程重启后仍只发一次
+- [x] AC7.3 冷却与账本是两套机制：不同 subject 在冷却窗口内被**拦住**，窗口过后放行
+- [x] AC7.4 被通道拒绝（非 2xx）的通知**可以**重试，已送达的通知**永不**重发
+- [x] AC7.5 预算耗尽进 `blocked` 而不是 `failed`/`retry_wait`，且 `error_kind` 落在
+      Attempt 行上；累计用量取该 Task **所有 Attempt**，重试不能清零
+- [x] AC7.6 `error_kind` 是闭集并在各调用点**显式赋值**；唯一来自外部的字符串走窄化分类，
+      认不出就是 `runtime_error`，**绝不硬套**一个具体原因
+- [x] AC7.7 `parallel>1` 生效且**有上界**（≤8）；`groupId` Task 一律钳 1；
+      峰值并发以**两个真实 worker 进程**度量，不是单进程内两个对象
+- [x] AC7.8 `skill` 不再是装饰：登记时拒绝目标 persona 并不持有的 slug；派发时解析
+      `agentDir`，使 `PiAdapter` 的 `--skill <dir>` 真的能到达事件 run
+- [x] AC7.9 对端联调跑的是**上游自己的** `wakeAgent`（resolve hook 只替换它的
+      `db`/`config`/`feishu`），一条真实告警 → 一个 Task → `GET /:id` 全程可查，
+      重发 3 次仍只有 1 个 Task
+- [ ] AC7.10 执行隔离（P9d）落地后，AC5.2 的可写工具目标才允许登记
+      —— **未做**：本机 `docker` 二进制存在但 daemon 未运行，无法测量，因此不写「已隔离」
+- [ ] AC7.11 多级升级链（一级→二级→人工）与决策账本的 UI —— 未做，P9b 只到
+      `blocked`/`failed` 两级
+
 ---
 
 ## 7. 发布边界与依赖
@@ -324,9 +368,10 @@ complete(attemptId, fencingToken, result | failure)
 |---|---|---|
 | P8 收尾（I7–I10） | 进行中 | 不阻塞 P9a 设计，但共享 `claimNext`，改动需串行合入 |
 | **P8 补丁**：`thinkingMode` 断链 | **已做**（2026-11-10） | `RoomAgent.thinkingMode` 原先只到数据库与模板，`durable-worker` 构造 `RunSpec` 时不带它，于是群声明 `thinkingMode: "high"` 也白声明。现由 `personaThinking()` 在每次运行时按 `task.memberId` 从花名册派生（不改表：`tasks` 没有该列，加列要手写 `ALTER TABLE`；派生还有个额外好处 —— `dispatchInput` 派出的子 Task 在 `execute` 里同样生效，用的是**子自己**的人设而非父的）。取值按 Pi 的闭合集合收紧（`off/minimal/low/medium/high/xhigh/max`），集合外一律丢弃：`thinking_mode` 是 `TEXT` 且来自模型写的团队模板，原样透传等于让模板控制一个命令行 token。代价是编辑 `thinking_mode` 从下一次触发生效（含重试），与人格技能在 spawn 时读取的规则一致。证据：`packages/orchestrator/src/thinking-mode.test.ts` 5 条（含撤掉接线后必需变红的证伪）；真实链路复跑一次真 worker + 真 `PiAdapter`，捕获到的子进程 argv 含 `--thinking high` |
-| P7b 鉴权/租户隔离/审计 | 待启 | **AC5.3 只是回环 + 静态令牌的临时措施**。任何公网暴露必须先过 P7b |
-| P9d 执行隔离 | 未做 | AC5.2 的放行条件 |
-| P9b 升级与决策账本 | 未做 | 消费本文的 `tell` 字段 |
+| P7b 鉴权/租户隔离/审计 | 待启 | **AC5.3 只是回环 + 静态令牌的临时措施**。已收紧（2026-11-12）：`ENABLED=1` 而无可用令牌 => 整块面**关闭**并报 `reason`；短令牌**不降级成匿名**；令牌比较走 `timingSafeEqual`；POST 带路由级 64 KiB `bodyLimit`。但静态令牌仍是可共享口令而不是身份，任何公网暴露必须先过 P7b |
+| P9d 执行隔离 | 未做（本机无可用 daemon，无法验证） | AC5.2 的放行条件；当前可写工具目标在登记时**真拒绝** |
+| P9b 升级与决策账本 | **已做**（2026-11-12） | 消费本文的 `tell` 字段；多级升级链与账本 UI 仍未做 |
+| 速率/去重的多 worker 语义 | 部分修复 | redrive 的双 worker 竞态已用 `claimRetry` 修掉（先前误记为「计数是进程内的」，实际一直在 SQLite）；但 `recoverExpired`/stall 在多 worker 下**未做过同级别对抗测试** |
 
 **入口本身就是攻击面**：这条链路第一次让外部字节进入系统，所以 §6 Story 5 不是可选项。
 `constraints.yaml` 现已补上 `ingest_limits`（见该文件）——因为"外部字节进得来"这件事此前
@@ -340,7 +385,7 @@ complete(attemptId, fencingToken, result | failure)
 | # | 问题 | 选项 |
 |---|---|---|
 | D1 | 规则存哪里 | A 只有 SQLite 表 + API；B 表 + `rules.json` 单向导入（Git 可审）；C 只有文件 |
-| D2 | 事件与 Task 的表关系 | A `events` 新表 + `tasks` 加 `event_id/lane/source`；B 全塞进 `tasks` 新列 |
+| D2 | 事件与 Task 的表关系 | A 新表（**实际取名 `inbound_events`**：`ExecutionStore` 已占用 `events` 且同库，`CREATE TABLE IF NOT EXISTS events` 会静默 no-op 再在首次 INSERT 炸）+ `tasks` 加 `event_id/lane/tools`；B 全塞进 `tasks` 新列 |
 | D3 | 一条规则可否命中多 Room | A 一规则一目标；B 一规则多目标（并发语义变复杂） |
 | D4 | 定时实现位置 | A 服务进程内定时器（对齐 §4.3 的 `missed: "once"` 幂等）；B 独立 scheduler 进程（AIHOT 把定时权交给 worker 单进程，`queue.ts:61-62`）；C 外部 cron `POST` |
 | D5 | `lane` 与 `parallel` 是否 P9a 就分开 | A 分开且 `parallel` 只允许 1；B 允许 N（需改 `claimNext` 计数 + 撤现有断言） |
@@ -364,7 +409,7 @@ complete(attemptId, fencingToken, result | failure)
 | **P8 补丁** | ~~接通 `thinkingMode → RunSpec.thinking`~~（**已做** 2026-11-10）；~~最小迁移账本~~（**已做** 2026-11-11：`schema_migrations` + `applyMigrations`） | 一条测试证明 `--thinking` 真的进了 argv —— 已满足（`thinking-mode.test.ts`） |
 | **P9a** | **已做** 2026-11-11：`inbound_events`（**不叫 `events`**，与持久化日志撞名）+ `trigger_rules` + `lane_claims`/`rule_dispatches`/`event_coalesce`、`POST /api/ingest/events`、四种结局、`lane` 串行 | Story 1–3 全绿；对端兼容 200（AC2.4） |
 | **P9.5** | **已做** 2026-11-11：`cron` 是规则上的数据，tick 产出 `source:"cron"` 事件；`just verify-import` 增补 AC4.3 证据段（真实包 `Git周月报` 2 条 cron 全部转成规则、0 具名拒绝） | Story 4 全绿；真实模板导入回归不劣化 |
-| **P9b** | 消费 `tell`：升级对象、分级、冷却、单一出站通道（飞书卡片）、决策账本 | 「定过的事不问第二遍」可证伪 |
-| **P9c** | 预算熔断 + 失败分类（`error_kind`） | 超限进 `blocked` 而非 `failed` |
-| **P9d** | 执行隔离（容器/只读档/出网策略） | 放行 AC5.2 |
-| **P9e** | 真实对端联调：把 `ref/AIHOT` 的 `WEBHOOK_HUB_URL` 指到我们的入口 | 一条真实告警 → 一个 Task → `GET /api/ingest/events/:id` 全程可查；重发 3 次仍只有 1 个 Task |
+| **P9b** | **已做** 2026-11-12：`tell_log` 决策账本（键是通知身份 `(rule,subject,kind)` 而非 Task）+ 冷却 + **单一**通道（`MTA_TELL_WEBHOOK`，未配置即沉默）；`skill` 由「声明但不生效」改为登记时校验 + 派发时解析 `agentDir`（此前事件 Task 不带 `agentDir`，而 `--skill` 正是由它推导，所以 persona 技能**从未**进入任何事件 run） | 「定过的事不问第二遍」可证伪 —— `tell.test.ts` 7 条 + `ingest-skill.test.ts` 12 条 + `just p9-smoke` 的 tell 项（真 webhook 收到 1 张卡片，重投后仍是 1 张） |
+| **P9c** | **已做** 2026-11-12：`attempts.error_kind` 闭集（各调用点**显式赋值**，不抓散文）+ Task 级预算熔断（累计取该 Task **所有 Attempt**，检查位于解读回复**之前**）；`parallel>1` 落地并改了 `claimNext` 谓词（键空间不变；`insertTask` 对带 `groupId` 的 Task 一律钳 1） | 超限进 `blocked` 而非 `failed` —— `failure-kind.test.ts` 4 条 + `lane-parallel.test.ts` 6 条 + `just p9-smoke` 的 budget/parallel 项（两个**真实 worker 进程**的全局峰值：`parallel=2`→2、默认→1、`parallel=4`→2） |
+| **P9d** | **未做，且此刻不可验证**：本机有 `docker` 二进制但 **daemon 未运行**（`docker info` 连不上 socket）。AC5.2 的放行条件因此仍未满足，可写工具目标继续**在登记时真拒绝** | 放行 AC5.2（需要一个能实测的隔离后端） |
+| **P9e** | **已做** 2026-11-12：不再手写模仿报文，而是用 resolve hook 直接跑**上游自己的** `wakeAgent` | 一条真实告警 → 一个 Task → `GET /:id` 全程可查；重发 3 次仍只有 1 个 Task —— `just p9-smoke` peer 项 7/7。**联调抓到两个单测永远抓不到的缺口**：① `wakeAgent` 发出的 body **没有 `source`**，按 P9a 每条告警都会 400（故新增 `MTA_INGEST_SOURCE`）；② 对端用 `Bearer $WEBHOOK_HUB_KEY`，所以它的 hub key **就是**本平台的 `MTA_INGEST_TOKEN`，两者配成不同值时全是 401 |

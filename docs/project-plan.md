@@ -18,7 +18,8 @@
 | P6 队列持久化 | 崩溃不丢任务、重试、租约 | ✅ 完成 |
 | P7a 服务端 + UI（本机） | API 骨架、SSE、assistant-ui（react-pi）接入 | ✅ 完成 |
 | P7b 团队服务化 | 鉴权、租户隔离、审计 | ⬜ 待启 |
-| P8 多 agent 群聊 | ChatRoom、团队模板导入、auto 接力与流程守卫 | 🚧 进行中 |
+| P8 多 agent 群聊 | ChatRoom、团队模板导入、auto 接力与流程守卫 | 🚧 进行中（I1–I10 已做完，剩建群入口未接 UI） |
+| P9 事件入口与触发路由 | 外部信号→声明式规则→Task；出站通知、预算熔断、并发、对端联调 | 🚧 进行中（P9a/P9b/P9c/P9e 已做完，剩 **P9d 执行隔离**） |
 
 **P8 分项进度**（I1–I10 定义见 `docs/prd/multi-agent-group-chat-issues.md`）：
 
@@ -35,13 +36,35 @@
   独立的技能管理页面仍未做，见 `docs/architecture.md` §9）
 - ✅ 完成 I10 真实端到端验证（`scripts/prd-acceptance.mjs`，六项 PASS，Q44）
 
-已验证：`rm -rf packages/*/dist && just check` 退出码 0（`just check` = build → typecheck →
-test → verify-cli → test-guardrails → verify-docs → verify-bitable → test-scripts →
-verify-packages，以 `justfile` 定义为准）；`just test-no-build` 在无构建产物下退出码 0，
-465 passed / 5 skipped；react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激活 →
-SSE → idle，底层 Task `succeeded`），群 thread 用真实 `createPiHttpClient` + 真实 reducer 验证；
+已验证（2026-11-12）：`rm -rf packages/*/dist && just check` 退出码 0（`just check` =
+build → typecheck → test → verify-cli → test-guardrails → verify-docs → verify-bitable →
+test-scripts → verify-packages → **verify-file-size**，以 `justfile` 定义为准）；
+`just test-no-build` 在无构建产物下退出码 0，**564 passed / 5 skipped**；
+react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激活 → SSE → idle，底层 Task
+`succeeded`），群 thread 用真实 `createPiHttpClient` + 真实 reducer 验证；
 `just pi-smoke` 对真实 Pi 验证 agent_settled 与会话续跑；
-`node scripts/prd-acceptance.mjs` 在真实模型下跑通 PRD §6 六项（手动门禁，不入 CI）。
+`node scripts/prd-acceptance.mjs` 在真实模型下跑通 PRD §6 六项（手动门禁，不入 CI）；
+**`just p9-smoke` 27 项全绿**（真 HTTP server + 真 worker OS 进程 + 真 webhook 接收端 +
+上游 `ref/AIHOT` 自己的 `wakeAgent`，手动门禁，不入 CI）。
+
+**P9 分项进度**（定义见 `docs/prd/event-ingress.md` §10）：
+
+- ✅ 完成 P9a 事件入口内核（`inbound_events` + `trigger_rules` + `lane` 串行 + 四种结局，Q49）
+- ✅ 完成 P9.5 定时即事件（`cron` 是规则上的数据；`just verify-import` 有 AC4.3 证据段）
+- ✅ 完成 P8 补丁另一半：迁移账本 `schema_migrations` + `applyMigrations`
+- ✅ 完成 P9b `tell` 出站 + 决策账本 + 冷却 + 单一通道（Q50）
+- ✅ 完成 P9b `skill` 贯通：登记校验 + 派发解析 `agentDir` → `--skill` 真的到达事件 run
+- ✅ 完成 P9c `error_kind` 闭集 + Task 级预算熔断（超限进 `blocked`）
+- ✅ 完成 P9c `parallel>1`（改 `claimNext` 谓词为按 `parallel` 计数；`groupId` 一律钳 1）
+- ✅ 完成 P9c 入站鉴权收紧（开了就必须有可用令牌；短令牌不降级成匿名）
+- ✅ 完成 P9c redrive 双 worker 竞态修复（`claimRetry` 条件 UPDATE）
+- ✅ 完成 P9e 真实对端联调（跑上游 `wakeAgent`；抓到「body 没有 `source`」与
+  「hub key 就是本平台 token」两个单测抓不到的缺口）
+- ✅ 完成 治理补齐：`size_limits.max_file_lines` 从此**真的被检查**（棘轮 baseline），
+  并把 `template-import.ts`(1166→425) 与 `durable-worker.ts`(959→901) 拆到限额内
+- ⬜ **P9d 执行隔离未做**：本机 `docker` 二进制存在但 daemon 未运行，无法测量，
+  因此不写「已隔离」；AC5.2 的可写工具目标继续在登记时真拒绝
+- ⬜ 多级升级链与决策账本 UI 未做（P9b 只到 `blocked`/`failed` 两级）
 
 > 飞书网络同步依赖本机 lark-cli Keychain。沙箱/自动化环境读不到系统 Keychain 时，
 > `just sync-docs` 会失败（`verify-docs` 离线映射仍通过），需在有权限的交互终端执行。
