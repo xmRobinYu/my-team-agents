@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { CanonicalEvent } from "@my-team-agents/runtime-core";
+import { addColumnIfMissing, applyMigrations, type Migration } from "./migrations.js";
 
 export type TaskStatus =
   | "queued"
@@ -29,6 +30,27 @@ export interface CreateTaskInput {
   prompt: string;
   /** Room id for group-chat tasks. Doubles as the serialization key (I3 AC3). */
   groupId?: string;
+  /**
+   * P9a: an event-lane serialisation key, unrelated to a Room.
+   *
+   * It must NOT be `groupId`: `groupId` carries three other meanings (Room lookup,
+   * I4 history injection, Q31 "never resume"), and `durable-worker.ts` forces
+   * `resumeSession = false` whenever it is set. A lane serialises without any of
+   * those side effects. `claimNext` serialises on `COALESCE(lane, group_id)`, which
+   * leaves every existing groupTask byte-identical (its lane is NULL).
+   */
+  lane?: string;
+  /** P9a: the inbound event that produced this Task, for AC6.1 traceability. */
+  eventId?: string;
+  /**
+   * P9a/AC5.2: the Pi tool allowlist this Task may hold, carried to the adapter.
+   *
+   * It lives on the Task because a registration-time check that does not reach
+   * execution would be phantom enforcement: the rule would say "read-only" and the
+   * run would still get Pi's default `read`/`bash`/`edit`/`write`. The worker reads
+   * it here and passes it to `RunSpec.tools`; the adapter turns it into `--tools`.
+   */
+  tools?: string[];
   model?: string;
   chainId?: string;
   parentTaskId?: string;
@@ -102,6 +124,24 @@ const num = (v: string | number | bigint | null | undefined) =>
 const json = <T>(v: unknown, fallback: T): T => {
   try { return JSON.parse(String(v)) as T; } catch { return fallback; }
 };
+
+/**
+ * Every column the durable `tasks` table gained after its first release.
+ *
+ * Ordered; ids are the ledger keys and never change. The first entry reproduces the
+ * I3 `agent_dir` probe this list replaces, so a database that already has the
+ * column records it as applied on the next start instead of re-running the ALTER.
+ */
+const TASK_MIGRATIONS: readonly Migration[] = [
+  { id: "0001-tasks-agent-dir", up: (db) => { addColumnIfMissing(db, "tasks", "agent_dir", "TEXT"); } },
+  // P9a: the event lane. NOT `group_id`: that column carries Room semantics and a
+  // set `group_id` forces `resumeSession = false` (Q31). See `CreateTaskInput.lane`.
+  { id: "0002-tasks-lane", up: (db) => { addColumnIfMissing(db, "tasks", "lane", "TEXT"); } },
+  { id: "0003-tasks-event-id", up: (db) => { addColumnIfMissing(db, "tasks", "event_id", "TEXT"); } },
+  // P9a/AC5.2: the tool allowlist, so "read-only" is enforced at run time and not
+  // merely asserted at registration. JSON array text, same convention as `result`.
+  { id: "0004-tasks-tools", up: (db) => { addColumnIfMissing(db, "tasks", "tools", "TEXT"); } },
+];
 
 /**
  * Q21/Q37 shared retry backoff. Every path that re-arms a Task — normal
@@ -220,12 +260,13 @@ export class ExecutionStore {
         UNIQUE(source_tool_call_id, target_member_id)
       );
     `);
-    // Databases created before I3 lack agent_dir; CREATE TABLE IF NOT EXISTS
-    // cannot add a column to an existing table.
-    const existing = this.all("PRAGMA table_info(tasks)");
-    if (!existing.some((column) => column.name === "agent_dir")) {
-      this.db.exec("ALTER TABLE tasks ADD COLUMN agent_dir TEXT");
-    }
+    // Column additions go through the migration ledger, not an ad-hoc probe here.
+    // `CREATE TABLE IF NOT EXISTS` cannot add a column to an existing table, and a
+    // growing pile of `PRAGMA table_info` checks keeps no record of what ran. Every
+    // `up` is idempotent (`addColumnIfMissing`), which is required: the ledger is
+    // new, so the first run against a pre-existing database sees an empty ledger
+    // beside a table that may already carry the column.
+    applyMigrations(this.db, TASK_MIGRATIONS);
   }
 
   close(): void { this.db.close(); }
@@ -283,6 +324,9 @@ export class ExecutionStore {
       agentDir: text(row.agent_dir) ?? undefined,
       prompt: text(row.prompt)!,
       groupId: text(row.group_id) ?? undefined,
+      lane: text(row.lane) ?? undefined,
+      eventId: text(row.event_id) ?? undefined,
+      tools: row.tools ? json<string[]>(row.tools, []) : undefined,
       model: text(row.model) ?? undefined,
       depth: num(row.depth),
       batch: num(row.batch),
@@ -321,10 +365,12 @@ export class ExecutionStore {
     this.run("INSERT OR IGNORE INTO chains(id) VALUES(?)", chainId);
     this.run(`INSERT INTO tasks(
       id,chain_id,parent_task_id,tenant_id,project_id,member_id,workspace_path,agent_dir,prompt,
-      group_id,model,depth,idempotency_key,recovery_snapshot,status,available_at,created_at,updated_at
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)`,
+      group_id,lane,event_id,tools,model,depth,idempotency_key,recovery_snapshot,status,available_at,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)`,
       id, chainId, input.parentTaskId ?? null, input.tenantId, input.projectId,
       input.memberId, input.workspacePath, input.agentDir ?? null, input.prompt, input.groupId ?? null,
+      input.lane ?? null, input.eventId ?? null,
+      input.tools && input.tools.length > 0 ? JSON.stringify(input.tools) : null,
       input.model ?? null, input.depth ?? 0, input.idempotencyKey ?? null,
       input.recoverySnapshot ?? null, input.availableAt ?? now, now, now);
     return this.getTask(id)!;
@@ -445,10 +491,11 @@ export class ExecutionStore {
         WHERE (t.status='queued' OR (t.status='retry_wait' AND t.available_at<=?))
           AND t.available_at<=? AND t.batch_attempts<3
           AND COALESCE(c.cancel_requested,0)=0
-          AND (t.group_id IS NULL OR NOT EXISTS (
+          AND (COALESCE(t.lane, t.group_id) IS NULL OR NOT EXISTS (
             SELECT 1 FROM tasks busy
             JOIN attempts live ON live.task_id=busy.id
-            WHERE busy.group_id = t.group_id AND busy.id <> t.id
+            WHERE COALESCE(busy.lane, busy.group_id) = COALESCE(t.lane, t.group_id)
+              AND busy.id <> t.id
               AND live.status IN ('leased','running') AND live.lease_expires_at > ?
           ))
         ORDER BY t.created_at LIMIT 1`, now, now, now);
@@ -643,6 +690,27 @@ export class ExecutionStore {
       const row = this.one(`SELECT COUNT(*) AS n FROM tasks WHERE chain_id=?
         AND status IN ('cancelling','cancelled')`, chainId);
       return num(row?.n);
+    });
+  }
+
+  /**
+   * P9a coalescing: push a queued Task's `available_at` forward so its next Attempt
+   * reads material that arrived while it was running, instead of racing the Attempt
+   * already in flight.
+   *
+   * Only touches a `queued` or `retry_wait` Task. A `running` Task is NOT rescheduled
+   * — `claimNext` would not pick it up anyway, and moving a live Task's clock is the
+   * kind of state edit that silently corrupts a lease. A terminal Task is left alone
+   * too: its lane claim is what the caller must supersede, and that happens at
+   * dispatch, not here. Returns whether anything moved.
+   */
+  deferTask(taskId: string, until: number): boolean {
+    return this.tx(() => {
+      const task = this.getTask(taskId);
+      if (!task || !["queued", "retry_wait"].includes(task.status)) return false;
+      this.run("UPDATE tasks SET available_at=?, updated_at=? WHERE id=? AND status IN ('queued','retry_wait')",
+        Math.max(until, task.availableAt), Date.now(), taskId);
+      return true;
     });
   }
 
