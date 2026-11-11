@@ -34,6 +34,12 @@ test-guardrails:
 verify-packages:
     node scripts/check-package-exports.mjs
 
+# Enforce constraints.yaml size_limits.max_file_lines.
+# Ratchet: existing offenders are recorded in scripts/file-size-baseline.json at
+# their current size and may only shrink. A NEW file over the limit fails here.
+verify-file-size:
+    node scripts/check-file-size.mjs
+
 # Prove tests are self-sufficient: no build, no dist, no prior artifacts.
 # `check` runs build first, which can hide a test suite that silently depends
 # on dist/; this target exists to catch exactly that class of regression.
@@ -79,7 +85,7 @@ sync-all *paths:
 #
 # build MUST precede typecheck: packages consume each other through dist/*.d.ts,
 # so type-checking a clean checkout without building first fails with TS2307.
-check: build typecheck test verify-cli test-guardrails verify-docs verify-bitable test-scripts verify-packages
+check: build typecheck test verify-cli test-guardrails verify-docs verify-bitable test-scripts verify-packages verify-file-size
 
 # Real end-to-end smoke against the installed pi binary (needs a live provider).
 # Not part of `check`: it requires pi installed + network + a working model.

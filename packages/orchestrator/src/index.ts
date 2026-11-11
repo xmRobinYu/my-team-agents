@@ -80,6 +80,17 @@ export {
   type ZipSource,
 } from "./template-import.js";
 
+// P9b — consuming `tell`: the outbound channel seam and the decision ledger.
+export {
+  createTellService,
+  createWebhookChannel,
+  SILENT_CHANNEL,
+  type TellCard,
+  type TellChannel,
+  type TellService,
+  type TellServiceDeps,
+} from "./tell.js";
+
 // I9 (appended at the tail to stay merge-friendly with in-flight edits above).
 export {
   agentSkillsRoot,
@@ -103,6 +114,7 @@ export {
 
 // P9a (appended at the tail to stay merge-friendly with in-flight edits above).
 export { buildEventPrompt, dedupKeyOf, deriveEventId, normalizeEvent, orderMatches, READ_ONLY_TOOLS, redactForLog, ruleMatches, validateRuleInput, DETAIL_MAX, SUMMARY_MAX } from "./ingest.js";
+export type { TargetPersona } from "./ingest.js";
 export type { EventScope, InboundEvent, IngestOutcome, RuleError, RuleTarget, RuleWhen, TriggerRule, TriggerRuleInput } from "./ingest.js";
 export { createIngestService } from "./ingest-service.js";
 export type { IngestService, IngestServiceDeps, RegisterRuleResult, SubmitResult } from "./ingest-service.js";

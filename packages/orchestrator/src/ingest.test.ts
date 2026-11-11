@@ -202,3 +202,74 @@ describe("Story 2 — repeats do not explode", () => {
     expect(h.store.listTasks()).toHaveLength(2);
   });
 });
+
+describe("P9e — the AIHOT producer shape", () => {
+  /**
+   * `ref/AIHOT/packages/backend/src/notify/agent.ts:70-78` builds the event as
+   * `{ id, type, subject, summary, detail, link }` — there is NO `source` key on the
+   * wire. These two tests pin both halves of that: the deployment must be able to
+   * name the source, and a body that DOES name one must not be overwritten.
+   */
+  const harness = (defaultSource?: string) => {
+    const executions = new ExecutionStore(":memory:");
+    const ingest = new IngestStore(executions.db);
+    const service = createIngestService({
+      executions, ingest, memberExists: () => true,
+      ...(defaultSource ? { defaultSource } : {}),
+    });
+    service.registerRule({
+      name: "收录告警", ask: "查一下", lane: "aihot",
+      when: { sources: [defaultSource ?? "aihot-prod"] },
+      to: { memberId: "agent-pm", workspacePath: "/tmp/ws" },
+    });
+    return { executions, ingest, service };
+  };
+
+  it("a source-less AIHOT body is accepted when the deployment names one", () => {
+    const h = harness("aihot-prod");
+    const result = h.service.submit(
+      { id: "content.collect:2026-11-11T00:00:00.000Z", type: "alert.now",
+        subject: "content.collect", summary: "网站停止收录新文章", detail: "影响：读者看不到新文章",
+        link: "https://aihot.example/admin/runs" },
+      { tenantId: "t1", projectId: "p1" });
+    expect(result.status).toBe(200);
+    expect(result.outcome).toBe("dispatched");
+    expect(result.event!.event.source).toBe("aihot-prod");
+    // The producer's own fields survive verbatim (G5).
+    expect(result.event!.event.link).toBe("https://aihot.example/admin/runs");
+    expect(result.event!.event.subject).toBe("content.collect");
+  });
+
+  it("without a configured source the same body is a 400, not a silent guess", () => {
+    const h = harness();
+    const result = h.service.submit(
+      { id: "x", type: "alert.now", subject: "s", summary: "t" },
+      { tenantId: "t1", projectId: "p1" });
+    expect(result.status).toBe(400);
+    expect(result.errors?.[0]?.code).toBe("BODY_INVALID");
+  });
+
+  it("an explicit source on the body always beats the deployment default", () => {
+    const h = harness("aihot-prod");
+    const result = h.service.submit(
+      { id: "x", source: "other-vendor", type: "alert.now", subject: "s", summary: "t" },
+      { tenantId: "t1", projectId: "p1" });
+    expect(result.outcome).toBe("unmatched");
+    expect(result.event!.event.source).toBe("other-vendor");
+  });
+
+  it("three deliveries of one alert id make exactly one Task (AC2.1/AC2.4)", () => {
+    const h = harness("aihot-prod");
+    const body = { id: "balance.deepseek:2026-11-11T00:00:00.000Z", type: "alert.today",
+      subject: "balance.deepseek", summary: "余额不足", detail: "充值" };
+    const scope = { tenantId: "t1", projectId: "p1" };
+    const first = h.service.submit(body, scope);
+    const again = h.service.submit(body, scope);
+    const third = h.service.submit(body, scope);
+    expect(first.outcome).toBe("dispatched");
+    expect(again.outcome).toBe("delivered");
+    expect(third.outcome).toBe("delivered");
+    expect(again.taskIds).toEqual(first.taskIds);
+    expect(h.executions.listTasks()).toHaveLength(1);
+  });
+});

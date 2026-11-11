@@ -11,6 +11,10 @@ scope:
   reference_repos_readonly: true
 
 size_limits:
+  # ENFORCED by `just verify-file-size` (part of `just check`). A ratchet: files
+  # already over the line are recorded in scripts/file-size-baseline.json at their
+  # current size and may only shrink; a new file over the limit fails the gate.
+  # max_complexity is NOT enforced (no checker) and is recorded as a gap below.
   max_file_lines: 800
   max_complexity: 15
 
@@ -35,9 +39,12 @@ enforcement:
   guardrail_self_test: block
   naming_and_backups: block
   rule_file_changes: block
+  file_size: block
 
 quality:
-  # Gaps, not fabricated thresholds: coverage tooling is not wired yet.
+  # Gaps, not fabricated thresholds: neither of these has a checker.
+  #   max_complexity  — no cyclomatic-complexity tool installed.
+  #   coverage_per_file — no coverage tooling wired.
   coverage_per_file: null
   duplicate_limit_percent: 3
   anti_stub: block

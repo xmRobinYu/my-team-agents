@@ -158,6 +158,22 @@ export class IngestStore {
         PRIMARY KEY (event_id, task_id)
       );
       CREATE INDEX IF NOT EXISTS event_coalesce_task ON event_coalesce(task_id);
+      -- P9b: the decision ledger. dedup_key is the IDENTITY of a notice —
+      -- (rule, subject, kind) — so "定过的事不问第二遍" survives a restart.
+      -- No backticks in here: this whole block is one JS template literal.
+      CREATE TABLE IF NOT EXISTS tell_log (
+        dedup_key TEXT PRIMARY KEY,
+        rule_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 1,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        sent_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS tell_log_rule ON tell_log(rule_id, sent_at);
     `);
   }
 
@@ -273,6 +289,26 @@ export class IngestStore {
     this.run("UPDATE inbound_events SET retry_at=NULL WHERE id=?", id);
   }
 
+  /**
+   * Atomically take ownership of ONE due deferral.
+   *
+   * The old redrive path read `dueRetries()` and then called `clearRetry()`: a read
+   * followed by an unconditional write. Two workers could therefore both pick up the
+   * same row and both run the decision. The event-level idempotency key stopped a
+   * duplicate Task, but the redundant pass still executed — and any coalesce or lane
+   * side effect in it would be applied twice.
+   *
+   * The claim IS the test: one conditional UPDATE, so exactly one caller observes
+   * `changes === 1`. Callers run inside `executions.transaction`, whose
+   * `BEGIN IMMEDIATE` serialises two concurrent claims.
+   */
+  claimRetry(id: string, now = Date.now()): boolean {
+    const res = this.db
+      .prepare("UPDATE inbound_events SET retry_at=NULL WHERE id=? AND outcome='deferred' AND retry_at IS NOT NULL AND retry_at<=?")
+      .run(id, now);
+    return Number(res.changes) === 1;
+  }
+
   dueRetries(at: number): InboundEventRecord[] {
     return this.all(
       "SELECT * FROM inbound_events WHERE outcome='deferred' AND retry_at IS NOT NULL AND retry_at<=? ORDER BY retry_at",
@@ -339,6 +375,49 @@ export class IngestStore {
       ruleId, eventId, taskId, now);
   }
 
+  // ---- tell ledger (P9b) ------------------------------------------------
+
+  /**
+   * Take the exclusive right to send one notice, keyed by the notice's IDENTITY
+   * (rule, subject, kind) rather than by the Task, so a retried Task and a worker
+   * restart both find the same row.
+   *
+   * At-most-once for success, at-least-once for failure: a notice that reached the
+   * channel is never sent again, and one the channel rejected may be retried. A
+   * crash between claim and send loses that one notification, which is the correct
+   * bias for a notifier — see tell.ts.
+   */
+  claimTell(dedupKey: string, ruleId: string, taskId: string, kind: string, channel: string, now = Date.now()): boolean {
+    // Two different answers for two different histories, and this is the whole
+    // policy in one statement:
+    //   - already `sent`  -> the WHERE fails, changes = 0, never re-notified;
+    //   - already `failed`-> re-claimed, so a webhook blip is retried;
+    //   - already `claimed` -> another caller is mid-send, do not stack.
+    const res = this.db.prepare(`
+      INSERT INTO tell_log(dedup_key,rule_id,task_id,kind,channel,status,attempts,created_at)
+      VALUES(?,?,?,?,?,'claimed',1,?)
+      ON CONFLICT(dedup_key) DO UPDATE SET status='claimed', attempts=attempts+1
+        WHERE tell_log.status='failed'`,
+    ).run(dedupKey, ruleId, taskId, kind, channel, now);
+    return Number(res.changes) === 1;
+  }
+
+  /** Give the claim back when the notice was never attempted (cooldown). */
+  releaseTell(dedupKey: string): void {
+    this.run("DELETE FROM tell_log WHERE dedup_key=? AND status='claimed'", dedupKey);
+  }
+
+  finishTell(dedupKey: string, status: "sent" | "failed", error: string | null, now = Date.now()): void {
+    this.run("UPDATE tell_log SET status=?,last_error=?,sent_at=? WHERE dedup_key=?",
+      status, error, status === "sent" ? now : null, dedupKey);
+  }
+
+  /** When this rule last actually reached the channel, or null. */
+  lastTellSentAt(ruleId: string): number | null {
+    const row = this.one("SELECT MAX(sent_at) AS t FROM tell_log WHERE rule_id=? AND status='sent'", ruleId);
+    return row?.t === null || row?.t === undefined ? null : num(row.t);
+  }
+
   /** Dispatches this rule started at or after `since` — the AC2.5 rate window. */
   countDispatchesSince(ruleId: string, since: number): number {
     const row = this.one(
@@ -399,7 +478,11 @@ export class IngestStore {
       ask: text(row.ask)!,
       skill: text(row.skill),
       lane: text(row.lane)!,
-      parallel: 1,
+      // P9c: this used to be the literal 1, the P9a assumption that nothing else
+      // could be stored. Reading it back as 1 would have silently dropped a rule's
+      // fan-out on every reload while registration still reported the real value —
+      // two answers depending on whether the row had been re-read.
+      parallel: num(row.parallel) >= 1 ? num(row.parallel) : 1,
       tell: (text(row.tell) ?? "silent") as TriggerRule["tell"],
       cron: cronRaw === null ? null : json<{ expression: string; type: string } | null>(cronRaw, null),
       rate: rateRaw === null ? null : json<{ max: number; windowMs: number } | null>(rateRaw, null),

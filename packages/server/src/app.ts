@@ -3,8 +3,8 @@ import fastifyStatic from "@fastify/static";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ServerResponse } from "node:http";
-import { createIngestService, IngestStore, RoomStore, type CreateTaskInput, type DurableWorker, type ExecutionStore } from "@my-team-agents/orchestrator";
-import { ingestConfig } from "./config.js";
+import { createIngestService, IngestStore, listAgentSkills, RoomStore, type CreateTaskInput, type DurableWorker, type ExecutionStore } from "@my-team-agents/orchestrator";
+import { ingestConfig, MIN_TOKEN_LENGTH } from "./config.js";
 import { registerIngestRoutes } from "./ingest-routes.js";
 import { registerPiRoutes } from "./pi-routes.js";
 import { registerRoomRoutes } from "./room-routes.js";
@@ -61,12 +61,37 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     clients.clear();
   });
 
+  const ingestCfg = ingestConfig();
+
+  // An anonymous inbound surface is a deliberate choice, so it is never quiet.
+  // stderr, not the structured logger: this is a startup fact, not request noise.
+  if (ingestCfg.open && ingestCfg.token === undefined) {
+    process.stderr.write(
+      "[mta] WARNING: /api/ingest is OPEN WITHOUT A TOKEN (MTA_INGEST_ALLOW_ANON=1).\n"
+      + "[mta]          Loopback only. Never expose this listener — set MTA_INGEST_TOKEN.\n");
+  }
+  if (ingestCfg.enabled && !ingestCfg.open) {
+    process.stderr.write(
+      `[mta] /api/ingest stays CLOSED: ${ingestCfg.reason ?? "unknown"}`
+      + ` (MTA_INGEST_TOKEN must be >= ${MIN_TOKEN_LENGTH} chars).\n`);
+  }
+
+  // Read once, so health and the route registration cannot disagree. `enabled` is
+  // the operator's intent; `open` is what actually happened, and `reason` is the
+  // difference. Reporting only `enabled` was the old bug: a bare
+  // `MTA_INGEST_ENABLED=1` produced an OPEN endpoint while health said nothing
+  // about a missing token.
+
   app.get("/api/health", async () => ({
     ok: true, mode: "development", version: "p9a",
     auth: "loopback-only", workerRecovery: true,
-    // D6/A: say whether the inbound surface is live, so an operator seeing a 404 on
-    // a correct-looking POST has the answer in one request.
-    ingest: { enabled: ingestConfig().enabled, tokenRequired: "token" in ingestConfig() },
+    ingest: {
+      enabled: ingestCfg.enabled,
+      open: ingestCfg.open,
+      tokenRequired: ingestCfg.token !== undefined,
+      anonymousAllowed: ingestCfg.open && ingestCfg.token === undefined,
+      reason: ingestCfg.reason ?? null,
+    },
   }));
   app.get("/api/catalog", async () => ({
     tenants: [{ id: "default", name: "开发租户" }],
@@ -236,11 +261,27 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // MTA_INGEST_ENABLED=1 (D6/A), and bearer-guarded when MTA_INGEST_TOKEN is set.
   // `memberExists` reads the room roster: a rule must name a real persona, which is
   // AC1.3's registration-time check (not a runtime silent degrade).
-  const { enabled, token } = ingestConfig();
+  const { open, token } = ingestCfg;
   const ingestService = createIngestService({
     executions: store,
     ingest,
     memberExists: (memberId) => rooms.getAgent(memberId) !== null,
+  // P9b: the persona behind a rule target. `listAgentSkills` reports only skills Pi
+  // would actually load, so a rule cannot name one that exists on disk but is
+  // unreadable — the exact I9 defect where an imported skill was invisible to Pi.
+  persona: (memberId) => {
+    const agent = rooms.getAgent(memberId);
+    if (!agent) return null;
+    return {
+      ...(agent.agentDir ? { agentDir: agent.agentDir } : {}),
+      ...(agent.model ? { model: agent.model } : {}),
+      ...(agent.agentDir
+        ? { loadableSkills: listAgentSkills(agent.agentDir).skills.filter((sk) => sk.loadable).map((sk) => sk.slug) }
+        : {}),
+    };
+  },
+  // P9e: AIHOT names no source on the wire, so the deployment names it once here.
+  ...(ingestCfg.defaultSource ? { defaultSource: ingestCfg.defaultSource } : {}),
   });
   await registerIngestRoutes(app, {
     executions: store,
@@ -248,7 +289,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     service: ingestService,
     defaultProjectId: options.defaultProjectId ?? "my-team-agents",
     defaultTenantId: options.defaultTenantId ?? "default",
-    enabled,
+    // `open`, not `enabled`: enabled-without-a-token is closed, and registering the
+    // routes anyway is exactly the hole this closes.
+    enabled: open,
     ...(token ? { token } : {}),
   });
 

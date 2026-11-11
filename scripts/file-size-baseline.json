@@ -1,0 +1,8 @@
+{
+  "$comment": "Files already over constraints.yaml size_limits.max_file_lines when the check was wired. Debt may shrink but never grow; remove an entry once the file is at or under the limit. Regenerate: node scripts/check-file-size.mjs",
+  "files": {
+    "scripts/prd-acceptance.mjs": 1323,
+    "packages/orchestrator/src/room-handoff-mention.test.ts": 1081,
+    "packages/orchestrator/src/durable-worker.ts": 901
+  }
+}

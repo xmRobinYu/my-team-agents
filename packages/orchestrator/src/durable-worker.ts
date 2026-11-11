@@ -6,6 +6,8 @@ import { DEFAULT_GUARDRAILS, TERMINATION_MARKER, evaluateHandoff } from "@my-tea
 import type { ChatRoom, RoomAgent } from "@my-team-agents/domain";
 import { ExecutionStore, type AttemptRecord, type TaskRecord, type TaskResult } from "./execution-store.js";
 import { dedupeByOrigin, parseHandoffArgs, type DispatchOrigin } from "./handoff-intent.js";
+import { handoffResolutionNotes, type ResolutionNote } from "./worker-notes.js";
+import { latestText, parseResult, unknownHighRiskTools } from "./worker-result.js";
 import { resolveMentions, resolveRosterTokens } from "./mention.js";
 import { evaluateTermination, evaluateTrigger, formatBlockReason } from "./room-guards.js";
 import {
@@ -16,6 +18,7 @@ import {
   type DispatchSource,
 } from "./room-trigger.js";
 import type { RoomStore } from "./room-store.js";
+import { classifyRuntimeError, type FailureKind } from "./failure-kind.js";
 
 export interface WorkerOptions {
   workerId?: string;
@@ -28,6 +31,18 @@ export interface WorkerOptions {
   rooms?: RoomStore;
   leaseMs?: number;
   idleTimeoutMs?: number;
+  /**
+   * P9c: stop this Task once its accumulated usage crosses either ceiling and put
+   * it in `blocked` — not `failed`, and not `retry_wait`. The usage is summed over
+   * ALL Attempts of the Task, so a retry cannot reset the meter.
+   */
+  budget?: { maxTokens?: number; maxCost?: number };
+  /**
+   * P9b: called after a Task settles into `blocked`/`failed`. The implementation is
+   * the tell service; the worker only knows that SOMEONE may need to be told, which
+   * keeps the outbound transport out of the execution kernel.
+   */
+  tell?: (taskId: string) => void | Promise<void>;
   now?: () => number;
   onChange?: () => void;
 }
@@ -62,12 +77,6 @@ export interface ResolvedHandoff {
  * 提及解析 is an unresolvable `@name` in prose (I5), 交接校验 is a `handoff_to`
  * target this room does not declare (D5).
  */
-interface ResolutionNote {
-  label: "提及解析" | "交接校验";
-  body: string;
-}
-
-/** One resolved dispatch target. `agent` is null when there is no roster to read. */
 interface DispatchEntry {
   memberId: string;
   name: string;
@@ -106,44 +115,6 @@ export interface DurableWorker {
   requestCancel(taskId: string): { affected: number; attemptId: string | null };
 }
 
-const hasStructuredResult = (value: unknown): value is TaskResult => {
-  if (typeof value !== "object" || value === null) return false;
-  const result = value as Partial<TaskResult>;
-  return ["success", "partial", "failed"].includes(result.outcome ?? "")
-    && typeof result.summary === "string" && result.summary.trim().length > 0
-    && Array.isArray(result.artifacts) && Array.isArray(result.remainingRisks)
-    && result.artifacts.every((a) => typeof a === "object" && a !== null
-      && typeof (a as { path?: unknown }).path === "string")
-    && result.remainingRisks.every((r) => typeof r === "string");
-};
-
-const unknownHighRiskTools = (events: CanonicalEvent[]): string[] => {
-  const safeTools = new Set(["read", "grep", "glob", "find", "ls", "handoff_to", "submit_result"]);
-  const pending = new Map<string, string>();
-  for (const event of events) {
-    if (!event.toolCallId || !event.toolName || safeTools.has(event.toolName)) continue;
-    if (event.type === "tool_execution_start") pending.set(event.toolCallId, event.toolName);
-    if (event.type === "tool_execution_end") pending.delete(event.toolCallId);
-  }
-  return [...new Set(pending.values())];
-};
-
-const latestText = (events: CanonicalEvent[]): string =>
-  [...events].reverse().find((e) => e.type === "message_end" && e.text)?.text ?? "";
-
-const parseResult = (text: string): TaskResult | null => {
-  const candidates = [text.trim()];
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/g;
-  for (const match of text.matchAll(fenced)) candidates.push(match[1]?.trim() ?? "");
-  for (const candidate of candidates) {
-    try {
-      const value: unknown = JSON.parse(candidate);
-      if (hasStructuredResult(value)) return value;
-    } catch { /* Final prose is not a structured task result. */ }
-  }
-  return null;
-};
-
 /** Conservative P6 recovery: durable events, bounded attempts and fenced writes. */
 export function createDurableWorker(store: ExecutionStore, options: WorkerOptions): DurableWorker {
   const workerId = options.workerId ?? `worker-${randomUUID()}`;
@@ -151,6 +122,11 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
   const idleTimeoutMs = options.idleTimeoutMs ?? 120_000;
   const now = options.now ?? Date.now;
   const onChange = options.onChange ?? (() => {});
+  /**
+   * P9c: a per-Task ceiling on tokens or cost. Optional, and unset means unset —
+   * a default would silently stop long legitimate runs.
+   */
+  const budget = options.budget;
   const active = new Map<string, { attempt: AttemptRecord; chainId: string }>();
   const rooms = options.rooms;
   // Same rule as `postRoomMessage`: the reply and the Task row must share one
@@ -371,22 +347,6 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
    * to fix. The sentence says 不是本群成员, because that is the actual finding — the
    * target may exist elsewhere and simply not be in THIS room.
    */
-  function handoffResolutionNotes(unknown: string[], ambiguous: string[]): ResolutionNote[] {
-    const notes: ResolutionNote[] = [];
-    if (unknown.length > 0) {
-      notes.push({
-        label: "交接校验",
-        body: `handoff_to 的目标不是本群成员：${unknown.join(" / ")}，未派发`,
-      });
-    }
-    if (ambiguous.length > 0) {
-      notes.push({
-        label: "交接校验",
-        body: `handoff_to 的目标在本群有重名成员，无法确定 ${ambiguous.join(" / ")} 指谁，未派发`,
-      });
-    }
-    return notes;
-  }
 
   /**
    * D6: the child Task input BOTH agent-dispatch paths build. One function, so
@@ -627,6 +587,8 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
     const events: CanonicalEvent[] = [];
     let lastEventAt = now();
     let failure: string | null = null;
+    /** P9c: why `failure` is set. Known at every assignment, so nothing is guessed. */
+    let failureKind: FailureKind = "unknown";
     let cancelled = false;
 
     try {
@@ -677,10 +639,12 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       const watchdog = setInterval(() => {
         if (now() - lastEventAt >= idleTimeoutMs) {
           failure = `no events for ${idleTimeoutMs}ms`;
+          failureKind = "idle_timeout";
           void handle.cancel("abort");
         }
         if (!store.heartbeat(attempt.id, attempt.fencingToken, now(), leaseMs)) {
           failure = "lease lost; stop the superseded attempt";
+          failureKind = "lease_lost";
           void handle.cancel("abort");
           return;
         }
@@ -703,34 +667,58 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
         if (result.sessionFile) {
           store.recordSession(attempt.id, attempt.fencingToken, result.sessionFile);
         }
-        if (result.status !== "completed") failure = failure ?? result.error ?? `runtime ${result.status}`;
+        if (result.status !== "completed") {
+          // The one error string we do not author, so it is classified narrowly.
+          failure = failure ?? result.error ?? `runtime ${result.status}`;
+          if (failureKind === "unknown") failureKind = classifyRuntimeError(failure);
+        }
       } finally {
         clearInterval(watchdog);
       }
 
       if (cancelled || store.getChain(task.chainId).cancelRequested) {
-        store.finishFailure(attempt.id, attempt.fencingToken, "cancel requested", { now: now() });
+        store.finishFailure(attempt.id, attempt.fencingToken, "cancel requested",
+          { kind: "cancelled", now: now() });
+        return;
+      }
+      // P9c: the budget is checked BEFORE the outcome is interpreted. An agent that
+      // ran out of budget mid-run produces a truncated reply, and reading that reply
+      // first would report `result_invalid` — blaming the agent for the ceiling.
+      const spent = store.getUsage(task.id).reduce(
+        (sum, u) => ({ tokens: sum.tokens + u.totalTokens, cost: sum.cost + u.totalCost }),
+        { tokens: 0, cost: 0 },
+      );
+      const overTokens = budget?.maxTokens !== undefined && spent.tokens > budget.maxTokens;
+      const overCost = budget?.maxCost !== undefined && spent.cost > budget.maxCost;
+      if (overTokens || overCost) {
+        const ceiling = overTokens ? `${budget!.maxTokens} tokens` : `${budget!.maxCost} cost`;
+        store.finishFailure(attempt.id, attempt.fencingToken,
+          `预算超限：本 Task 累计 ${spent.tokens} tokens / ${spent.cost}，上限 ${ceiling}`,
+          { kind: "budget_exceeded", now: now() });
         return;
       }
       if (failure) {
-        store.finishFailure(attempt.id, attempt.fencingToken, failure, { now: now() });
+        store.finishFailure(attempt.id, attempt.fencingToken, failure,
+          { kind: failureKind, now: now() });
         return;
       }
       const unresolved = unknownHighRiskTools(events);
       if (unresolved.length > 0) {
         store.finishFailure(attempt.id, attempt.fencingToken,
           `unknown tool outcomes require human review: ${unresolved.join(", ")}`,
-          { blocked: true, now: now() });
+          { kind: "unresolved_tools", blocked: true, now: now() });
         return;
       }
       const structured = parseResult(latestText(events));
       if (!structured) {
         store.finishFailure(attempt.id, attempt.fencingToken,
-          "missing valid structured result (outcome, summary, artifacts, remainingRisks)", { now: now() });
+          "missing valid structured result (outcome, summary, artifacts, remainingRisks)",
+          { kind: "result_invalid", now: now() });
         return;
       }
       if (structured.outcome === "failed") {
-        store.finishFailure(attempt.id, attempt.fencingToken, structured.summary, { now: now() });
+        store.finishFailure(attempt.id, attempt.fencingToken, structured.summary,
+          { kind: "agent_failed", now: now() });
         return;
       }
 
@@ -878,6 +866,15 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       const claimed = store.claimNext(workerId, now(), leaseMs);
       if (!claimed) return false;
       await execute(claimed.task, claimed.attempt);
+      // P9b: a Task that ends needing a human is the escalation trigger. Read the
+      // FINAL status rather than trusting what `execute` decided, because `execute`
+      // has six different exits and a cancelled chain can flip the row underneath it.
+      // Fire-and-forget: a slow webhook must not stall the claim loop, and the
+      // ledger already makes a lost notification retryable by identity.
+      const settled = store.getTask(claimed.task.id);
+      if (settled && (settled.status === "blocked" || settled.status === "failed")) {
+        void Promise.resolve(options.tell?.(settled.id)).catch(() => { /* ledger holds it */ });
+      }
       return true;
     },
     recoverExpired() {

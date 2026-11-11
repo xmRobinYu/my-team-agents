@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { CanonicalEvent } from "@my-team-agents/runtime-core";
 import { addColumnIfMissing, applyMigrations, type Migration } from "./migrations.js";
+import { requiresHuman, type FailureKind } from "./failure-kind.js";
 
 export type TaskStatus =
   | "queued"
@@ -42,6 +43,13 @@ export interface CreateTaskInput {
   lane?: string;
   /** P9a: the inbound event that produced this Task, for AC6.1 traceability. */
   eventId?: string;
+  /**
+   * P9c/AC3.2: how many Tasks of this Task's lane may run concurrently. Only
+   * meaningful with `lane`: `insertTask` clamps it to 1 whenever `groupId` is set,
+   * because I3 AC3 ("one room, peak concurrency 1") is an invariant of the Room
+   * model and not a knob a caller may turn.
+   */
+  parallel?: number;
   /**
    * P9a/AC5.2: the Pi tool allowlist this Task may hold, carried to the adapter.
    *
@@ -88,6 +96,8 @@ export interface AttemptRecord {
   status: "leased" | "running" | "completed" | "failed" | "orphaned" | "cancelled";
   leaseExpiresAt: number;
   error: string | null;
+  /** P9c: the closed-set reason. `error` remains the human sentence. */
+  errorKind: FailureKind | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -141,7 +151,21 @@ const TASK_MIGRATIONS: readonly Migration[] = [
   // P9a/AC5.2: the tool allowlist, so "read-only" is enforced at run time and not
   // merely asserted at registration. JSON array text, same convention as `result`.
   { id: "0004-tasks-tools", up: (db) => { addColumnIfMissing(db, "tasks", "tools", "TEXT"); } },
+  // P9c: why it failed, as a closed set. `error` stays the human sentence; this is
+  // the countable field. Nullable because every pre-existing Attempt predates it.
+  { id: "0005-attempts-error-kind", up: (db) => { addColumnIfMissing(db, "attempts", "error_kind", "TEXT"); } },
+  // P9c/AC3.2: how many Tasks of one lane may run at once. It lives on the Task and
+  // not only on the rule because `claimNext`'s predicate is one SQL statement — it
+  // cannot join back to `trigger_rules` without making the queue depend on ingress.
+  // DEFAULT 1 is what keeps every existing row, and every `groupId` Task, serialised
+  // exactly as before.
+  { id: "0006-tasks-parallel", up: (db) => { addColumnIfMissing(db, "tasks", "parallel", "INTEGER NOT NULL DEFAULT 1"); } },
 ];
+
+/** P9c: 1 is the only safe answer for anything that is not a positive integer. */
+function normaliseParallel(value: number | undefined): number {
+  return Number.isSafeInteger(value) && (value as number) >= 1 ? (value as number) : 1;
+}
 
 /**
  * Q21/Q37 shared retry backoff. Every path that re-arms a Task — normal
@@ -328,6 +352,9 @@ export class ExecutionStore {
       eventId: text(row.event_id) ?? undefined,
       tools: row.tools ? json<string[]>(row.tools, []) : undefined,
       model: text(row.model) ?? undefined,
+      // Re-read through the SAME helper, so a row written before the clamp existed
+      // (or by hand, with `UPDATE tasks SET parallel = 1.5`) still means 1.
+      parallel: normaliseParallel(num(row.parallel)),
       depth: num(row.depth),
       batch: num(row.batch),
       batchAttempts: num(row.batch_attempts),
@@ -351,6 +378,7 @@ export class ExecutionStore {
       batch: num(row.batch), fencingToken: num(row.fencing_token),
       workerId: text(row.worker_id)!, status: text(row.status) as AttemptRecord["status"],
       leaseExpiresAt: num(row.lease_expires_at), error: text(row.error),
+      errorKind: (text(row.error_kind) as FailureKind | null) ?? null,
       createdAt: num(row.created_at), updatedAt: num(row.updated_at),
     };
   }
@@ -365,13 +393,23 @@ export class ExecutionStore {
     this.run("INSERT OR IGNORE INTO chains(id) VALUES(?)", chainId);
     this.run(`INSERT INTO tasks(
       id,chain_id,parent_task_id,tenant_id,project_id,member_id,workspace_path,agent_dir,prompt,
-      group_id,lane,event_id,tools,model,depth,idempotency_key,recovery_snapshot,status,available_at,created_at,updated_at
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)`,
+      group_id,lane,event_id,tools,model,parallel,depth,idempotency_key,recovery_snapshot,status,available_at,created_at,updated_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)`,
       id, chainId, input.parentTaskId ?? null, input.tenantId, input.projectId,
       input.memberId, input.workspacePath, input.agentDir ?? null, input.prompt, input.groupId ?? null,
       input.lane ?? null, input.eventId ?? null,
       input.tools && input.tools.length > 0 ? JSON.stringify(input.tools) : null,
-      input.model ?? null, input.depth ?? 0, input.idempotencyKey ?? null,
+      input.model ?? null,
+      // P9c: a Room is NEVER widened. `parallel` is a lane capability, and I3 AC3
+      // ("one room, peak concurrency 1") is an invariant of the Room model, not of a
+      // rule's tuning knob — so the kernel clamps it here rather than trusting every
+      // caller (handoff dispatch, template import, /api/tasks) to remember.
+      // Clamped on WRITE as well as on read: the row is what the queue's SQL
+      // compares against, so a fractional or negative value stored there would be a
+      // bound nobody can reason about. (SQLite's INTEGER affinity keeps 1.5 as 1.5 —
+      // it only converts losslessly, so this clamp cannot be delegated to the schema.)
+      input.groupId ? 1 : normaliseParallel(input.parallel),
+      input.depth ?? 0, input.idempotencyKey ?? null,
       input.recoverySnapshot ?? null, input.availableAt ?? now, now, now);
     return this.getTask(id)!;
   }
@@ -491,13 +529,17 @@ export class ExecutionStore {
         WHERE (t.status='queued' OR (t.status='retry_wait' AND t.available_at<=?))
           AND t.available_at<=? AND t.batch_attempts<3
           AND COALESCE(c.cancel_requested,0)=0
-          AND (COALESCE(t.lane, t.group_id) IS NULL OR NOT EXISTS (
-            SELECT 1 FROM tasks busy
+          -- P9c/AC3.2: the key space is UNCHANGED (COALESCE(lane, group_id), one
+          -- namespace by Q49), only the test becomes a count. parallel defaults to
+          -- 1, so for every pre-existing row and every groupId Task this is
+          -- count < 1, i.e. exactly the old NOT EXISTS.
+          AND (COALESCE(t.lane, t.group_id) IS NULL OR (
+            SELECT COUNT(*) FROM tasks busy
             JOIN attempts live ON live.task_id=busy.id
             WHERE COALESCE(busy.lane, busy.group_id) = COALESCE(t.lane, t.group_id)
               AND busy.id <> t.id
               AND live.status IN ('leased','running') AND live.lease_expires_at > ?
-          ))
+          ) < COALESCE(t.parallel, 1))
         ORDER BY t.created_at LIMIT 1`, now, now, now);
       if (!row) return null;
       const task = this.taskFrom(row)!;
@@ -572,16 +614,21 @@ export class ExecutionStore {
   }
 
   finishFailure(attemptId: string, fencingToken: number, error: string,
-    options: { blocked?: boolean; now?: number } = {}): TaskStatus {
+    options: { blocked?: boolean; kind?: FailureKind; now?: number } = {}): TaskStatus {
     return this.tx(() => {
       const row = this.current(attemptId, fencingToken);
       const task = this.taskFrom(row)!;
       const now = options.now ?? Date.now();
       const chain = this.getChain(task.chainId);
       const cancelled = chain.cancelRequested || task.status === "cancelling";
-      this.run("UPDATE attempts SET status=?,error=?,updated_at=? WHERE id=?",
-        cancelled ? "cancelled" : "failed", error, now, attemptId);
-      const status: TaskStatus = cancelled ? "cancelled" : options.blocked ? "blocked"
+      // P9c: a budget stop is BLOCKED, never a retry. Retrying a Task that has
+      // already spent its budget would spend it again and then call the result
+      // "failed", which blames the agent for an operator decision.
+      const kind: FailureKind = options.kind ?? (cancelled ? "cancelled" : "unknown");
+      const blocked = options.blocked === true || requiresHuman(kind);
+      this.run("UPDATE attempts SET status=?,error=?,error_kind=?,updated_at=? WHERE id=?",
+        cancelled ? "cancelled" : "failed", error, kind, now, attemptId);
+      const status: TaskStatus = cancelled ? "cancelled" : blocked ? "blocked"
         : task.batchAttempts < 3 ? "retry_wait" : "failed";
       const delay = retryDelay(task.batchAttempts, this.rng);
       // Snapshot is generated after the failure is recorded, so a retry can see

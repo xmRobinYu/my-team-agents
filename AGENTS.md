@@ -99,6 +99,7 @@ and the UI with `pnpm --filter @my-team-agents/web dev`. The server's `dev` scri
 | Bitable sync mapping | `docs/feishu-bitable.json` + parsed sources | `just verify-bitable` | yes |
 | Sync-layer unit tests | `scripts/*.test.mjs` | `just test-scripts` | yes |
 | Package resolution | every workspace package | `just verify-packages` | yes |
+| File size | tracked source vs `size_limits.max_file_lines` | `just verify-file-size` | yes |
 | Tests without any build | all packages | `just test-no-build` | yes |
 | Real Pi end-to-end | runtime-pi + live model | `just pi-smoke` | no (needs pi + network) |
 | Template import evidence | `packages/orchestrator/src/template-import.ts` | `just verify-import` | no (needs local `ref/` zips) |
@@ -310,6 +311,7 @@ checker; nothing here is advisory only.
 | Full matrix green on push/PR | repo | `.github/workflows/ci.yml` (CI) | gate |
 | Test scope excludes `ref/` | `vitest.config.ts` | `just test` | block |
 | Doc-sync mapping is complete | `docs/feishu-sync.json` + mapped sources | `just verify-docs` | block |
+| Files stay within the declared line limit | tracked `.ts/.tsx/.mjs/.js/.sh` | `just verify-file-size` (ratchet baseline) | block |
 | Bitable sync mapping is complete | `docs/feishu-bitable.json` + parsed docs | `just verify-bitable` | block |
 | Sync layer tests pass | `scripts/*.test.mjs` | `just test-scripts` | block |
 | Template package imports with rollback proven | `packages/orchestrator/src/template-import.ts` + `ref/teamagentx-templates/*.zip` | `just verify-import` | gate |

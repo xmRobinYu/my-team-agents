@@ -33,6 +33,7 @@ import type {
   EventScope,
   InboundEvent,
   IngestOutcome,
+  TargetPersona,
   TriggerRule,
   TriggerRuleInput,
 } from "./ingest.js";
@@ -54,6 +55,28 @@ export interface IngestServiceDeps {
    * reached dispatch as `member_id="寇豆码"`/`agent_dir=NULL` and spun anonymously.
    */
   memberExists: (memberId: string) => boolean;
+  /**
+   * P9b: the target persona's directory, model and loadable skills.
+   *
+   * Without it an event Task runs with `agentDir = NULL`, so Pi gets no `--skill`
+   * argument at all: the persona's prompt and skills never load, and a rule's
+   * `skill` could only ever be decoration. Same class as AC1.3's unknown-member
+   * refusal — a Task that silently loses its persona is a mis-dispatch, not a
+   * degraded one.
+   *
+   * Optional: a caller with no roster leaves it out, and dispatch behaves exactly
+   * as before (no agentDir, no model).
+   */
+  persona?: (memberId: string) => TargetPersona | null;
+  /**
+   * Source to assume when the producer body carries none. AIHOT's `wakeAgent`
+   * (`ref/AIHOT/packages/backend/src/notify/agent.ts:70-78`) posts
+   * `{id,type,subject,summary,detail,link}` and NO `source`, so without this the
+   * documented peer gets a 400 on every single alert. A deployment that fronts one
+   * producer names it here; a body that DOES send `source` always wins, because
+   * guessing over an explicit field is how two producers end up sharing a rule.
+   */
+  defaultSource?: string;
   now?: () => number;
 }
 
@@ -71,6 +94,8 @@ export interface SubmitResult {
 
 export interface RegisterRuleResult {
   ok: boolean;
+  /** Present when a `skill` was accepted but no roster was available to check it. */
+  warnings?: string[];
   rule?: TriggerRule;
   errors?: Array<{ field: string; code: string; message: string }>;
 }
@@ -83,7 +108,7 @@ export interface IngestService {
 }
 
 export function createIngestService(deps: IngestServiceDeps): IngestService {
-  const { executions, ingest, memberExists } = deps;
+  const { executions, ingest, memberExists, persona, defaultSource } = deps;
   const now = deps.now ?? (() => Date.now());
 
   if (executions.db !== ingest.db) {
@@ -147,13 +172,22 @@ export function createIngestService(deps: IngestServiceDeps): IngestService {
       // AC3.4 + Q18: `lane` is NOT `groupId`. A `groupId` would make the worker force
       // `resumeSession = false` (Q31, durable-worker.ts:616) and try to inject a Room
       // that does not exist. `lane` serialises without either side effect.
+      // P9b: resolved per dispatch, not stored on the rule, so installing a skill or
+      // moving an agentDir takes effect on the NEXT event with no re-registration.
+      const target = persona?.(rule.to.memberId) ?? null;
       const task = executions.createTask({
         tenantId: scope.tenantId,
         projectId: scope.projectId,
         memberId: rule.to.memberId,
         workspacePath: rule.to.workspacePath,
+        ...(target?.agentDir ? { agentDir: target.agentDir } : {}),
+        ...(target?.model ? { model: target.model } : {}),
         prompt: buildEventPrompt(rule, event),
         lane: rule.lane,
+        // P9c/AC3.2: how many of THIS lane may run at once. `claimNext` reads it off
+        // the Task row, which is why it is copied here instead of looked up per rule
+        // inside the queue's SQL.
+        parallel: rule.parallel,
         eventId: event.id,
         // AC5.2: carry the allowlist to the run. Validated at registration; passed
         // here so "read-only" is a property of the execution, not just the rule row.
@@ -175,7 +209,7 @@ export function createIngestService(deps: IngestServiceDeps): IngestService {
   return {
     submit(body, scope) {
       const at = now();
-      const normalized = normalizeEvent(body, { now: at });
+      const normalized = normalizeEvent(body, { now: at, ...(defaultSource ? { defaultSource } : {}) });
       if (!normalized.ok) {
         return { status: 400, outcome: "rejected", taskIds: [], ruleIds: [],
           errors: [{ field: normalized.code === "SUMMARY_REQUIRED" ? "summary" : normalized.code === "TYPE_REQUIRED" ? "type" : "source",
@@ -224,9 +258,17 @@ export function createIngestService(deps: IngestServiceDeps): IngestService {
       const validated = validateRuleInput(
         { ...input, tenantId: input.tenantId ?? scope.tenantId, projectId: input.projectId ?? scope.projectId },
         memberExists,
+        persona,
       );
       if (!validated.ok) return { ok: false, errors: validated.errors };
-      return { ok: true, rule: ingest.createRule(validated.value, now()) };
+      return {
+        ok: true,
+        rule: ingest.createRule(validated.value, now()),
+        // An unchecked declaration must not read as a verified one.
+        ...(validated.unverifiedSkill
+          ? { warnings: [`skill "${validated.unverifiedSkill}" 未对照名册校验（本次调用没有提供名册）`] }
+          : {}),
+      };
     },
 
     redriveDeferred(at = now()) {
@@ -234,11 +276,15 @@ export function createIngestService(deps: IngestServiceDeps): IngestService {
       let progressed = 0;
       for (const record of due) {
         executions.transaction(() => {
+          // CLAIM before deciding. `dueRetries` only screens candidates; between
+          // reading that list and acting on it another worker may already have
+          // redriven this event. The conditional UPDATE is the ownership test and it
+          // runs inside `BEGIN IMMEDIATE`, so two claims cannot interleave.
+          if (!ingest.claimRetry(record.event.id, at)) return;
           // Re-run the decision WITHOUT re-inserting: the `(source, id)` dedup key
           // already holds this event, so `insertEvent` would report `delivered` and a
           // deferred event would never advance. Redrive is the only path that updates
           // an existing row's outcome.
-          ingest.clearRetry(record.event.id);
           const decision = dispatchEvent(record.event, record.scope);
           ingest.setEventOutcome(record.event.id, decision.outcome, {
             ruleIds: decision.ruleIds,

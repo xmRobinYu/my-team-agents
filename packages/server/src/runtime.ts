@@ -21,9 +21,18 @@ function mockAdapter(): RuntimeAdapter {
     async start(spec) {
       let cancelled = false;
       const delay = Number(process.env.MTA_MOCK_DELAY_MS ?? 300);
+      // The mock declares `usageAttribution: "message"`, so it must actually emit
+      // usage: a capability claim with no events behind it is exactly the bug class
+      // the usage-attribution fix (02d532f) was about, and it left the P9c token
+      // budget untestable without a paid model.
+      const tokens = Number(process.env.MTA_MOCK_USAGE_TOKENS ?? 1_200);
+      const usage = {
+        input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: tokens,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      };
       const events: CanonicalEvent[] = [
         { type: "agent_start", runId: spec.runId, timestamp: new Date().toISOString() },
-        { type: "message_end", runId: spec.runId, timestamp: new Date().toISOString(),
+        { type: "message_end", runId: spec.runId, timestamp: new Date().toISOString(), usage,
           text: JSON.stringify({ outcome: "success", summary: `Mock runtime accepted: ${spec.prompt.slice(0, 160)}`,
             artifacts: [], remainingRisks: ["This is a deterministic development runtime, not an agent response."] }) },
         { type: "agent_settled", runId: spec.runId, timestamp: new Date().toISOString() },

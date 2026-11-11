@@ -27,6 +27,7 @@
  * this platform cannot normalize at all (AC2.4).
  */
 
+import { timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { ExecutionStore, IngestService, IngestStore } from "@my-team-agents/orchestrator";
 
@@ -37,23 +38,54 @@ export interface IngestRouteOptions {
   /** Project an event is attributed to when the caller/rule does not name one. */
   defaultProjectId: string;
   defaultTenantId: string;
-  /** AC5.3: static bearer token. Unset means "no token required" (loopback only). */
+  /** AC5.3: static bearer token. Absent means the caller opted into anonymous. */
   token?: string;
-  /** D6/A: the surface is inert unless this is true. */
+  /** The routes are registered only when this is true (`open`, not `enabled`). */
   enabled: boolean;
 }
+
+/**
+ * The largest body this surface will read. The event itself is bounded by
+ * `normalizeEvent` (summary 200, detail 4000), but that truncation runs AFTER
+ * Fastify has already parsed and buffered the whole payload — so without a limit
+ * here, "truncate the detail" is not a bound on the bytes an unauthenticated-ish
+ * caller can push through. 64 KiB is ~16x the largest legitimate event.
+ */
+const INGEST_BODY_LIMIT = 64 * 1024;
 
 const unauthorized = (reply: FastifyReply) =>
   reply.code(401).send({ error: "unauthorized", hint: "设置 authorization: Bearer <MTA_INGEST_TOKEN>" });
 
+/**
+ * Constant-time bearer check.
+ *
+ * `a !== b` on strings returns on the first differing byte, so response timing
+ * leaks the shared prefix length — enough to recover a token byte by byte over many
+ * requests. `timingSafeEqual` needs equal-length buffers, so a length mismatch is
+ * folded into a comparison against itself: same work, constant answer.
+ */
+function tokenMatches(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) {
+    try { timingSafeEqual(b, b); } catch { /* lengths already equal */ }
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
 export function ingestGuard(options: Pick<IngestRouteOptions, "token">) {
   const token = options.token;
   return (request: FastifyRequest, reply: FastifyReply): boolean => {
+    // No token means the operator set MTA_INGEST_ALLOW_ANON=1; `ingestConfig` is the
+    // only thing allowed to decide that, and it has already refused to open the
+    // surface otherwise. This function must not invent a third answer.
     if (!token) return true;
     const header = request.headers.authorization;
     if (typeof header !== "string") return (unauthorized(reply), false);
     const match = /^Bearer\s+(.+)$/.exec(header.trim());
-    if (!match || match[1] !== token) return (unauthorized(reply), false);
+    if (!match) return (unauthorized(reply), false);
+    if (!tokenMatches(match[1]!.trim(), token)) return (unauthorized(reply), false);
     return true;
   };
 }
@@ -70,8 +102,12 @@ export async function registerIngestRoutes(
   }
   const authorized = ingestGuard(options);
 
+  // `bodyLimit` is a ROUTE option in Fastify (a plugin-registration option is
+  // ignored), set only on the one route that accepts a body. This is what makes the
+  // truncation in `normalizeEvent` a bound on BYTES rather than only on the stored
+  // string: truncation runs after Fastify has already buffered the payload.
   await app.register(async (scope) => {
-    scope.post("/api/ingest/events", async (request, reply) => {
+    scope.post("/api/ingest/events", { bodyLimit: INGEST_BODY_LIMIT }, async (request, reply) => {
       if (!authorized(request, reply)) return reply;
       const scopeIn = {
         tenantId: options.defaultTenantId,

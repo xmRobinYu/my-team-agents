@@ -62,16 +62,24 @@ describe("migration ledger", () => {
 });
 
 describe("ExecutionStore uses the ledger for the P9a columns", () => {
-  it("a fresh database gets lane, event_id and tools, and records all four migrations", () => {
+  it("a fresh database gets lane, event_id, tools, error_kind, parallel and records all six migrations", () => {
     const store = new ExecutionStore(":memory:");
     const tasks = store.db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
     const names = tasks.map((c) => c.name);
     for (const column of ["agent_dir", "lane", "event_id", "tools"]) {
       expect(names, column).toContain(column);
     }
+    // P9c put its column on `attempts`, not `tasks` — the reason is WHERE the fact
+    // lives: a retry re-uses the Task row but always mints a new Attempt.
+    const attempts = store.db.prepare("PRAGMA table_info(attempts)").all() as Array<{ name: string }>;
+    expect(attempts.map((c) => c.name)).toContain("error_kind");
+    const attemptCols = store.db.prepare("PRAGMA table_info(attempts)").all() as Array<{ name: string }>;
+    expect(attemptCols.map((c) => c.name)).toContain("error_kind");
+    expect(names).toContain("parallel");
     const ledger = store.db.prepare("SELECT id FROM schema_migrations ORDER BY id").all() as Array<{ id: string }>;
     expect(ledger.map((r) => r.id)).toEqual([
       "0001-tasks-agent-dir", "0002-tasks-lane", "0003-tasks-event-id", "0004-tasks-tools",
+      "0005-attempts-error-kind", "0006-tasks-parallel",
     ]);
     store.close();
   });
@@ -86,10 +94,11 @@ describe("ExecutionStore uses the ledger for the P9a columns", () => {
       const first = new ExecutionStore(file);
       first.close();
       const second = new ExecutionStore(file);
-      // Same columns, and the ledger still holds exactly the four known ids.
+      // Same columns, and the ledger still holds exactly the six known ids.
       const ledger = second.db.prepare("SELECT id FROM schema_migrations ORDER BY id").all() as Array<{ id: string }>;
       expect(ledger.map((r) => r.id)).toEqual([
         "0001-tasks-agent-dir", "0002-tasks-lane", "0003-tasks-event-id", "0004-tasks-tools",
+        "0005-attempts-error-kind", "0006-tasks-parallel",
       ]);
       expect(second.listTasks()).toEqual([]);
       second.close();

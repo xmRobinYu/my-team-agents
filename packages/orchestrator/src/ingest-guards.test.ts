@@ -21,6 +21,49 @@ const base = (over: Record<string, unknown> = {}) => ({
   workspacePath: "/tmp/ws", prompt: "work", ...over,
 });
 
+describe("AC2.5 — a deferred event has exactly one redriver", () => {
+  it("two stores over one database cannot both claim the same due retry", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "mta-claim-"));
+    const filename = join(dir, "exec.sqlite");
+
+    const a = new ExecutionStore(filename);
+    // A second connection is what makes this a real race: two workers do not share
+    // an in-process object, they share a file.
+    const b = new ExecutionStore(filename);
+    const ia = new IngestStore(a.db);
+    const ib = new IngestStore(b.db);
+    const service = createIngestService({ executions: a, ingest: ia, memberExists: () => true });
+    service.registerRule({
+      name: "r", ask: "x", lane: "L1", when: { sources: ["s"] },
+      to: { memberId: "agent-pm", workspacePath: "/tmp/ws" },
+      rate: { windowMs: 60_000, max: 1 },
+    });
+
+    const scope = { tenantId: "t1", projectId: "p1" };
+    const first = service.submit({ id: "e1", source: "s", type: "t", summary: "x" }, scope);
+    expect(first.outcome).toBe("dispatched");
+    // The rate window is now full, so this one is DEFERRED rather than dropped.
+    const second = service.submit({ id: "e2", source: "s", type: "t2", summary: "y" }, scope);
+    expect(second.outcome).toBe("deferred");
+
+    const later = Date.now() + 60_000;
+    expect(ia.dueRetries(later)).toHaveLength(1);
+    // Both workers read the same candidate list — the claim is what decides.
+    expect(ib.dueRetries(later)).toHaveLength(1);
+    // The producer id is the event id (it supplied one), so `e2` is the row.
+    const claims = [ia.claimRetry("e2", later), ib.claimRetry("e2", later)];
+    expect(claims.filter(Boolean)).toHaveLength(1);
+
+    // And the loser's redrive pass progresses nothing, rather than re-running the
+    // decision for a row someone else owns.
+    expect(service.redriveDeferred(later)).toBe(0);
+    ia.close(); ib.close(); a.close(); b.close();
+  });
+});
+
 describe("Story 3 — the durable kernel is untouched", () => {
   it("AC3.1 an event Task carries the full durable spine (chain, lease, attempts)", () => {
     const store = new ExecutionStore(":memory:");
