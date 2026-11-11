@@ -210,17 +210,23 @@ describe("parseTemplatePackage — happy path", () => {
     expect(codes(parsed)).not.toContain("cronTasks-not-migrated");
   });
 
-  it("drops cronTasks and categories but never silently", () => {
+  it("converts cronTasks to rules (AC4.3) and still never silently drops categories", () => {
     const parsed = parseTemplatePackage(pack({
       snapshot: snapshotOf(fiveAgents(), {}, {
         categories: [{ id: "c1", name: "A" }, { id: "c2", name: "B" }],
         cronTasks: [{ id: "t1", name: "每天 9 点" }],
       }),
     }));
-    expect(codes(parsed)).toEqual(
-      expect.arrayContaining(["categories-not-migrated", "cronTasks-not-migrated"]),
-    );
-    expect(parsed.ignoredFields.find((f) => f.field === "cronTasks")?.value).toContain("1 个定时任务");
+    // `categories` is still not migrated (Q31) and still warns.
+    expect(codes(parsed)).toEqual(expect.arrayContaining(["categories-not-migrated"]));
+    // AC4.3 (P9.5) REVERSED the old Q31 policy for `cronTasks`: a declared schedule
+    // now becomes a rule instead of being dropped, so its warning is gone and the
+    // record says what actually happened. Rewritten because the SPEC changed, not to
+    // silence a failure: the case the old assertion guarded is still guarded here,
+    // now against the conversion instead of against the drop.
+    expect(codes(parsed)).not.toContain("cronTasks-not-migrated");
+    expect(parsed.ignoredFields.find((f) => f.field === "cronTasks")?.reason).toContain("已转为触发规则");
+    expect(parsed.cronTasks).toHaveLength(1);
   });
 
   it("materialises skills from skill-usages into the plan", () => {

@@ -42,6 +42,8 @@ import {
   readSkillFrontmatter,
 } from "@my-team-agents/runtime-core";
 import type { CreateRoomAgentInput, CreateRoomInput, RoomStore } from "./room-store.js";
+import { planCronRules, readCronTasks, type CronRulePlan } from "./ingest-import.js";
+import type { TriggerRule } from "./ingest.js";
 
 /** A package arrives either as a path on disk or as an already-uploaded buffer. */
 export type ZipSource = string | Uint8Array;
@@ -134,6 +136,8 @@ export interface ParsedTemplate {
   agents: ParsedAgent[];
   /** slug -> relative path -> file text. */
   skillFiles: Record<string, Record<string, string>>;
+  /** AC4.3: raw `cronTasks[]`, carried out of the snapshot for rule conversion. */
+  cronTasks: ReturnType<typeof readCronTasks>;
   ignoredFields: IgnoredField[];
   warnings: ImportWarning[];
 }
@@ -170,6 +174,16 @@ export interface ImportResult {
   ignoredFields: IgnoredField[];
   warnings: ImportWarning[];
   parsed: ParsedTemplate;
+  /**
+   * AC4.3: template `cronTasks` that became rules. Empty when the package declares
+   * none OR when the caller supplied no `registerCronRule` seam — in which case the
+   * converted inputs are still listed in `cronRuleInputs` so nothing is lost.
+   */
+  cronRules: TriggerRule[];
+  /** Converted-but-unregistered rule inputs (no seam supplied). */
+  cronRuleInputs: Array<Record<string, unknown>>;
+  /** Schedules that could NOT be converted, with the reason. Never silent. */
+  cronRefused: Array<{ name: string; reason: string }>;
 }
 
 export interface ParseOptions {
@@ -186,6 +200,15 @@ export interface ImportOptions {
   roomsRoot?: string;
   now?: number;
   parse?: ParseOptions;
+  /**
+   * AC4.3 seam: register one converted schedule as a rule. Injected so this module
+   * keeps talking only to a `RoomStore`; a caller without an `IngestStore` still
+   * gets the conversion reported (`cronRuleInputs`) instead of losing it. Returns
+   * the stored rule, or null when the store refused it (reported as a refusal).
+   */
+  registerCronRule?: (input: Record<string, unknown>) => TriggerRule | null;
+  /** Project workspace scheduled Tasks run against. Defaults to `<cwd>`. */
+  workspacePath?: string;
 }
 
 const REQUIRED_FILES = ["manifest.json", "snapshot.json"] as const;
@@ -750,19 +773,37 @@ export function parseTemplatePackage(source: ZipSource, options: ParseOptions = 
     }
   }
 
-  // Deliberately not migrated (Q31) — recorded, not swallowed.
-  for (const field of ["categories", "cronTasks"] as const) {
-    const value = snapshot[field];
+  // `categories` is still deliberately not migrated (Q31) — recorded, not swallowed.
+  {
+    const value = snapshot["categories"];
     const n = Array.isArray(value) ? value.length : 0;
-    const label = field === "categories" ? "分类" : "定时任务";
     ignored.push({
       scope: "package",
-      field,
-      reason: n > 0 ? `不迁移（Q31）：包内 ${n} 个${label}，本次导入丢弃` : "不迁移（Q31）",
-      value: n > 0 ? `${n} 个${label}` : undefined,
+      field: "categories",
+      reason: n > 0 ? `不迁移（Q31）：包内 ${n} 个分类，本次导入丢弃` : "不迁移（Q31）",
+      value: n > 0 ? `${n} 个分类` : undefined,
     });
     if (n > 0) {
-      warnings.push({ code: `${field}-not-migrated`, message: `包内有 ${n} 个${label}，按 Q31 不迁移` });
+      warnings.push({ code: "categories-not-migrated", message: `包内有 ${n} 个分类，按 Q31 不迁移` });
+    }
+  }
+  // AC4.3 REVERSES Q31 for `cronTasks`: a declared schedule is now CONVERTED to a
+  // trigger rule (see `planCronRules`) instead of being dropped. The record below
+  // stays — the field is still worth naming in the report — but it now says what
+  // happened rather than "discarded". A task that cannot be converted is refused by
+  // name in `cronRefused`, so the "never silent" property survives the change.
+  {
+    const cronTaskCount = readCronTasks(snapshot).length;
+    const n = cronTaskCount;
+    if (n === 0) {
+      ignored.push({ scope: "package", field: "cronTasks", reason: "包内无定时任务" });
+    } else {
+      ignored.push({
+        scope: "package",
+        field: "cronTasks",
+        reason: `已转为触发规则（AC4.3/P9.5）：包内 ${n} 个定时任务不再丢弃`,
+        value: `${n} 个定时任务 → 待转换规则`,
+      });
     }
   }
 
@@ -779,6 +820,7 @@ export function parseTemplatePackage(source: ZipSource, options: ParseOptions = 
     defaultAgentRef: str(roomRaw["defaultAgentId"]),
     agents,
     skillFiles,
+    cronTasks: readCronTasks(snapshot),
     ignoredFields: ignored,
     warnings,
   };
@@ -1023,6 +1065,56 @@ export function importTemplatePackage(options: ImportOptions): ImportResult {
 
   const filesWritten = plan.agents.flatMap((agent) => agent.files.map((rel) => join(agent.agentDir, rel)));
 
+  // AC4.3: convert the package's `cronTasks` into trigger rules.
+  //
+  // Done AFTER `commitRoom`, because a rule names a MEMBER ID and the ids only
+  // exist once the agents are committed. The mapping is pure
+  // (`planCronRules`); this is where it is bound to the roster that just landed.
+  //
+  // A refusal (a target the package does not contain, a non-cron schedule type, an
+  // unparseable expression) is returned by name in `cronRefused` and never silently
+  // dropped. Registration failures are refusals too, for the same reason.
+  const cronPlan = planCronRules(plan.parsed.cronTasks, {
+    workspacePath: options.workspacePath ?? resolve(process.cwd()),
+    memberIdForTemplateAgent: (templateAgentId) => {
+      const index = plan.agents.findIndex((a) => a.templateAgentId === templateAgentId);
+      return index === -1 ? null : (committed.agents[index]?.id ?? null);
+    },
+    agentIdOf: (task) => {
+      const ids = Array.isArray(task.agentIds) ? task.agentIds : [];
+      return typeof ids[0] === "string" ? ids[0] : null;
+    },
+    lanePrefix: plan.parsed.manifest.roomRef,
+  });
+  const cronRules: TriggerRule[] = [];
+  const cronRuleInputs: Array<Record<string, unknown>> = [];
+  // `registered` vs `unregistered` is NOT `converted` vs `refused`. A seam that
+  // returns null may be a store refusal OR a dry run (this very script's seam returns
+  // null on purpose). Reporting a dry run as "refused" would tell an operator that a
+  // working template had a broken schedule.
+  let unregistered = 0;
+  for (const input of cronPlan.rules) {
+    cronRuleInputs.push(input as unknown as Record<string, unknown>);
+    if (!options.registerCronRule) { unregistered += 1; continue; }
+    const stored = options.registerCronRule(input as unknown as Record<string, unknown>);
+    if (stored) cronRules.push(stored);
+    else unregistered += 1;
+  }
+  // The report says what actually happened, not what was intended.
+  if (cronPlan.rules.length > 0) {
+    const idx = plan.ignoredFields.findIndex((f) => f.field === "cronTasks");
+    const time = cronPlan.rules.length;
+    const text = `已转为触发规则（AC4.3/P9.5）：${time} 个定时任务`
+      + (options.registerCronRule
+        ? `，${cronRules.length} 个已登记，${unregistered} 个未登记（seam 未返回规则）`
+        : `，未登记（未提供注册 seam，转出的规则在 cronRuleInputs）`);
+    if (idx !== -1) plan.ignoredFields[idx] = { ...plan.ignoredFields[idx]!, reason: text, value: `${time} 个定时任务 → 规则` };
+    else plan.ignoredFields.push({ scope: "package", field: "cronTasks", reason: text, value: `${time} 个定时任务 → 规则` });
+    for (const refusal of cronPlan.refused) {
+      plan.warnings.push({ code: "cron-task-not-converted", message: `定时任务「${refusal.name}」未转成规则：${refusal.reason}` });
+    }
+  }
+
   const report = {
     ...marker,
     importId: `import-${randomUUID()}`,
@@ -1067,5 +1159,8 @@ export function importTemplatePackage(options: ImportOptions): ImportResult {
     ignoredFields: plan.ignoredFields,
     warnings: plan.warnings,
     parsed: plan.parsed,
+    cronRules,
+    cronRuleInputs,
+    cronRefused: cronPlan.refused,
   };
 }

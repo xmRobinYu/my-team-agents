@@ -100,3 +100,19 @@ export {
   type SkillIssue,
   type SkillIssueCode,
 } from "./skills.js";
+
+// P9a (appended at the tail to stay merge-friendly with in-flight edits above).
+export { buildEventPrompt, dedupKeyOf, deriveEventId, normalizeEvent, orderMatches, READ_ONLY_TOOLS, redactForLog, ruleMatches, validateRuleInput, DETAIL_MAX, SUMMARY_MAX } from "./ingest.js";
+export type { EventScope, InboundEvent, IngestOutcome, RuleError, RuleTarget, RuleWhen, TriggerRule, TriggerRuleInput } from "./ingest.js";
+export { createIngestService } from "./ingest-service.js";
+export type { IngestService, IngestServiceDeps, RegisterRuleResult, SubmitResult } from "./ingest-service.js";
+export { IngestStore } from "./ingest-store.js";
+export type { InboundEventRecord, RuleDocument } from "./ingest-store.js";
+export { addColumnIfMissing, applyMigrations, hasColumn, hasTable } from "./migrations.js";
+export type { Migration } from "./migrations.js";
+export { BEIJING_OFFSET_MS, cronEventId, dueSlots, latestDueSlot, parseCron } from "./cron.js";
+export type { CronFields, CronParseResult } from "./cron.js";
+export { createScheduler } from "./scheduler.js";
+export type { Scheduler, SchedulerDeps } from "./scheduler.js";
+export { planCronRules, readCronTasks } from "./ingest-import.js";
+export type { CronRuleContext, CronRulePlan, TemplateCronTask } from "./ingest-import.js";
