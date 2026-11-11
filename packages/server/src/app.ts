@@ -3,7 +3,9 @@ import fastifyStatic from "@fastify/static";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ServerResponse } from "node:http";
-import { RoomStore, type CreateTaskInput, type DurableWorker, type ExecutionStore } from "@my-team-agents/orchestrator";
+import { createIngestService, IngestStore, RoomStore, type CreateTaskInput, type DurableWorker, type ExecutionStore } from "@my-team-agents/orchestrator";
+import { ingestConfig } from "./config.js";
+import { registerIngestRoutes } from "./ingest-routes.js";
 import { registerPiRoutes } from "./pi-routes.js";
 import { registerRoomRoutes } from "./room-routes.js";
 import { registerSkillRoutes } from "./skill-routes.js";
@@ -20,6 +22,12 @@ export interface AppOptions {
   defaultWorkspacePath?: string;
   /** Task attribution tenant for triggered Tasks. Defaults to "default". */
   defaultTenantId?: string;
+  /**
+   * P9a: the inbound-event store. Defaults to one over `store.db`, so events and
+   * Tasks commit together. Injected when a caller (a test, or a worker process)
+   * already holds an instance.
+   */
+  ingest?: IngestStore;
 }
 
 interface TaskBody {
@@ -41,6 +49,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   const { store, worker } = options;
   const rooms = options.rooms ?? new RoomStore(store.db);
+  // P9a: same database handle as the Tasks it creates, so an event + its Tasks +
+  // its outcome commit in one transaction (the rule `postRoomMessage` follows).
+  const ingest = options.ingest ?? new IngestStore(store.db);
   const clients = new Set<ServerResponse>();
   const notify = () => {
     for (const client of clients) client.write(`event: tasks\ndata: ${JSON.stringify(store.listTasks())}\n\n`);
@@ -51,8 +62,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   });
 
   app.get("/api/health", async () => ({
-    ok: true, mode: "development", version: "p7a",
+    ok: true, mode: "development", version: "p9a",
     auth: "loopback-only", workerRecovery: true,
+    // D6/A: say whether the inbound surface is live, so an operator seeing a 404 on
+    // a correct-looking POST has the answer in one request.
+    ingest: { enabled: ingestConfig().enabled, tokenRequired: "token" in ingestConfig() },
   }));
   app.get("/api/catalog", async () => ({
     tenants: [{ id: "default", name: "开发租户" }],
@@ -216,6 +230,27 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   // I9: agent skill management rides the same RoomStore seam as /api/rooms, in
   // its own encapsulated scope so it cannot alter any existing body handling.
   await registerSkillRoutes(app, { store: rooms });
+
+  // P9a: the inbound-event surface. Its own encapsulated scope, so its body
+  // handling cannot change what /api/tasks and /api/pi see. Inert unless
+  // MTA_INGEST_ENABLED=1 (D6/A), and bearer-guarded when MTA_INGEST_TOKEN is set.
+  // `memberExists` reads the room roster: a rule must name a real persona, which is
+  // AC1.3's registration-time check (not a runtime silent degrade).
+  const { enabled, token } = ingestConfig();
+  const ingestService = createIngestService({
+    executions: store,
+    ingest,
+    memberExists: (memberId) => rooms.getAgent(memberId) !== null,
+  });
+  await registerIngestRoutes(app, {
+    executions: store,
+    ingest,
+    service: ingestService,
+    defaultProjectId: options.defaultProjectId ?? "my-team-agents",
+    defaultTenantId: options.defaultTenantId ?? "default",
+    enabled,
+    ...(token ? { token } : {}),
+  });
 
   if (options.staticRoot && existsSync(options.staticRoot)) {
     await app.register(fastifyStatic, { root: resolve(options.staticRoot), prefix: "/" });

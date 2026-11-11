@@ -296,6 +296,17 @@ export class PiAdapter implements RuntimeAdapter {
     args.push(this.options.approveProjectResources ? "--approve" : "--no-approve");
     if (spec.model) args.push("--model", spec.model);
     if (spec.thinking) args.push("--thinking", spec.thinking);
+    // AC5.2: `--tools` REPLACES Pi's default tool selection, so every tool the run
+    // is allowed must be named here. Pi's default is `read,bash,edit,write`; an
+    // event-ingress Task names only read-only tools, which is what stops the run
+    // from writing anything. A run without `spec.tools` appends nothing, keeping
+    // every existing argv byte-identical (pinned by the D1/D3 regression tests).
+    //
+    // `handoff_to` is ours (D1): it arrives via `--extension`, and `--tools` with
+    // plain names replaces the selection WITHOUT touching extension tools unless
+    // named. It is listed so the structured-handoff path keeps working on a
+    // read-only Task — its `execute()` only records intent for the worker.
+    if (spec.tools && spec.tools.length > 0) args.push("--tools", spec.tools.join(","));
     if (this.options.extraArgs) args.push(...this.options.extraArgs);
     // D1: the handoff extension is a resource injection, so it joins the resource
     // block after extraArgs and before the skills. `--extension` is REPEATABLE and

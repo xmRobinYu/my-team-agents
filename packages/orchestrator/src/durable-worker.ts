@@ -661,6 +661,9 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
         // consumes it; the rest ignore it and keep using workspacePath.
         ...(task.agentDir ? { agentDir: task.agentDir } : {}),
         ...(task.model ? { model: task.model } : {}),
+        // AC5.2: an event-ingress Task carries its read-only allowlist; a Task
+        // without one keeps the runtime default and byte-identical argv.
+        ...(task.tools && task.tools.length > 0 ? { tools: task.tools } : {}),
         ...personaThinking(task, task.memberId),
         ...(resumeSession
           ? { session: {

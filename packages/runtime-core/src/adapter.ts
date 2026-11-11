@@ -78,6 +78,15 @@ export interface RunSpec {
   session?: RunSession;
   /** Pi: --thinking. */
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  /**
+   * P9a/AC5.2: the tool allowlist for this run. Pi maps it to `--tools` (a
+   * comma-separated replacement list). Absent means "runtime default" — Pi's is
+   * `read,bash,edit,write` — so a run that omits this field keeps today's argv
+   * byte-for-byte. Only an event-ingress rule sets it, and only to read-only tools,
+   * which is what makes "this target cannot write" an enforced property rather than
+   * a declaration.
+   */
+  tools?: string[];
 }
 
 export interface RunHandle {

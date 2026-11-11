@@ -11,8 +11,20 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { RoomStore } from "../packages/orchestrator/src/room-store.ts";
-import { importTemplatePackage } from "../packages/orchestrator/src/template-import.ts";
+// Imported from the BUILT tree, by relative path (`just verify-import` has a `build`
+// prerequisite). Two independent reasons this cannot stay on `../src/*.ts`:
+//  - `--experimental-strip-types` strips types but does NOT rewrite a `.js` specifier
+//    to `.ts`, so a source file that VALUE-imports `./x.js` (all of them do, under
+//    NodeNext) cannot be loaded this way. That was fine while this file only imported
+//    a module whose local imports were type-only; the AC4.3 conversion module is a
+//    value import, so it is not.
+//  - The bare workspace specifier `@my-team-agents/orchestrator` does not resolve
+//    from the root `scripts/` directory, which belongs to no workspace package.
+import {
+  importTemplatePackage,
+  planCronRules,
+  RoomStore,
+} from "../packages/orchestrator/dist/index.js";
 
 // fflate is declared in packages/orchestrator; reach it there rather than
 // adding a root dependency just for an evidence script.
@@ -99,6 +111,39 @@ line(
     .split("\n").slice(0, 6).map((l) => `    ${l}`).join("\n"),
 );
 line("");
+
+line("");
+line("=== AC4.3：模板 cronTasks 转规则（P9.5）===");
+{
+  // A package that actually DECLARES schedules, so this proves the conversion on
+  // real upstream data rather than an empty array.
+  const cronZip = resolve(import.meta.dirname, "../ref/teamagentx-templates/Git周月报-2026-06-03.zip");
+  if (!existsSync(cronZip)) {
+    line(`  跳过：找不到 ${cronZip}`);
+  } else {
+    const registered: Array<Record<string, unknown>> = [];
+    const cronImport = importTemplatePackage({
+      zip: cronZip,
+      store,
+      projectId: "my-team-agents",
+      roomsRoot: join(work, ".cron-rooms"),
+      registerCronRule: (input) => { registered.push(input); return null; },
+    });
+    line(`  包内 cronTasks      : ${cronImport.parsed.cronTasks.length} 个`);
+    line(`  转出的规则输入      : ${cronImport.cronRuleInputs.length} 个`);
+    line(`  调用了注册 seam     : ${registered.length} 次`);
+    line(`  无法转换（具名拒绝）: ${cronImport.cronRefused.length} 个`);
+    for (const input of cronImport.cronRuleInputs) {
+      const cron = input["cron"] as { expression?: string } | undefined;
+      line(`    - ${String(input["name"])}  cron=${cron?.expression ?? "-"  }  lane=${String(input["lane"])}`);
+    }
+    const record = cronImport.ignoredFields.find((f) => f.field === "cronTasks");
+    line(`  ignoredFields 记录  : ${record ? record.reason : "!! 缺失"}`);
+    line(`  结论: ${cronImport.cronRuleInputs.length === cronImport.parsed.cronTasks.length
+      && !record?.reason.includes("丢弃") ? "PASS — 定时任务不再丢弃" : "FAIL"}`);
+  }
+  line("");
+}
 
 line("=== 回滚验证 ===");
 const cases: Array<[string, () => void]> = [
