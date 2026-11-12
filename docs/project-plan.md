@@ -45,8 +45,8 @@ react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激�
 `just pi-smoke` 对真实 Pi 验证 agent_settled 与会话续跑；
 `node scripts/prd-acceptance.mjs` 在真实模型下跑通 PRD §6 六项（手动门禁，不入 CI）；
 **`just p9-smoke`：已有 27 项全绿**（真 HTTP server + 真 worker OS 进程 + 真 webhook 接收端 +
-上游 `ref/AIHOT` 自己的 `wakeAgent`），**新增 `iso` 项 13 条机械断言全绿**，其最后一段
-（容器内真实模型写文件）因 provider 429/TPM 报 `BLOCKED` 并 exit 2；手动门禁，不入 CI。
+上游 `ref/AIHOT` 自己的 `wakeAgent`），**新增 `iso` 项 15 项全绿、exit 0**（2026-11-12 实测，
+含容器内一次真实模型写文件并落盘到宿主）；手动门禁，不入 CI。
 
 **P9 分项进度**（定义见 `docs/prd/event-ingress.md` §10）：
 
@@ -64,10 +64,10 @@ react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激�
 - ✅ 完成 治理补齐：`size_limits.max_file_lines` 从此**真的被检查**（棘轮 baseline），
   并把 `template-import.ts`(1166→425) 与 `durable-worker.ts`(959→879) 拆到限额内
   （P9d 的门禁本想加进后者，棘轮拒绝它变长，于是 `personaThinking` 被抽成独立模块）
-- ✅ 完成 **P9d 执行隔离**（`just p9-smoke` 的 `iso` 项：13 项机械断言全绿）：
-  `docker run` 包同一份 `pi` argv；登记与执行两道门。真实模型那一段需要 provider，
-  当前唯一 provider 返回 429/TPM，脚本按 Q45 报 `BLOCKED` 并以 **exit 2** 退出——
-  是「前置条件缺失」，不是「通过」，也不是隔离失败
+- ✅ 完成 **P9d 执行隔离**（`just p9-smoke` 的 `iso` 项：15 项全绿、exit 0）：
+  `docker run` 包同一份 `pi` argv；登记与执行两道门；容器内真实模型写文件并落盘宿主。
+  provider 的配额是共享的 token/分钟，窗口约 20 分钟一次，脚本因此先等窗口再请求
+  （`MTA_P9_WINDOW_MS`，等不到仍 `BLOCKED` / exit 2）
 - ⬜ 多级升级链与决策账本 UI 未做（P9b 只到 `blocked`/`failed` 两级）
 
 > 飞书网络同步依赖本机 lark-cli Keychain。沙箱/自动化环境读不到系统 Keychain 时，

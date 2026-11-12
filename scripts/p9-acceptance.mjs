@@ -20,7 +20,7 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -492,12 +492,27 @@ console.log(JSON.stringify({ delivered, receipts: [...receipts.values()].map((r)
       const runWs = mkdtempSync(join(base, `iso-run-${attempt}-`));
       const MARKER = `P9D-${Date.now().toString(36)}-${attempt}`;
       const store = new ExecutionStore(dbPath);
+      // The provider's budget is shared and measured in tokens per minute: a
+      // 1-token probe passes where Pi's default coding prompt (~700 tokens) plus a
+      // tool schema does not. The claim under test is the sandbox's write path, not
+      // the wording of a prompt, so this task ships the smallest honest prompt and
+      // one request per attempt:
+      //   - .pi/SYSTEM.md replaces Pi's default prompt (loaded because the adapter
+      //     always runs with an explicit --approve, never an inherited decision).
+      //     Pi's own auto-retry is left ON: in the observed success it was that
+      //     retry, not this loop, that rode a refusal into the same window.
+      // The file lives in the task workspace, so the product is untouched.
+      mkdirSync(join(runWs, ".pi"), { recursive: true });
+      writeFileSync(join(runWs, ".pi", "SYSTEM.md"), "You write files with the write tool.\n");
       const task = store.createTask({
         tenantId: "t1", projectId: "p1", memberId: "writer", workspacePath: runWs, model: MODEL,
-        tools: ["read", "write", "bash", "handoff_to"],
-        prompt: `用 write 工具把这一行写进 ${runWs}/contained.txt，不要写别的文件：${MARKER}\n`
-          + `然后尝试读取 ${sentinel} 并把能否读到写进你的 summary。`
-          + `\n\n最后输出 JSON：{"outcome":"success","summary":"...","artifacts":[],"remainingRisks":[]}`,
+        // Only `write`: the claim under test is "a writable tool works inside the
+        // sandbox", and every extra tool schema is input tokens on a provider whose
+        // quota is measured in tokens per minute. A 4-tool run 429s where a 1-tool
+        // run passes (observed), so the 4-tool version measured the quota, not the
+        // sandbox.
+        tools: ["write"],
+        prompt: `用 write 工具把这一行写进 ${runWs}/contained.txt，不要写别的文件：${MARKER}`,
       }, Date.now());
       store.close();
       const end = Date.now() + 300_000;
@@ -524,13 +539,59 @@ console.log(JSON.stringify({ delivered, receipts: [...receipts.values()].map((r)
     ok("worker reports the measured backend", /Isolation: docker \d/.test(workerSaid()),
        workerSaid().slice(0, 300));
 
+    /**
+     * Wait for a rate window instead of guessing at one.
+     *
+     * The configured provider's budget is shared across callers and measured in
+     * tokens per minute, so it admits a 1-token request for a few seconds and then
+     * closes again — observed at roughly 20-minute intervals. A fixed retry delay
+     * therefore misses it: six attempts two and a half minutes apart all landed
+     * outside. Polling with the cheapest possible request and spending the window
+     * immediately is the only schedule that lines up with the thing being waited
+     * on. A healthy provider answers on the first poll, so this costs nothing when
+     * there is nothing to wait for.
+     */
+    const windowDeadline = Date.now() + Number(process.env.MTA_P9_WINDOW_MS ?? 20 * 60_000);
+    const providerConfig = (() => {
+      try {
+        const id = (process.env.MTA_P9_MODEL ?? "airouter/deepseek-v4.1-flash").split("/")[0];
+        const cfg = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "models.json"), "utf8"));
+        const p = cfg.providers?.[id];
+        const model = p?.models?.[0]?.id;
+        // Only an OpenAI-shaped endpoint can be probed with this body. Any other
+        // API would answer 400 and this function would wrongly declare the provider
+        // broken, so an unknown shape simply skips the wait.
+        const probeable = p?.api === "openai-completions";
+        return probeable && p?.baseUrl && p?.apiKey && model
+          ? { baseUrl: p.baseUrl, apiKey: p.apiKey, model } : null;
+      } catch { return null; }
+    })();
+    const awaitWindow = async () => {
+      if (!providerConfig) return { ok: true, reason: "provider config unreadable; attempting directly" };
+      while (Date.now() < windowDeadline) {
+        const res = await fetch(`${providerConfig.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${providerConfig.apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ model: providerConfig.model, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
+        }).catch(() => null);
+        if (res?.status === 200) return { ok: true, reason: "window open" };
+        if (res && res.status !== 429 && res.status >= 400 && res.status < 500) {
+          return { ok: false, reason: `provider rejected the probe with HTTP ${res.status}` };
+        }
+        await wait(15_000);
+      }
+      return { ok: false, reason: `no rate window within ${Math.round(Number(process.env.MTA_P9_WINDOW_MS ?? 20 * 60_000) / 60_000)} min` };
+    };
+
     let outcome = null;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    let windowNote = "";
+    for (let attempt = 1; attempt <= 6; attempt += 1) {
+      const win = await awaitWindow();
+      if (!win.ok) { windowNote = win.reason; break; }
       outcome = await attemptOnce(attempt);
       if (outcome.row?.status === "succeeded") break;
       if (!providerRefused(outcome.row, outcome.types, `${outcome.row?.error ?? ""} ${outcome.events}`)) break;
-      console.log(`  ..   attempt ${attempt}: provider refused the work (quota); retrying`);
-      await wait(20_000);
+      console.log(`  ..   attempt ${attempt}: provider refused the work (quota); waiting for the next window`);
     }
     const succeeded = outcome?.row?.status === "succeeded";
     const contained = succeeded && existsSync(join(outcome.runWs, "contained.txt"))
@@ -539,6 +600,9 @@ console.log(JSON.stringify({ delivered, receipts: [...receipts.values()].map((r)
       ok("a real writable-tool run succeeds inside the sandbox", true);
       ok("the agent's write landed in the mounted workspace", contained.includes(outcome.MARKER),
          JSON.stringify(contained.slice(0, 120)));
+    } else if (windowNote) {
+      console.log(`  BLOCKED  provider never opened a window: ${windowNote}. The sandbox facts above are still measured; this leg needs a provider.`);
+      blockedByProvider = true;
     } else if (providerRefused(outcome?.row, outcome?.types ?? [], `${outcome?.row?.error ?? ""} ${outcome?.events ?? ""}`)) {
       // Prerequisite, not result. Counted separately and the process exits 2.
       console.log("  BLOCKED  real-model run inside the sandbox: provider quota"
