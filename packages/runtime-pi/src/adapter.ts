@@ -41,6 +41,7 @@ import type { RuntimeAdapter, RuntimeCapabilities, RunHandle, RunResult, RunSpec
 import type { CanonicalEvent, Usage } from "@my-team-agents/runtime-core";
 import { handoffExtensionPath } from "./handoff-extension.js";
 import { piSessionDirArgs } from "./session-isolation.js";
+import type { RunIsolation } from "./docker-isolation.js";
 import { piSkillDirs } from "./skills.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -245,25 +246,40 @@ export interface PiAdapterOptions {
    * Task keeps the upstream session behaviour byte-for-byte.
    */
   isolatePersonaSessions?: boolean;
+  /**
+   * P9d: run Pi inside a container instead of the worker's own process boundary.
+   * The SAME argv is used; only the launcher changes, and the mounts reuse the
+   * host's absolute paths so nothing in the argv has to be translated. Absent
+   * means the historical behaviour, byte-for-byte.
+   */
+  isolation?: RunIsolation;
 }
 
 export class PiAdapter implements RuntimeAdapter {
   readonly kind = "pi" as const;
-  readonly capabilities: RuntimeCapabilities = {
-    streaming: true,
-    steer: true,
-    cancel: true,
-    approval: "none",
-    sandbox: "none",
-    workspacePerRun: true,
-    // I3: the persona dir takes effect as the spawn cwd, so it is genuinely per-run.
-    agentDirPerRun: true,
-    usageAttribution: "message",
-    costCap: false,
-    sessionResume: true,
-  };
+  readonly capabilities: RuntimeCapabilities;
 
-  constructor(private readonly options: PiAdapterOptions) {}
+  constructor(private readonly options: PiAdapterOptions) {
+    this.capabilities = {
+      streaming: true,
+      steer: true,
+      cancel: true,
+      // Pi has no approval system of its own: `--approve` decides whether project
+      // resources load, never what a tool may touch.
+      approval: "none",
+      // P9d: `sandbox` is a claim about the PROCESS boundary, so it may only say
+      // "workspace-write" when a container actually wraps the run. Declaring it
+      // unconditionally would repeat the defect AC5.2 exists to prevent — a
+      // capability asserted in metadata and absent in reality.
+      sandbox: options.isolation ? "workspace-write" : "none",
+      workspacePerRun: true,
+      // I3: the persona dir takes effect as the spawn cwd, so it is genuinely per-run.
+      agentDirPerRun: true,
+      usageAttribution: "message",
+      costCap: false,
+      sessionResume: true,
+    };
+  }
 
   async start(spec: RunSpec): Promise<RunHandle> {
     const args = ["--mode", "rpc"];
@@ -332,7 +348,28 @@ export class PiAdapter implements RuntimeAdapter {
     // the persona dir can only take effect as cwd. The accepted cost: while an
     // agentDir run is active the agent cannot see the project workspace.
     const cwd = spec.agentDir ?? spec.workspacePath;
-    const child = spawnFn("pi", args, { cwd });
+    // P9d: the SAME argv, inside the container. Mounts reuse the host's absolute
+    // paths, so nothing here is translated and the isolated launch cannot drift
+    // into a second, less-tested code path.
+    const isolation = this.options.isolation;
+    const launch = isolation
+      ? isolation.wrap({
+          args, cwd, workspacePath: spec.workspacePath, runId: spec.runId,
+          ...(spec.agentDir ? { agentDir: spec.agentDir } : {}),
+        })
+      : { command: "pi", args };
+    const child = spawnFn(launch.command, launch.args, { cwd });
+    /**
+     * Abandoning a live run must reap the CONTAINER, not just the docker client:
+     * killing `docker run` detaches the client while the container keeps running.
+     * Only called while the client is alive, so a normal exit never shells out.
+     */
+    const abandon = () => {
+      if (child.exitCode === null && !child.killed) {
+        isolation?.kill(spec.runId);
+        child.kill();
+      }
+    };
 
     // A holder is used because the settled promise must be created before the
     // parser can call it, and the parser is what sees `agent_settled`.
@@ -349,8 +386,8 @@ export class PiAdapter implements RuntimeAdapter {
       settledHolder.onSettled?.(record), (file) => {
       settledHolder.sessionFile = file;
       settledHolder.onSessionFile?.(file);
-    });
-    const settled = this.settle(child, spec.runId, settledHolder, cwd);
+    }, abandon);
+    const settled = this.settle(child, spec.runId, settledHolder, cwd, abandon);
 
     // Kick off the run. `prompt` resolving means accepted, NOT completed
     // (node_modules/@earendil-works/pi-coding-agent/docs/rpc.md).
@@ -404,6 +441,7 @@ export class PiAdapter implements RuntimeAdapter {
     runId: string,
     onSettled?: (record: JsonRecord) => void,
     onSessionFile?: (file: string) => void,
+    onAbandon?: () => void,
   ): { iterable: AsyncIterable<CanonicalEvent>; done: Promise<void> } {
     let buffer = "";
     let push: (e: CanonicalEvent) => void = () => {};
@@ -573,7 +611,9 @@ export class PiAdapter implements RuntimeAdapter {
           }),
         return: async () => {
           finished = true;
-          child.kill();
+          // Same reason as `settle`: a stopped consumer must not leave a container
+          // running. Falls back to the plain kill for non-isolated runs.
+          (onAbandon ?? (() => child.kill()))();
           return { value: undefined, done: true };
         },
       }),
@@ -587,6 +627,7 @@ export class PiAdapter implements RuntimeAdapter {
     runId: string,
     holder: { onSettled?: (record: JsonRecord) => void; sessionFile?: string },
     cwd: string,
+    onAbandon?: () => void,
   ): Promise<RunResult> {
     return new Promise((resolve) => {
       let settled = false;
@@ -594,7 +635,9 @@ export class PiAdapter implements RuntimeAdapter {
         if (settled) return;
         settled = true;
         const sessionFile = holder.sessionFile;
-        if (child.exitCode === null && !child.killed) child.kill();
+        (onAbandon ?? (() => {
+          if (child.exitCode === null && !child.killed) child.kill();
+        }))();
         resolve(sessionFile ? { ...result, sessionFile } : result);
       };
       // `agent_settled` is the only completion signal: `agent_end` closes one

@@ -113,8 +113,8 @@ export {
 } from "./skills.js";
 
 // P9a (appended at the tail to stay merge-friendly with in-flight edits above).
-export { buildEventPrompt, dedupKeyOf, deriveEventId, normalizeEvent, orderMatches, READ_ONLY_TOOLS, redactForLog, ruleMatches, validateRuleInput, DETAIL_MAX, SUMMARY_MAX } from "./ingest.js";
-export type { TargetPersona } from "./ingest.js";
+export { buildEventPrompt, dedupKeyOf, deriveEventId, hasWritableTools, normalizeEvent, orderMatches, READ_ONLY_TOOLS, redactForLog, ruleMatches, validateRuleInput, DETAIL_MAX, SUMMARY_MAX } from "./ingest.js";
+export type { TargetPersona, WritableToolsGate } from "./ingest.js";
 export type { EventScope, InboundEvent, IngestOutcome, RuleError, RuleTarget, RuleWhen, TriggerRule, TriggerRuleInput } from "./ingest.js";
 export { createIngestService } from "./ingest-service.js";
 export type { IngestService, IngestServiceDeps, RegisterRuleResult, SubmitResult } from "./ingest-service.js";

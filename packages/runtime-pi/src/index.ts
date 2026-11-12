@@ -11,3 +11,19 @@ export {
   piSessionDirForAgent,
 } from "./session-isolation.js";
 export { piSkillDirs, PI_SKILLS_DIR_NAME } from "./skills.js";
+export {
+  DEFAULT_ISOLATION_IMAGE,
+  DockerIsolation,
+  containerNameFor,
+  isolationFromEnv,
+  probeDockerIsolation,
+  resolveDockerBin,
+} from "./docker-isolation.js";
+export type {
+  DockerIsolationOptions,
+  IsolationLaunch,
+  IsolationProbe,
+  IsolationSetup,
+  IsolationWrapInput,
+  RunIsolation,
+} from "./docker-isolation.js";

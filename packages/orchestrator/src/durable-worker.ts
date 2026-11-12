@@ -5,6 +5,8 @@ import type { CanonicalEvent, RunSpec, RuntimeAdapter } from "@my-team-agents/ru
 import { DEFAULT_GUARDRAILS, TERMINATION_MARKER, evaluateHandoff } from "@my-team-agents/domain";
 import type { ChatRoom, RoomAgent } from "@my-team-agents/domain";
 import { ExecutionStore, type AttemptRecord, type TaskRecord, type TaskResult } from "./execution-store.js";
+import { hasWritableTools } from "./ingest.js";
+import { personaThinking } from "./persona-thinking.js";
 import { dedupeByOrigin, parseHandoffArgs, type DispatchOrigin } from "./handoff-intent.js";
 import { handoffResolutionNotes, type ResolutionNote } from "./worker-notes.js";
 import { latestText, parseResult, unknownHighRiskTools } from "./worker-result.js";
@@ -229,42 +231,6 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
     };
   }
 
-  /**
-   * `RoomAgent.thinkingMode` reached the database, the template importer and Pi's
-   * own `--thinking` flag, but never the run: `personaFields` only carried
-   * `agentDir`/`model`, so every run asked for the adapter default. A room that
-   * declares `thinkingMode: "high"` for its reviewer therefore bought nothing.
-   *
-   * Deliberately DERIVED from the roster on every run instead of stored on the
-   * Task, unlike `agentDir`/`model`:
-   *  - it costs no schema migration (`tasks` still wins over a new column only if
-   *    you accept a hand-written `ALTER TABLE` in an experimental `node:sqlite`),
-   *  - a child Task dispatched by an agent (`dispatchInput`) gets the SAME
-   *    treatment as the parent, because `execute` runs for both and reads the row
-   *    for `task.memberId` — the persona that is about to speak, never the parent's.
-   * The cost is honest: editing `thinking_mode` takes effect on the next trigger,
-   * including a retry. That matches how persona skills already work (read at spawn
-   * time), so it is one rule for persona-scoped settings, not two.
-   *
-   * Values are CLAMPED to Pi's documented set. `thinking_mode` is free text
-   * (`TEXT`) and comes from model-authored templates, so passing it through
-   * verbatim would put an attacker/template-controlled string onto a command line.
-   * An unrecognised value is dropped — the run keeps the adapter default rather
-   * than failing, because a bad thinking level must not cost a whole execution.
-   */
-  const THINKING_LEVELS = new Set<NonNullable<RunSpec["thinking"]>>(
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-  );
-  function personaThinking(
-    task: TaskRecord,
-    memberId: string,
-  ): { thinking?: NonNullable<RunSpec["thinking"]> } {
-    if (!rooms || !task.groupId) return {};
-    const raw = rooms.getAgent(memberId)?.thinkingMode?.trim().toLowerCase();
-    if (!raw) return {};
-    if (!THINKING_LEVELS.has(raw as NonNullable<RunSpec["thinking"]>)) return {};
-    return { thinking: raw as NonNullable<RunSpec["thinking"]> };
-  }
 
   /**
    * Idempotency anchor for the `@name` path. There is no tool call, so the id is
@@ -381,7 +347,7 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
       // I5/bug-C: a group child must run AS its own persona, not in the parent's
       // workspace with the parent's model.
       ...personaFields(task, entry.memberId),
-      ...personaThinking(task, entry.memberId),
+      ...personaThinking(rooms, task, entry.memberId),
     };
   }
 
@@ -594,6 +560,18 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
     try {
       store.markAttemptRunning(attempt.id, attempt.fencingToken);
       const adapter = options.adapterFor(task.memberId);
+      // P9d: "writable ⇒ isolated" is enforced HERE, not only at registration.
+      // Registration is a moment; execution is the fact. A rule accepted while the
+      // daemon was up must not keep running unisolated after a restart without it,
+      // and a Task written straight into the store never passed registration at all.
+      if (task.tools && task.tools.length > 0 && hasWritableTools(task.tools)
+          && adapter.capabilities.sandbox === "none") {
+        store.finishFailure(attempt.id, attempt.fencingToken,
+          `可写工具（${task.tools.join(",")}）需要隔离运行时，但本次 adapter 声明 sandbox=none。`
+          + "拒绝执行：未隔离的可写 agent 能读到其它项目工作区与执行库。",
+          { kind: "isolation_unavailable", blocked: true, now: now() });
+        return;
+      }
       const snapshot = task.recoverySnapshot ? `\n\nRecovery snapshot:\n${task.recoverySnapshot}` : "";
       const originalPrompt = (() => {
         if (!task.recoverySnapshot) return task.prompt;
@@ -626,7 +604,7 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
         // AC5.2: an event-ingress Task carries its read-only allowlist; a Task
         // without one keeps the runtime default and byte-identical argv.
         ...(task.tools && task.tools.length > 0 ? { tools: task.tools } : {}),
-        ...personaThinking(task, task.memberId),
+        ...personaThinking(rooms, task, task.memberId),
         ...(resumeSession
           ? { session: {
               sessionId: basename(task.sessionFile!, ".jsonl"),

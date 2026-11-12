@@ -14,7 +14,7 @@ import {
   type TellChannel,
 } from "@my-team-agents/orchestrator";
 import { ingestConfig, openExecutionStore } from "./config.js";
-import { runtimeFor } from "./runtime.js";
+import { runtimeFor, isolationStatus, isolationProbe } from "./runtime.js";
 
 const { store, filename } = openExecutionStore();
 // I4: same handle as the API's RoomStore, so a group Task's success and its reply
@@ -70,6 +70,10 @@ const ingestService = createIngestService({
         : {}),
     };
   },
+  // P9d: AC5.2's gate reads a MEASUREMENT. When isolation is not running, a rule
+  // naming `bash` is still refused at registration — the relaxation is conditional
+  // on the isolation actually being there, not on a version number.
+  writableTools: isolationStatus,
   // P9e: a cron-generated event has no producer at all, so the deployment's source
   // is the only name it can get. Same value the HTTP surface uses, so a webhook
   // event and a scheduled event of one deployment are attributed identically.
@@ -95,6 +99,13 @@ const tell = createTellService({
   ...(process.env.MTA_TELL_COOLDOWN_MS ? { cooldownMs: Number(process.env.MTA_TELL_COOLDOWN_MS) } : {}),
 });
 console.log(`Tell channel: ${tellChannel.name}`);
+
+// P9d: printed at startup because "isolated" is the kind of claim that is
+// worthless if you have to infer it. A failed probe says why, in one line.
+console.log(isolationProbe.ok
+  ? `Isolation: docker ${isolationProbe.daemonVersion} image=${isolationProbe.image}`
+    + ` models=${isolationProbe.modelsFileMounted ? "mounted" : "ABSENT"} -> writable-tool rules ALLOWED`
+  : `Isolation: OFF (${isolationProbe.reason}) -> writable-tool rules refused`);
 
 const worker = createDurableWorker(store, {
   adapterFor: runtimeFor,

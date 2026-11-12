@@ -284,6 +284,55 @@ prompt 在**指令语态**点名该技能、绝不放进围栏数据块。
 对端用 `authorization: Bearer $WEBHOOK_HUB_KEY`，所以**它的 hub key 就是本平台的
 `MTA_INGEST_TOKEN`** —— 两者配成不同值时每条告警都是 401，这不是假设，是第一次联调实测到的。
 
+## 6.8 执行隔离（P9d）
+
+AC5.2 原本把可写工具目标**在登记处拒绝**，这是诚实的，但把一种能力变成了不可能。P9d 把它
+变成有条件的：**测量到隔离才放行**。实现只有一条原则 —— 不要把已验证的命令行重写一遍。
+
+**同一份 argv**。`PiAdapter` 构造 `pi --mode rpc …`，隔离层用 `docker run … <image> pi <同一份
+argv>` 包起来。容器里的路径与宿主**完全一致**（`--session`、`--session-dir`、`--skill`、
+`--extension` 都指向同一绝对路径，因此一个字符都不用翻译）。代价是必须把那些路径挂进容器；
+收益是隔离版不会成为"第二套、少测的启动路径"。
+
+**边界是这些 flag**（`runtime-pi/src/docker-isolation.ts`，`wrap()` 是纯函数，单测直接断言 argv）：
+
+| 约束 | flag | 实测（`just p9-smoke` 的 `iso` 项） |
+|---|---|---|
+| 非 root | `--user 1000:1000` | `id -u` = 1000 |
+| 根文件系统只读 | `--read-only` | `touch /etc/…` 失败 |
+| 只有一个项目可见 | 只挂 workspace + persona + `models.json`(ro) + 扩展(ro) | 宿主哨兵文件不可见 |
+| 无能力、不可提权 | `--cap-drop ALL`、`no-new-privileges` | `CapEff=0` |
+| 资源上限 | `--memory`/`--memory-swap`/`--cpus`/`--pids-limit` | `pids.max=512` |
+| 可写面仅显式项 | `--tmpfs …mode=1777` | workspace 写入在宿主可见 |
+
+两个只有踩过才知道的细节，写在代码注释里也写在这里：
+
+1. **tmpfs 必须挂在 `$HOME/.pi/agent` 本身，而不是它的父目录**。父目录由 docker 为
+   `models.json` 的文件挂载创建成 root:root 0755，于是 uid 1000 无法 `mkdir sessions`，
+   每次运行都以 `EACCES` 死掉；`mode=1777` 才让非 root 用户可写。第一次就是错的。
+2. **`killing docker run` 不等于杀掉容器**。`--rm` 处理正常退出；异常中止时必须
+   `docker kill <name>`，名字由 attempt id 确定性推导（`mta-<sanitized>`）。
+
+**两道门，不是一道**：
+
+- 登记：`validateRuleInput(..., writableTools)`，`MTA_ISOLATION=docker` 且探针
+  （daemon 可达 + 镜像存在）通过才 `allowed`。**不传门等于拒绝** —— 漏参数不能放宽权限。
+- 执行：`durable-worker` 在 spawn **之前**看 `adapter.capabilities.sandbox`，
+  `none` 时把 Task 落 `blocked`/`isolation_unavailable`。理由是登记只是一个**时刻**：
+  一条在守护进程正常时登记的规则，不能在它停掉之后继续无隔离地跑；而且直接写进 store 的
+  Task 从未经过登记。
+
+**出口网络是策略，不是保证**。默认 `--network bridge`，因为模型端点在远端；设成 `none`
+会让每次隔离运行在第一个 token 处失败，那样的"隔离"只测到了它坏掉的样子。真正的出网
+白名单需要代理/策略层，属 P7b 之后。
+
+**这项验收到哪一步（不粉饰）**：`just p9-smoke` 的 `iso` 项有 13 条机械断言 —— 六项容器
+事实、两条登记门、两条执行门（`blocked`、不 spawn、不落文件）、worker 自报后端。**容器内
+真实模型写文件**那一段需要 provider：本机唯一的 provider 当前对每次调用返回 429/TPM，
+脚本重试 3 次后按 Q45 报 `BLOCKED` 并以 exit 2 退出。所以已证明的是「隔离真实存在」与
+「关闭隔离时同一条规则被拒、Task 被 blocked 且没有写出文件」；**没有**观察到一次成功的
+模型写入，这一条在 provider 恢复前不能勾。
+
 ## 7. 扩展接口（刻意留白，不生效）
 
 | 接口 | 位置 | 未来填充 |
@@ -447,16 +496,18 @@ prompt 在**指令语态**点名该技能、绝不放进围栏数据块。
     令牌"说辞的门）；`MTA_INGEST_ALLOW_ANON=1` 是唯一匿名通道且启动即告警。
     仍然成立的部分：监听只绑 `127.0.0.1`，静态令牌是可共享口令而不是身份。任何公网暴露必须先过
     P7b —— 这是 PRD §7 明写的依赖关系，不是遗漏。已实测（`just p9-smoke` 的 auth 项，9/9）。
-18. **P9b/P9c/P9e 已落地；P9d 执行隔离一行未写**（2026-11-12）。
+18. **P9b/P9c/P9d/P9e 均已落地**（2026-11-12）。早先这条写的是"P9d 执行隔离一行未写，
+    本机 daemon 未运行因此无法验证"——那个判断在当时是对的，现在被实测取代。
     - 已做：`tell` 出站 + 决策账本（P9b）、`skill` 贯通到 `--skill`（P9b）、`error_kind` +
-      预算熔断（P9c）、`parallel>1`（P9c，改了 `claimNext` 谓词）、对端真实联调（P9e）。
-      `just p9-smoke` 27/27，全部走真进程。
-    - **P9d 未做，且此刻无法在本机验证**：本机有 `docker` 二进制但 **daemon 未运行**
-      （`docker info` 连不上 `~/.docker/run/docker.sock`）。因此 AC5.2 目前的放行条件
-      （"隔离落地"）**仍未满足**，可写工具目标继续**在登记时拒绝** —— 这是真拒绝，
-      不是收下不生效。没有测过隔离，就不写"已隔离"。
-    - 仍未做：`tell` 的**升级对象/分级**只到"blocked 与 failed 两种"，没有 PRD P9b 设想的
-      多级升级链；决策账本没有 UI。
+      预算熔断（P9c）、`parallel>1`（P9c，改了 `claimNext` 谓词）、对端真实联调（P9e）、
+      容器执行隔离（P9d，见 §6.8）。
+    - **一个曾经正确的结论如何失效**：P9d 的阻塞理由是"没有可用的 daemon，无法测量"。
+      启动 Docker Desktop 后 daemon 可用，但镜像源 `docker.io` 在本机网络**不可达**
+      （`auth.docker.io` 超时）；本地已有 `node:22`，容器内可达 `registry.npmmirror.com`，
+      于是镜像完全离线可构建。**"没有 daemon"与"无法准备镜像"是两个不同的阻塞**，
+      当时代理把它们当成同一个，结果是一条本可解除的阻塞被记成了环境限制。
+    - 剩下**真实的**限制写在 §6.8 末尾：出网是策略旋钮（`bridge` 默认），不是白名单；
+      隔离只覆盖文件系统/进程/资源，**不**覆盖模型端点的信任边界。
 19. **redrive 的双 worker 竞态已修（2026-11-12）**。先前这条记的是"速率/去重计数是进程内的"，
     **归因错了**：`rule_dispatches` 计数与 `lane_claims` 一直在共享 SQLite 里。真正的竞态在别处 ——
     `redriveDeferred` 先 `dueRetries()` 再**无条件** `clearRetry()`，两个 worker 会各自 redrive

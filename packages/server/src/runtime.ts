@@ -1,13 +1,31 @@
 import { CliAdapter, type CliKind } from "@my-team-agents/runtime-cli";
 import type { CanonicalEvent, RuntimeAdapter } from "@my-team-agents/runtime-core";
-import { PiAdapter } from "@my-team-agents/runtime-pi";
+import { PiAdapter, isolationFromEnv } from "@my-team-agents/runtime-pi";
+
+/**
+ * P9d: measured ONCE at process start. A later daemon failure does not silently
+ * degrade to unisolated execution — `docker run` then fails, the Attempt is
+ * classified `runtime_unavailable`, and the writable-tool kernel check still
+ * refuses a runtime that reports `sandbox: "none"`.
+ */
+const setup = isolationFromEnv();
+
+/** The registration gate AC5.2 now reads: measured, not configured. */
+export function isolationStatus(): { allowed: boolean; reason?: string } {
+  return setup.writableTools;
+}
+
+export const isolationProbe = setup.probe;
 
 export function runtimeFor(memberId: string): RuntimeAdapter {
   if (process.env.MTA_RUNTIME === "mock" || memberId === "mock-agent") return mockAdapter();
   if (memberId.includes("claude")) return new CliAdapter({ kind: "claude-cli" });
   if (memberId.includes("codex")) return new CliAdapter({ kind: "codex-cli" });
   if (memberId.includes("dsh")) return new CliAdapter({ kind: "dsh-cli" as CliKind });
-  return new PiAdapter({ approveProjectResources: true });
+  return new PiAdapter({
+    approveProjectResources: true,
+    ...(setup.isolation ? { isolation: setup.isolation } : {}),
+  });
 }
 
 /** Development-only deterministic runtime; never calls a model or edits files. */

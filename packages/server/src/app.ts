@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import type { ServerResponse } from "node:http";
 import { createIngestService, IngestStore, listAgentSkills, RoomStore, type CreateTaskInput, type DurableWorker, type ExecutionStore } from "@my-team-agents/orchestrator";
 import { ingestConfig, MIN_TOKEN_LENGTH } from "./config.js";
+import { isolationStatus } from "./runtime.js";
 import { registerIngestRoutes } from "./ingest-routes.js";
 import { registerPiRoutes } from "./pi-routes.js";
 import { registerRoomRoutes } from "./room-routes.js";
@@ -282,6 +283,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   },
   // P9e: AIHOT names no source on the wire, so the deployment names it once here.
   ...(ingestCfg.defaultSource ? { defaultSource: ingestCfg.defaultSource } : {}),
+  // P9d: same measured gate as the worker, so a rule accepted by the API is one the
+  // worker will actually be able to run.
+  writableTools: isolationStatus,
   });
   await registerIngestRoutes(app, {
     executions: store,

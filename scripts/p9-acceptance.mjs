@@ -34,6 +34,8 @@ const ITEMS = (process.env.MTA_P9_ITEMS ?? "auth,budget,tell,parallel,peer")
   .split(",").map((s) => s.trim()).filter(Boolean);
 
 let pass = 0, fail = 0;
+/** A requested leg whose prerequisite (the provider) is missing: exit 2, never 0. */
+let blockedByProvider = false;
 const ok = (name, cond, extra = "") => {
   if (cond) { pass += 1; console.log(`  ok   ${name}`); }
   else { fail += 1; console.log(`  FAIL ${name} ${extra}`); }
@@ -377,9 +379,213 @@ console.log(JSON.stringify({ delivered, receipts: [...receipts.values()].map((r)
     stop(s);
   }
 
+  // ---- iso (P9d) -----------------------------------------------------------
+  if (ITEMS.includes("iso")) {
+    console.log("\n[iso] P9d execution isolation");
+    const isoDist = join(DIST, "runtime-pi/dist/index.js");
+    if (!existsSync(isoDist)) {
+      console.error("p9-smoke: iso needs runtime-pi/dist. Run `just build` first.");
+      process.exit(2);
+    }
+    const { isolationFromEnv } = await import(isoDist);
+    const setup = isolationFromEnv({ ...process.env, MTA_ISOLATION: "docker" });
+    if (!setup.probe.ok || setup.probe.modelsFileMounted !== true) {
+      // A prerequisite, not a result: never report a green run for untested isolation.
+      console.error(`p9-smoke: iso needs a working docker backend and a provider config:`
+        + ` ${setup.probe.reason ?? "models.json not visible to the container"}`);
+      process.exit(2);
+    }
+    ok("docker probed: daemon + image + provider config", setup.writableTools.allowed === true,
+       JSON.stringify(setup.probe));
+
+    const ws = join(base, "iso-ws");
+    mkdirSync(ws, { recursive: true });
+    const sentinel = join(base, "host-only.txt");
+    writeFileSync(sentinel, "HOST-SECRET-NEVER-READ");
+
+    /**
+     * Containment is measured from INSIDE the argv the wrapper actually builds,
+     * with only the entrypoint swapped (`<image> pi` -> `<image> sh`). Writing a
+     * second, hand-rolled `docker run` here would test the probe instead of the
+     * production launcher.
+     */
+    const launch = setup.isolation.wrap({ args: [], cwd: ws, workspacePath: ws, runId: "iso-probe" });
+    const piAt = launch.args.indexOf("pi");
+    const script = [
+      "echo UID=$(id -u)",
+      "touch /etc/iso-should-fail 2>/dev/null && echo ROOTFS_WRITABLE=1 || echo ROOTFS_WRITABLE=0",
+      `[ -e ${JSON.stringify(sentinel)} ] && echo SENTINEL_VISIBLE=1 || echo SENTINEL_VISIBLE=0`,
+      `echo contained > ${JSON.stringify(join(ws, "written.txt"))} && echo WS_WRITE=1 || echo WS_WRITE=0`,
+      "awk '/^CapEff/{print \"CAPEFF=\"$2}' /proc/self/status",
+      "echo PIDS_MAX=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo n/a)",
+    ].join("; ");
+    const probeArgv = [...launch.args.slice(0, piAt - 1), setup.probe.image, "sh", "-lc", script];
+    const probed = await new Promise((res) => {
+      const p = spawn(launch.command, probeArgv, { stdio: ["ignore", "pipe", "pipe"] });
+      const out = [], err = [];
+      p.stdout.on("data", (c) => out.push(String(c)));
+      p.stderr.on("data", (c) => err.push(String(c)));
+      p.on("close", (code) => res({ code, out: out.join(""), err: err.join("") }));
+    });
+    const facts = Object.fromEntries(probed.out.split("\n").filter((l) => l.includes("="))
+      .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]));
+    ok("runs as uid 1000, not root", facts.UID === "1000", JSON.stringify(facts));
+    ok("root filesystem is read-only", facts.ROOTFS_WRITABLE === "0", JSON.stringify(facts));
+    ok("a host file outside the mount is invisible", facts.SENTINEL_VISIBLE === "0", JSON.stringify(facts));
+    ok("the workspace is writable, and the write is visible on the host",
+       facts.WS_WRITE === "1" && readFileSync(join(ws, "written.txt"), "utf8").trim() === "contained",
+       JSON.stringify(facts));
+    ok("all capabilities dropped (CapEff=0)", facts.CAPEFF === "0000000000000000", String(facts.CAPEFF));
+    ok("pid cap applied from the same argv", facts.PIDS_MAX === "512", String(facts.PIDS_MAX));
+
+    // -- registration gate: measured, and the same rule flips with the measurement
+    const writableRule = (agentId, workspacePath) => ({
+      name: "隔离写", ask: "改代码并说明改动", lane: "iso",
+      when: { sources: ["s"], types: ["t"] },
+      to: { memberId: agentId, workspacePath, tools: ["read", "bash", "write"] },
+    });
+    let s = await server({ MTA_INGEST_ENABLED: "1", MTA_INGEST_TOKEN: TOKEN, MTA_ISOLATION: "docker" });
+    const accepted = await s.post("/api/ingest/rules", writableRule(s.agentId, ws), TOKEN);
+    ok("isolation measured up: a writable-tool rule is accepted", accepted.status === 201,
+       JSON.stringify(accepted.body).slice(0, 200));
+    stop(s);
+
+    s = await server({ MTA_INGEST_ENABLED: "1", MTA_INGEST_TOKEN: TOKEN });
+    const refused = await s.post("/api/ingest/rules", writableRule(s.agentId, ws), TOKEN);
+    ok("isolation off: the SAME rule is refused, with the reason",
+       refused.status === 400 && JSON.stringify(refused.body).includes("WRITABLE_TOOLS_REFUSED")
+       && JSON.stringify(refused.body).includes("MTA_ISOLATION"),
+       JSON.stringify(refused.body).slice(0, 240));
+    stop(s);
+
+    // -- execution: a real Pi, real container, writable tools
+    const MODEL = process.env.MTA_P9_MODEL ?? "airouter/deepseek-v4.1-flash";
+    const dbPath = join(base, "iso-exec.sqlite");
+    // The DB is a parameter: the negative control runs against its OWN store, and a
+    // worker pointed at the wrong file would look like "nothing happened".
+    const runWorker = (database, env) => {
+      const p = spawnNode([join(DIST, "server/dist/worker.js")], { MTA_DB_PATH: database, ...env });
+      procs.push(p);
+      return p;
+    };
+    const wk = runWorker(dbPath, { MTA_ISOLATION: "docker", MTA_INGEST_ENABLED: "0" });
+
+    /**
+     * The provider can refuse the WORK, and that is not a verdict on isolation.
+     * A 429 is a missing prerequisite (exit 2, per Q45), never a pass and never a
+     * FAIL that would blame the sandbox. Anything else — a model that answered but
+     * wrote nothing — stays a failure.
+     */
+    // Two shapes of the same fact: the provider said no in words (429/TPM), or Pi
+    // retried an upstream failure and settled with no assistant text at all
+    // (`auto_retry_start` with no structured reply). Either way the sandbox was
+    // never exercised — a prerequisite, not a result.
+    // `auto_retry_start` is Pi's own record that an upstream call failed and it is
+    // retrying. It is the reliable signal: the 429 text itself is not always
+    // forwarded, and matching the prompt echo for `"outcome"` was a false negative
+    // (the prompt CONTAINS that word). Only consulted for a non-succeeded run.
+    const providerRefused = (row, types, text) =>
+      /429|rate.?limit|tpm|rpm/i.test(text)
+      || (types.includes("auto_retry_start") && row?.status !== "succeeded");
+
+    const attemptOnce = async (attempt) => {
+      const runWs = mkdtempSync(join(base, `iso-run-${attempt}-`));
+      const MARKER = `P9D-${Date.now().toString(36)}-${attempt}`;
+      const store = new ExecutionStore(dbPath);
+      const task = store.createTask({
+        tenantId: "t1", projectId: "p1", memberId: "writer", workspacePath: runWs, model: MODEL,
+        tools: ["read", "write", "bash", "handoff_to"],
+        prompt: `用 write 工具把这一行写进 ${runWs}/contained.txt，不要写别的文件：${MARKER}\n`
+          + `然后尝试读取 ${sentinel} 并把能否读到写进你的 summary。`
+          + `\n\n最后输出 JSON：{"outcome":"success","summary":"...","artifacts":[],"remainingRisks":[]}`,
+      }, Date.now());
+      store.close();
+      const end = Date.now() + 300_000;
+      while (Date.now() < end) {
+        const probe = new ExecutionStore(dbPath);
+        const row = probe.getTask(task.id);
+        const recorded = row && ["succeeded", "failed", "blocked", "cancelled"].includes(row.status)
+          ? probe.getEvents(task.id) : [];
+        const events = recorded.map((e) => String(e.event.text ?? e.event.error ?? "")).join(" ");
+        const types = recorded.map((e) => e.event.type);
+        probe.close();
+        if (row && ["succeeded", "failed", "blocked", "cancelled"].includes(row.status)) {
+          return { row, events, types, runWs, MARKER };
+        }
+        await wait(2000);
+      }
+      return { row: null, events: "", types: [], runWs, MARKER };
+    };
+
+    // Bounded wait: the startup line is written asynchronously, and asserting on a
+    // pipe that has not flushed yet would report a missing claim that exists.
+    const workerSaid = () => `${wk.__out()}\n${wk.__err()}`;
+    for (let i = 0; i < 50 && !workerSaid().includes("Isolation:"); i += 1) await wait(200);
+    ok("worker reports the measured backend", /Isolation: docker \d/.test(workerSaid()),
+       workerSaid().slice(0, 300));
+
+    let outcome = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      outcome = await attemptOnce(attempt);
+      if (outcome.row?.status === "succeeded") break;
+      if (!providerRefused(outcome.row, outcome.types, `${outcome.row?.error ?? ""} ${outcome.events}`)) break;
+      console.log(`  ..   attempt ${attempt}: provider refused the work (quota); retrying`);
+      await wait(20_000);
+    }
+    const succeeded = outcome?.row?.status === "succeeded";
+    const contained = succeeded && existsSync(join(outcome.runWs, "contained.txt"))
+      ? readFileSync(join(outcome.runWs, "contained.txt"), "utf8") : "";
+    if (succeeded) {
+      ok("a real writable-tool run succeeds inside the sandbox", true);
+      ok("the agent's write landed in the mounted workspace", contained.includes(outcome.MARKER),
+         JSON.stringify(contained.slice(0, 120)));
+    } else if (providerRefused(outcome?.row, outcome?.types ?? [], `${outcome?.row?.error ?? ""} ${outcome?.events ?? ""}`)) {
+      // Prerequisite, not result. Counted separately and the process exits 2.
+      console.log("  BLOCKED  real-model run inside the sandbox: provider quota"
+        + " (429/TPM). Containment itself is proven by the facts above; this leg needs a provider.");
+      blockedByProvider = true;
+    } else {
+      ok("a real writable-tool run succeeds inside the sandbox", false,
+         `${outcome?.row?.status}: ${String(outcome?.row?.error ?? "").slice(0, 220)}`);
+      ok("the agent's write landed in the mounted workspace", false, JSON.stringify(contained.slice(0, 120)));
+    }
+    ok("the host-only file did not appear inside the workspace",
+       !outcome || !existsSync(join(outcome.runWs, "host-only.txt")), "leaked");
+    try { wk.kill("SIGKILL"); } catch { /* gone */ }
+
+    // -- negative control: same Task, isolation off -> blocked BEFORE any spawn
+    const negWs = mkdtempSync(join(base, "iso-neg-"));
+    const negDb = join(base, "iso-neg.sqlite");
+    const negStore = new ExecutionStore(negDb);
+    const negTask = negStore.createTask({
+      tenantId: "t1", projectId: "p1", memberId: "writer", workspacePath: negWs, model: MODEL,
+      tools: ["read", "bash"], prompt: "写点什么",
+    }, Date.now());
+    negStore.close();
+    const nwk = runWorker(negDb, { MTA_INGEST_ENABLED: "0" });
+    const neg = await (async () => {
+      const end = Date.now() + 60_000;
+      while (Date.now() < end) {
+        const probe = new ExecutionStore(negDb);
+        const row = probe.getTask(negTask.id);
+        const attempt = probe.getAttempts(negTask.id)[0];
+        probe.close();
+        if (row && ["succeeded", "failed", "blocked"].includes(row.status)) return { row, attempt };
+        await wait(1000);
+      }
+      return null;
+    })();
+    ok("isolation off: the writable Task is BLOCKED, not retried",
+       neg?.row.status === "blocked" && neg?.attempt?.errorKind === "isolation_unavailable",
+       `${neg?.row.status}/${neg?.attempt?.errorKind}`);
+    ok("isolation off: nothing was written", !existsSync(join(negWs, "contained.txt")));
+    try { nwk.kill("SIGKILL"); } catch { /* gone */ }
+  }
+
   rmSync(base, { recursive: true, force: true });
   console.log(`\np9-smoke: ${pass} passed, ${fail} failed`);
   if (fail > 0) process.exitCode = 1;
+  else if (blockedByProvider) process.exitCode = 2;
 }
 
 await main();

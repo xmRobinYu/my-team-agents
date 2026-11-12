@@ -24,12 +24,29 @@ size_limits:
 # thresholds (the PRD asked for exactly this): truncation happens in `normalizeEvent`,
 # the tool allowlist is refused at rule registration AND reaches `pi --tools`, and the
 # entry is opt-in. Everything below is enforced by code, not aspiration.
+# The P9d `isolation_*` values are cross-checked against the launcher's real argv by
+# `packages/runtime-pi/src/docker-isolation.test.ts`, so editing one side alone fails.
 ingest_limits:
   summary_chars: 200          # normalizeEvent
   detail_chars: 4000          # normalizeEvent
   body_bytes: 65536           # route-level bodyLimit; truncation runs AFTER Fastify buffers
   min_token_chars: 24         # a shorter token closes the surface, it does NOT go anonymous
-  writable_tools: forbidden   # AC5.2 — refused at registration until P9d isolation exists
+  # P9d: writable tools are allowed ONLY while a container backend is measured working
+  # (MTA_ISOLATION=docker + probe ok). Registration asks a live gate, and the kernel
+  # refuses to spawn a writable Task on a runtime that reports sandbox=none — so the
+  # rule cannot outlive the isolation it was accepted under.
+  writable_tools: requires_isolation
+  isolation_backend: docker
+  isolation_image: mta-pi-sandbox:1
+  isolation_limits:
+    user: "1000:1000"          # non-root inside the container
+    capabilities: dropped_all   # --cap-drop ALL
+    rootfs: read_only           # --read-only; only explicit mounts + tmpfs are writable
+    memory: 2g                  # --memory == --memory-swap (no swap)
+    cpus: 2
+    pids: 512
+    network: bridge             # egress is a POLICY, not a guarantee (model endpoint is remote)
+    mounts: workspace_rw + agent_dir_rw + models.json_ro + handoff_extension_ro
   enabled_by_default: false   # D6/A — MTA_INGEST_ENABLED=1 is required
   requires_token: always_when_enabled   # P9c: enabled without a usable token is CLOSED
   anonymous_opt_in: MTA_INGEST_ALLOW_ANON=1  # the only way to open it unauthenticated

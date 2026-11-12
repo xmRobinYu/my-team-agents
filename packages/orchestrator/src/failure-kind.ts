@@ -34,6 +34,8 @@ export type FailureKind =
   | "result_invalid"
   /** The agent itself declared `outcome: "failed"`. */
   | "agent_failed"
+  /** P9d: a writable-tool Task reached a runtime that is not isolated. Blocks. */
+  | "isolation_unavailable"
   /** Nothing recognised. Never silently re-labelled as something else. */
   | "unknown";
 
@@ -41,6 +43,9 @@ export type FailureKind =
 const TERMINAL_FOR_AUTOMATION: ReadonlySet<FailureKind> = new Set([
   "budget_exceeded",
   "unresolved_tools",
+  // Retrying cannot create an isolated runtime: three retries would burn the Task
+  // and then report `failed`, blaming the agent for an operator's missing daemon.
+  "isolation_unavailable",
 ]);
 
 export const requiresHuman = (kind: FailureKind): boolean => TERMINAL_FOR_AUTOMATION.has(kind);

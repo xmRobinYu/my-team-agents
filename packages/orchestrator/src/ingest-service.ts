@@ -36,6 +36,7 @@ import type {
   TargetPersona,
   TriggerRule,
   TriggerRuleInput,
+  WritableToolsGate,
 } from "./ingest.js";
 import { buildEventPrompt, normalizeEvent, orderMatches, validateRuleInput } from "./ingest.js";
 
@@ -68,6 +69,16 @@ export interface IngestServiceDeps {
    * as before (no agentDir, no model).
    */
   persona?: (memberId: string) => TargetPersona | null;
+  /**
+   * P9d: is execution isolation actually in force? Called at REGISTRATION, so a
+   * rule naming `bash`/`edit`/`write` is accepted only while the isolation backend
+   * is measurably working. A function rather than a boolean because the answer can
+   * change while the process lives (daemon stopped, image removed), and a stale
+   * `true` would be worse than no gate.
+   *
+   * Optional, and absent means "refused" — omitting it can never widen access.
+   */
+  writableTools?: () => WritableToolsGate;
   /**
    * Source to assume when the producer body carries none. AIHOT's `wakeAgent`
    * (`ref/AIHOT/packages/backend/src/notify/agent.ts:70-78`) posts
@@ -259,6 +270,7 @@ export function createIngestService(deps: IngestServiceDeps): IngestService {
         { ...input, tenantId: input.tenantId ?? scope.tenantId, projectId: input.projectId ?? scope.projectId },
         memberExists,
         persona,
+        deps.writableTools?.(),
       );
       if (!validated.ok) return { ok: false, errors: validated.errors };
       return {

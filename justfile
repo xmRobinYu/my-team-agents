@@ -95,8 +95,11 @@ pi-smoke: build
 
 # P9 acceptance against real processes: a built server over a real socket, a real
 # worker OS process, a real webhook receiver, and AIHOT's own producer code.
+# The `iso` item additionally runs a real container (P9d) and, when a provider is
+# available, a real model inside it; a provider 429 blocks (exit 2), never passes.
 # Not part of `check`: it needs `just build` first, and `peer` needs the read-only
-# ref/AIHOT checkout. A requested item whose prerequisite is missing exits 2.
+# ref/AIHOT checkout, `iso` needs Docker + the mta-pi-sandbox:1 image.
+# A requested item whose prerequisite is missing exits 2.
 # Subset: MTA_P9_ITEMS=auth,budget just p9-smoke
 p9-smoke: build
     node scripts/p9-acceptance.mjs

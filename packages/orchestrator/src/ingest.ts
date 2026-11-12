@@ -47,6 +47,24 @@ export type ReadOnlyTool = (typeof READ_ONLY_TOOLS)[number];
 
 const READ_ONLY_SET: ReadonlySet<string> = new Set(READ_ONLY_TOOLS);
 
+/**
+ * True when an allowlist asks for a tool outside `READ_ONLY_TOOLS`.
+ *
+ * Exported because the same question is asked twice at different times: at
+ * registration (may this rule exist?) and in the kernel before a spawn (is the
+ * runtime that will execute it actually isolated?). One predicate, so the two can
+ * never disagree about what "writable" means.
+ */
+export function hasWritableTools(tools: readonly string[]): boolean {
+  return tools.some((tool) => !READ_ONLY_SET.has(tool));
+}
+
+/** Whether a writable-tool rule may be registered right now, and why not. */
+export interface WritableToolsGate {
+  allowed: boolean;
+  reason?: string;
+}
+
 export interface InboundEvent {
   /** Producer's stable id, or one derived from (source, subject, type, summary). */
   id: string;
@@ -316,6 +334,12 @@ export function validateRuleInput(
    * as unverified, never silently dropped.
    */
   persona?: (memberId: string) => TargetPersona | null,
+  /**
+   * P9d: whether a writable-tool target may be registered RIGHT NOW. Optional, and
+   * absent means "not allowed" — a caller that cannot measure isolation must not
+   * be able to grant it by forgetting to pass a flag.
+   */
+  writableTools?: WritableToolsGate,
 ): { ok: true; value: Omit<TriggerRule, "id" | "createdAt" | "updatedAt">; unverifiedSkill?: string }
   | { ok: false; errors: RuleError[] } {
   const errors: RuleError[] = [];
@@ -368,15 +392,16 @@ export function validateRuleInput(
   }
   const resolvedTools = tools === null ? [] : (tools.length > 0 ? tools : [...READ_ONLY_TOOLS]);
   const writable = resolvedTools.filter((tool) => !READ_ONLY_SET.has(tool));
-  if (writable.length > 0) {
+  if (writable.length > 0 && writableTools?.allowed !== true) {
     // The gate the PRD asked for, made real: Pi's sandbox is "none" and its
     // approval is "none", so a target holding `write`/`bash` can edit anything the
     // process can. Until P9d isolates execution, such a rule is refused outright.
+    const why = writableTools?.reason ?? "本次调用没有测量执行隔离";
     errors.push({
       field: "to.tools",
       code: "WRITABLE_TOOLS_REFUSED",
-      message: `P9a 只允许只读工具（${READ_ONLY_TOOLS.join(",")}）；拒绝：${writable.join(", ")}`
-        + "。可写工具要等 P9d 执行隔离落地（Pi sandbox=none、approval=none，信任不约束工具能力）",
+      message: `只允许只读工具（${READ_ONLY_TOOLS.join(",")}）；拒绝：${writable.join(", ")}`
+        + `。可写工具需要 P9d 执行隔离生效（Pi sandbox=none、approval=none，信任不约束工具能力）：${why}`,
     });
   }
 

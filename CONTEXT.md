@@ -1016,6 +1016,58 @@ path: "pi"`，所以那条错误在两种成因下无法区分。这正是 Q45 �
 **仍未做，且不粉饰**：**P9d 执行隔离**（本机有 docker 二进制但 daemon 未运行，任何
 "已隔离"的断言都无法测量，因此不写）；真正的鉴权/租户隔离/审计（P7b）。
 
+
+## Q51 — P9d 执行隔离：把"拒收"换成"测到才收" (2026-11-12)
+**A**: AC5.2 原先在登记处一律拒绝可写工具。那个拒绝是对的，但它把一种能力变成了**不可能**，
+而不是**安全**。现在隔离真的存在，于是规则从"永远拒绝"变成"测到隔离才允许"。
+
+1. **同一份 argv，换一个启动器**。`PiAdapter` 造 `pi --mode rpc …`，隔离层用
+   `docker run … <image> pi <同一份 argv>`。挂载沿用**宿主绝对路径**，所以
+   `--session`/`--session-dir`/`--skill`/`--extension` 一个字符都不改。
+   代价：这些路径必须被挂进容器。收益：隔离版不是"第二套、少测的启动路径"。
+   **反例就是本仓库的 D1**：`handoff_to` 曾以为 Pi 内建，结果是"跑了但主路径不存在"。
+
+2. **`sandbox` 必须说真话，且被用来拒绝**。`PiAdapter.capabilities.sandbox` 以前恒为
+   `"none"`（对 Pi 是诚实的）。现在它等于 `isolation ? "workspace-write" : "none"`，
+   而 `durable-worker` 在 spawn **之前**据此拒绝可写 Task（`blocked` / `isolation_unavailable`）。
+   为什么登记门不够：登记是**时刻**，执行是**事实**。一条在 daemon 正常时登记的规则，
+   不能在 daemon 停掉之后继续无隔离地跑；直接写进 store 的 Task 更是从未经过登记。
+
+3. **不传门 = 拒绝**。`validateRuleInput` 的 `writableTools` 参数可选，缺省即拒绝。
+   一个忘了传参数的调用点**不能**因此获得更宽的权限 —— 这是可选参数最常见的错误方向。
+
+4. **两个只有踩过才知道的坑**：
+   - tmpfs 必须挂在 `$HOME/.pi/agent` **本身**。挂父目录时，docker 会为 `models.json`
+     的文件挂载把 `agent/` 建成 root:root 0755，uid 1000 无法 `mkdir sessions`，
+     每次运行 `EACCES` 死掉。`mode=1777` 才让非 root 可写。
+   - `killing docker run` **不等于**杀容器。`--rm` 只处理正常退出；中止时必须
+     `docker kill <name>`，名字由 attempt id 确定性推导，否则只能靠列举去猜。
+
+5. **"daemon 未运行"与"镜像准备不了"是两个阻塞**，我此前把它们当成一个。启动 Docker
+   Desktop 后 daemon 可用，但 `docker.io` 在本机网络**不可达**（`auth.docker.io` 超时）；
+   本地已有 `node:22`，容器内可达 `registry.npmmirror.com`，于是镜像可**完全离线**构建。
+   教训：把环境限制写进"未做"之前，先分别验证每个子前提，否则一条本可解除的阻塞
+   会被永久记成事实。
+
+6. **出口网络是策略，不是保证**。默认 `--network bridge`，因为模型端点在远端；
+   `none` 会让每次隔离运行在第一个 token 处失败，那样的"隔离"只测到了它坏掉的样子。
+   真正的出网白名单需要代理/策略层，属 P7b 之后。这条**写进** PRD §7 与架构 §6.8 末尾，
+   而不是留给读者自己发现。
+
+7. **阴性对照是验收的一部分**。`just p9-smoke` 的 `iso` 项除了在容器内实测
+   uid/rootfs/宿主可见性/`CapEff`/`pids.max`，还跑一次真实模型的写文件任务，
+   再用**同一条规则**在关掉隔离的部署上跑一次：必须 `blocked`、必须不 spawn、必须没写出文件。
+   只证明"隔离时能跑"而不证明"不隔离时不能跑"，等于只测了一半。
+
+8. **第 7 条里"真实模型写文件"这一半，到 2026-11-12 仍未观察到**。唯一 provider
+   (`airouter/deepseek-v4.1-flash`) 对每次调用返回 429/TPM；Pi 自己 `auto_retry` 之后
+   没有 assistant 文本落定，worker 记 `result_invalid`。脚本因此把这一分支判为
+   **前置条件缺失**：重试 3 次仍被拒 → 打印 `BLOCKED` 并 **exit 2**（既不是 0，也不是 1）。
+   已证的 13 条机械断言不含它。
+   另外记一件事：**棘轮改变了实现**。这道执行门本想写进 `durable-worker.ts`，但
+   `max_file_lines` 的 baseline 是 901，加 13 行即违规，于是 `personaThinking` 被抽成
+   `persona-thinking.ts`（914→879）。规则拦下的是增长，所以修法是拆，不是抬高 baseline。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

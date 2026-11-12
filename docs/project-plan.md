@@ -19,7 +19,7 @@
 | P7a 服务端 + UI（本机） | API 骨架、SSE、assistant-ui（react-pi）接入 | ✅ 完成 |
 | P7b 团队服务化 | 鉴权、租户隔离、审计 | ⬜ 待启 |
 | P8 多 agent 群聊 | ChatRoom、团队模板导入、auto 接力与流程守卫 | 🚧 进行中（I1–I10 已做完，剩建群入口未接 UI） |
-| P9 事件入口与触发路由 | 外部信号→声明式规则→Task；出站通知、预算熔断、并发、对端联调 | 🚧 进行中（P9a/P9b/P9c/P9e 已做完，剩 **P9d 执行隔离**） |
+| P9 事件入口与触发路由 | 外部信号→声明式规则→Task；出站通知、预算熔断、并发、对端联调、执行隔离 | ✅ 完成（P9a/P9b/P9c/P9d/P9e 已做完；出网白名单与 AC7.11 另计，见 PRD §7） |
 
 **P8 分项进度**（I1–I10 定义见 `docs/prd/multi-agent-group-chat-issues.md`）：
 
@@ -44,8 +44,9 @@ react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激�
 `succeeded`），群 thread 用真实 `createPiHttpClient` + 真实 reducer 验证；
 `just pi-smoke` 对真实 Pi 验证 agent_settled 与会话续跑；
 `node scripts/prd-acceptance.mjs` 在真实模型下跑通 PRD §6 六项（手动门禁，不入 CI）；
-**`just p9-smoke` 27 项全绿**（真 HTTP server + 真 worker OS 进程 + 真 webhook 接收端 +
-上游 `ref/AIHOT` 自己的 `wakeAgent`，手动门禁，不入 CI）。
+**`just p9-smoke`：已有 27 项全绿**（真 HTTP server + 真 worker OS 进程 + 真 webhook 接收端 +
+上游 `ref/AIHOT` 自己的 `wakeAgent`），**新增 `iso` 项 13 条机械断言全绿**，其最后一段
+（容器内真实模型写文件）因 provider 429/TPM 报 `BLOCKED` 并 exit 2；手动门禁，不入 CI。
 
 **P9 分项进度**（定义见 `docs/prd/event-ingress.md` §10）：
 
@@ -61,9 +62,12 @@ react-pi 端到端经真实 HTTP client 走通（创建空 thread → 发送激�
 - ✅ 完成 P9e 真实对端联调（跑上游 `wakeAgent`；抓到「body 没有 `source`」与
   「hub key 就是本平台 token」两个单测抓不到的缺口）
 - ✅ 完成 治理补齐：`size_limits.max_file_lines` 从此**真的被检查**（棘轮 baseline），
-  并把 `template-import.ts`(1166→425) 与 `durable-worker.ts`(959→901) 拆到限额内
-- ⬜ **P9d 执行隔离未做**：本机 `docker` 二进制存在但 daemon 未运行，无法测量，
-  因此不写「已隔离」；AC5.2 的可写工具目标继续在登记时真拒绝
+  并把 `template-import.ts`(1166→425) 与 `durable-worker.ts`(959→879) 拆到限额内
+  （P9d 的门禁本想加进后者，棘轮拒绝它变长，于是 `personaThinking` 被抽成独立模块）
+- ✅ 完成 **P9d 执行隔离**（`just p9-smoke` 的 `iso` 项：13 项机械断言全绿）：
+  `docker run` 包同一份 `pi` argv；登记与执行两道门。真实模型那一段需要 provider，
+  当前唯一 provider 返回 429/TPM，脚本按 Q45 报 `BLOCKED` 并以 **exit 2** 退出——
+  是「前置条件缺失」，不是「通过」，也不是隔离失败
 - ⬜ 多级升级链与决策账本 UI 未做（P9b 只到 `blocked`/`failed` 两级）
 
 > 飞书网络同步依赖本机 lark-cli Keychain。沙箱/自动化环境读不到系统 Keychain 时，
