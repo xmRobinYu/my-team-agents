@@ -266,6 +266,14 @@ Room id 时二者会串行，这是选择而非缺陷。
 检查在**解读回复之前**，否则被预算截断的回复会被报成 `result_invalid`。累计用量取该 Task
 **所有 Attempt** 之和，所以重试不能把计量清零。
 
+**"没有回复"不是"回复不合规"（2026-11-13）**：一次真实会话里，provider 连续拒绝、Pi 的
+`auto_retry` 用尽后**一个字都没产出**，Attempt 却被记成 `result_invalid`，面板上把
+`missing valid structured result (outcome, summary, artifacts, remainingRisks)` 原样显示给用户 ——
+既怪错了人，也让"限流"在计数里看起来像"模型不守约"。现在两者分开：**零文本 + 出现
+`auto_retry_start`** → `provider_unavailable`（可重试，中文说明）；有文本但不是约定结构 →
+仍是 `result_invalid`。同时 `claimNext` 在领取新 Attempt 时 **`error=NULL`** ——
+重试中的 Task 不该挂着上一次的失败原因，那是 `attempts` 行上的历史。
+
 **`parallel` 是内核语义，不是新字段（P9c）**：`claimNext` 的谓词从"该键有活 Attempt 就排除"
 改为"**按 Task 的 `parallel` 计数**"。键空间没动（`COALESCE(lane, group_id)`），`parallel=1`
 与旧的 `NOT EXISTS` 完全等价，所以 `group-serial.test.ts` **未经修改即通过**。I3 AC3（一群一并发）

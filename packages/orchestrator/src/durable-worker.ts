@@ -687,11 +687,26 @@ export function createDurableWorker(store: ExecutionStore, options: WorkerOption
           { kind: "unresolved_tools", blocked: true, now: now() });
         return;
       }
-      const structured = parseResult(latestText(events));
+      const reply = latestText(events);
+      const structured = parseResult(reply);
       if (!structured) {
+        // Two different failures looked identical here. A reply with no text at all,
+        // after the runtime retried upstream, means the PROVIDER never answered —
+        // reporting "missing valid structured result" blamed the agent for a
+        // contract it never had a chance to meet (a real 2026-11-13 session showed
+        // this to the user as a bare English error while the Task was retrying).
+        // The LAST message_end, not `latestText`: a room run echoes the injected
+        // persona/prompt as a user message first, so "the last non-empty text" is
+        // that echo — which is how the first version of this branch never fired.
+        // An empty final message after Pi's own retries is the provider refusing.
+        const lastMessageEnd = [...events].reverse().find((event) => event.type === "message_end");
+        const producedNothing = (lastMessageEnd?.text ?? "").trim() === "";
+        const refused = producedNothing && events.some((event) => event.type === "auto_retry_start");
         store.finishFailure(attempt.id, attempt.fencingToken,
-          "missing valid structured result (outcome, summary, artifacts, remainingRisks)",
-          { kind: "result_invalid", now: now() });
+          refused
+            ? "provider 没有返回任何内容（上游限流或不可用），本次尝试已自动重试"
+            : "missing valid structured result (outcome, summary, artifacts, remainingRisks)",
+          { kind: refused ? "provider_unavailable" : "result_invalid", now: now() });
         return;
       }
       if (structured.outcome === "failed") {

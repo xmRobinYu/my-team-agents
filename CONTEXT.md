@@ -1098,6 +1098,24 @@ path: "pi"`，所以那条错误在两种成因下无法区分。这正是 Q45 �
 **复核**：`just check` 0（593 passed / 5 skipped）；UI 实测（受管 Chromium）——发送后
 textarea 为空、非用户消息出现后横幅消失。花名册修复另有 6 条单测。
 
+## Q53 — "模型没回话"与"模型回话不合规"是两件事，面板不该把前者显示成英文契约错误 (2026-11-13)
+
+**A**: 用户在任务详情里看到 `missing valid structured result (outcome, summary, artifacts,
+remainingRisks)`，问我"怎么有报错信息"。查下来是三层问题叠在一起：
+
+1. **归类错**：那次 Attempt 一个字都没产出 —— provider 连续 `429`，Pi 的 `auto_retry` 用尽后
+   `agent_settled`，`latestText` 是空串。把它记成 `result_invalid` 等于说"模型给的结构不对"，
+   而模型根本没机会说话。现在：**零文本 + 有 `auto_retry_start`** → `provider_unavailable`
+   （可重试、中文说明）；**有文本但不是约定 JSON** → 仍是 `result_invalid`。两者在运维计数里
+   的含义完全不同（限流 vs 契约破坏）。
+2. **状态错**：`finishFailure` 把原因写在 `tasks.error` 上，进入 `retry_wait`/`running` 后也不清。
+   于是面板对一个**正在重试、可能成功**的 Task 显示"错误"。现在 `claimNext` 领取新 Attempt 时
+   `error=NULL`：失败原因是 `attempts` 行上的历史，不是 Task 的当前状态。
+3. **呈现错**：`retry_wait` 与 `failed` 都显示成红色"错误"。现在 `retry_wait` 是黄色
+   「上次尝试失败，会自动重试」，`running` 不显示 —— 因为那本来就不该有值。
+
+**没动的**：`result_invalid` 的定义与重试策略。空回复本来就该重试，失败的只是**标签**。
+
 ## Reference Notes
 
 `ref/teamagentx` is read-only. Verified findings that shaped this design:

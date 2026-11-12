@@ -238,9 +238,13 @@ export function TaskDetailPanel({
             </div>
           ) : null}
 
-          {task.error ? (
-            <Alert tone="danger">
-              <strong>错误</strong>
+          {task.error && task.status !== "running" ? (
+            // A Task that is running has no error: the store clears it when the next
+            // Attempt is claimed. `retry_wait` still carries the previous reason, and
+            // saying "错误" there reads as "it failed" while the platform is about to
+            // try again — so it is labelled as history, in warning rather than danger.
+            <Alert tone={task.status === "retry_wait" ? "warning" : "danger"}>
+              <strong>{task.status === "retry_wait" ? "上次尝试失败，会自动重试" : "错误"}</strong>
               <pre className="error-body">{task.error}</pre>
             </Alert>
           ) : null}

@@ -32,6 +32,13 @@ export type FailureKind =
   | "unresolved_tools"
   /** The reply did not carry the required structured result. */
   | "result_invalid"
+  /**
+   * The upstream model provider refused or failed every attempt, so no reply was
+   * ever produced. Distinct from `result_invalid` on purpose: that one blames the
+   * agent for a malformed answer, while here there was no answer at all — and an
+   * operator counting failures needs to see rate limits as rate limits.
+   */
+  | "provider_unavailable"
   /** The agent itself declared `outcome: "failed"`. */
   | "agent_failed"
   /** P9d: a writable-tool Task reached a runtime that is not isolated. Blocks. */

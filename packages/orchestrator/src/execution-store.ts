@@ -550,8 +550,12 @@ export class ExecutionStore {
       this.run(`INSERT INTO attempts(id,task_id,sequence,batch,fencing_token,worker_id,status,lease_expires_at,created_at,updated_at)
         VALUES(?,?,?,?,?,?,'leased',?,?,?)`,
         attemptId, task.id, sequence, task.batch, fencing, workerId, now + leaseMs, now, now);
+      // A Task that is running has no error: the previous Attempt's reason is
+      // history (it lives on the `attempts` row), and leaving it here made the
+      // detail panel show "错误" for a Task that was already retrying and might
+      // still succeed.
       this.run(`UPDATE tasks SET status='running',active_attempt_id=?,fencing_token=?,
-        batch_attempts=batch_attempts+1,updated_at=? WHERE id=? AND fencing_token=?`,
+        batch_attempts=batch_attempts+1,error=NULL,updated_at=? WHERE id=? AND fencing_token=?`,
         attemptId, fencing, now, task.id, task.fencingToken);
       this.run("UPDATE outbox SET status='delivered' WHERE child_task_id=?", task.id);
       return { task: this.getTask(task.id)!, attempt: this.getAttempt(attemptId)! };

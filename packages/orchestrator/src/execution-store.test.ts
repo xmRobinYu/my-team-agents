@@ -148,6 +148,20 @@ describe("ExecutionStore", () => {
     expect(next.attempt.batch).toBe(2);
   });
 
+  it("clears the previous Attempt's error when the Task is claimed again", () => {
+    // The detail panel shows `task.error`; a retrying Task that still carries the
+    // last Attempt's reason reads as "it failed" while it is in fact running again.
+    const store = new ExecutionStore(":memory:", { rng: () => 0.5 });
+    const task = store.createTask(input, 100);
+    const first = store.claimNext("w1", 100)!;
+    expect(store.finishFailure(first.attempt.id, first.attempt.fencingToken, "boom", { now: 110 })).toBe("retry_wait");
+    expect(store.getTask(task.id)?.error).toBe("boom");
+    const second = store.claimNext("w1", 20000)!;
+    expect(second.attempt.sequence).toBe(2);
+    expect(store.getTask(task.id)?.status).toBe("running");
+    expect(store.getTask(task.id)?.error).toBeNull();
+  });
+
   it("throttles a failed task inside the bounded jitter window", () => {
     const store = new ExecutionStore();
     store.createTask(input, 100);
