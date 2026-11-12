@@ -94,6 +94,30 @@ const rosterIndex = (agents: readonly RoomAgent[]): RosterIndex => {
 /** How many room members answer to this exact name/role (0 when nobody does). */
 const claimers = (index: Map<string, RoomAgent[]>, token: string): number => index.get(token)?.length ?? 0;
 
+
+/** The roster's coordinator suffix — `（协调者）` is a tag, not a role. */
+const COORDINATOR_TAG = "协调者";
+
+/**
+ * Split `名字（角色）（协调者）` into its head and its parenthetical groups, fully
+ * nested (either bracket style), refusing anything that is all brackets.
+ */
+export function splitDisplayForm(token: string): { head: string; groups: string[] } | null {
+  const groups: string[] = [];
+  let head = token;
+  for (;;) {
+    const match = /^(.*?)[（(]([^（）()]*)[）)]$/.exec(head);
+    if (!match) break;
+    head = match[1] ?? "";
+    groups.unshift((match[2] ?? "").trim());
+  }
+  return groups.length > 0 && head !== "" ? { head, groups } : null;
+}
+
+/** A parenthetical may be the member's own role, the coordinator tag, or empty. */
+const displayTagAgrees = (group: string, agent: RoomAgent): boolean =>
+  group === "" || group === COORDINATOR_TAG || group === agent.role;
+
 /**
  * Resolve the tokens a model passed to `handoff_to` against the room's roster
  * (D5). Same rules as `resolveMentions`, same index:
@@ -148,6 +172,26 @@ export function resolveRosterTokens(
       if (roled.length > 1) report(ambiguous, token);
       else claim(roled[0]!);
       continue;
+    }
+    // The roster line we INJECT reads `- 许清楚（产品经理）｜id: …`, so a model that
+    // copies it — the most natural thing to do — used to be refused as "not a member
+    // of this room". That was our defect, not the model's: the prompt's own display
+    // form has to be a spelling we accept. It resolves only when the head is an
+    // exact single name AND every parenthetical agrees with that member (his role, or
+    // the coordinator tag), so `许清楚（工程师）` is a contradiction and stays unknown
+    // rather than being "close enough".
+    const display = splitDisplayForm(token);
+    if (display) {
+      const heads = index.byName.get(display.head);
+      if (heads && heads.length > 1) {
+        report(ambiguous, token);
+        continue;
+      }
+      const only = heads?.[0];
+      if (only && display.groups.every((group) => displayTagAgrees(group, only))) {
+        claim(only);
+        continue;
+      }
     }
     report(unknown, token);
   }

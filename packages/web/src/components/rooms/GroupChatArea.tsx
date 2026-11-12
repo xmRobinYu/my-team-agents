@@ -189,6 +189,7 @@ export function GroupChatArea({
         disabled={agents.length === 0 && !agentsLoading}
         disabledReason={agentsError ? "成员加载失败，先修复后使用 @" : "本群还没有成员，@ 无法解析"}
         draftKey={roomId}
+        replyCount={visible.filter((turn) => turn.author.authorKind !== "user").length}
       />
     </section>
   );

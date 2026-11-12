@@ -73,10 +73,23 @@ export interface RoomComposerProps {
   disabled?: boolean;
   disabledReason?: string;
   draftKey?: string;
+  /**
+   * How many turns in the stream are NOT the user's. The "等待回复" line is a claim
+   * about the future, so it is withdrawn as soon as somebody answers — otherwise it
+   * sits there forever saying nothing is happening.
+   *
+   * Why a count of non-user turns rather than `seq`: the two feeds do not share a
+   * sequence space. `seq` is the room's monotonic number on the rooms API, but the
+   * Pi projection numbers user rows by array index. Comparing the two compares a
+   * room seq with an array index, which is how the banner stayed up after a real
+   * reply. "Did anybody other than me speak" is the question, and it is the same
+   * question in both projections.
+   */
+  replyCount?: number;
 }
 
 export const RoomComposer = forwardRef<ComposerHandle, RoomComposerProps>(function RoomComposer(
-  { roomId, agents, onCommitted, disabled = false, disabledReason, draftKey = "" },
+  { roomId, agents, onCommitted, disabled = false, disabledReason, draftKey = "", replyCount = 0 },
   ref,
 ) {
   const draft = useManagedTextarea("");
@@ -85,6 +98,8 @@ export const RoomComposer = forwardRef<ComposerHandle, RoomComposerProps>(functi
   const [sending, setSending] = useState(false);
   const [feedback, setFeedback] = useState<{ tone: "warn" | "danger" | "info"; text: string } | null>(null);
   const busyRef = useRef(false);
+  /** Non-user turns already on screen when we sent; a larger count means an answer. */
+  const sentRepliesRef = useRef<number | null>(null);
 
   const trigger = useMemo(
     () => (disabled ? null : findMentionTrigger(draft.value, draft.caret)),
@@ -106,6 +121,7 @@ export const RoomComposer = forwardRef<ComposerHandle, RoomComposerProps>(functi
   // Switching rooms must not carry an unrelated draft into the new one.
   useEffect(() => {
     draft.setValue("");
+    sentRepliesRef.current = null;
     setFeedback(null);
     setDismissedKey(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset on room/draft-key change only
@@ -123,13 +139,19 @@ export const RoomComposer = forwardRef<ComposerHandle, RoomComposerProps>(functi
         const result = await postRoomTurn(roomId, content);
         setDismissedKey(null);
         onCommitted(result);
+        // The send succeeded, so the draft is spent. Only the success path clears:
+        // a refusal keeps what the user typed (see the class comment).
+        draft.setValue("");
+        sentRepliesRef.current = replyCount;
         setFeedback(
           result.blocked.length > 0
             ? {
                 tone: "info",
                 text: `消息已记录；平台拦下了 ${result.blocked.length} 个触发，原因见流中的系统提示（这不是发送失败）。`,
               }
-            : { tone: "info", text: `已触发 ${result.tasks.length} 个 agent，等待回复。` },
+            : result.tasks.length > 0
+              ? { tone: "info", text: `已触发 ${result.tasks.length} 个 agent，等待回复。` }
+              : { tone: "info", text: "消息已记录；没有新的触发。" },
         );
       } catch (error: unknown) {
         const message =
@@ -144,8 +166,15 @@ export const RoomComposer = forwardRef<ComposerHandle, RoomComposerProps>(functi
         setSending(false);
       }
     },
-    [draft, onCommitted, roomId],
+    [draft, onCommitted, replyCount, roomId],
   );
+
+  useEffect(() => {
+    const sent = sentRepliesRef.current;
+    if (sent === null || replyCount <= sent) return;
+    sentRepliesRef.current = null;
+    setFeedback((current) => (current?.tone === "info" ? null : current));
+  }, [replyCount]);
 
   const handleSend = useCallback(() => {
     if (!roomId || busyRef.current) return;

@@ -298,3 +298,50 @@ describe("resolveRosterTokens — 花名册把 handoff_to 的写法解析成人�
     expect(r.unknown).toEqual(["", "@"]);
   });
 });
+
+// --- D5-b: the roster's own display form is a spelling, not a trap -------------
+//
+// `buildDispatchPrompt` renders every member as `- 名字（角色）｜id: …`, so copying
+// that line verbatim is the most natural `handoff_to` a model can produce. It was
+// refused as "不是本群成员" in a real run (2026-11-12). These cases make the display
+// form a supported spelling without loosening anything else: a contradiction
+// between head and parenthetical is still refused.
+describe("resolveRosterTokens — 花名册展示的那一行本身可解析（D5-b）", () => {
+  const ROOM = [
+    agent("齐活林", "a-lead", "交付总监"),
+    agent("许清楚", "a-pm", "产品经理"),
+    agent("高见远", "a-arch", "架构师"),
+  ];
+  const ids = (tokens: string[]) => resolveRosterTokens(tokens, ROOM).targets.map((a) => a.id);
+
+  it("名字（角色）—— 花名册原样复制", () => {
+    expect(ids(["许清楚（产品经理）"])).toEqual(["a-pm"]);
+    expect(ids(["高见远（架构师）"])).toEqual(["a-arch"]);
+  });
+
+  it("协调者后缀也算：名字（角色）（协调者）", () => {
+    expect(ids(["齐活林（交付总监）（协调者）"])).toEqual(["a-lead"]);
+    expect(ids(["齐活林（协调者）"])).toEqual(["a-lead"]);
+  });
+
+  it("半角括号同样接受", () => {
+    expect(ids(["许清楚(产品经理)"])).toEqual(["a-pm"]);
+  });
+
+  it("括号与本人角色矛盾 → 仍拒绝，不猜", () => {
+    const r = resolveRosterTokens(["许清楚（工程师）"], ROOM);
+    expect(r.targets).toEqual([]);
+    expect(r.unknown).toEqual(["许清楚（工程师）"]);
+  });
+
+  it("括号里的人不在本群 → 仍拒绝", () => {
+    expect(resolveRosterTokens(["老王（产品经理）"], ROOM).unknown).toEqual(["老王（产品经理）"]);
+  });
+
+  it("重名 + 括号 → ambiguous，不派发", () => {
+    const dup = ROOM.concat([agent("许清楚", "a-pm2", "产品经理")]);
+    const r = resolveRosterTokens(["许清楚（产品经理）"], dup);
+    expect(r.ambiguous).toEqual(["许清楚（产品经理）"]);
+    expect(r.targets).toEqual([]);
+  });
+});
